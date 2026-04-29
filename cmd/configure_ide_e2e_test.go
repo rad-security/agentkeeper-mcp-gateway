@@ -599,7 +599,7 @@ func TestE2E23_TildeInHomePath_NotExpanded(t *testing.T) {
 // Consistent with §5.2 "env fills blank, file wins once populated": after
 // Save, the file now has the key, so subsequent loads source from file.
 //
-// For enterprise rollouts (Kanji case) this does not matter — the config file
+// For enterprise rollouts (Kandji case) this does not matter — the config file
 // at /etc/... is written before configure-ide runs, and Load reads the file's
 // populated key (file wins over env, no env lookup, no re-save drift).
 //

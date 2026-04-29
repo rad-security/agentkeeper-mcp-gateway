@@ -69,7 +69,7 @@ const (
 )
 
 // SystemConfigPath is the well-known fleet-deploy location. Configuration-
-// management tools (Kanji, Ansible, Jamf, MDM) drop the gateway config here
+// management tools (Kandji, Ansible, Jamf, MDM) drop the gateway config here
 // because they do not know any individual developer's home directory.
 const SystemConfigPath = "/etc/agentkeeper-mcp-gateway/config.json"
 

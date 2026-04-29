@@ -7,9 +7,7 @@ Sits between any MCP client (Cursor, Claude Code, Windsurf, Copilot) and your MC
 ## Quick Start
 
 ```bash
-# Install
-brew install rad-security/tap/agentkeeper-mcp-gateway
-# or
+# Install from the latest GitHub Release
 curl -fsSL https://www.agentkeeper.dev/install-gateway.sh | bash
 
 # Add your MCP servers
@@ -122,11 +120,11 @@ Supports **Claude Code** (`~/.claude/settings.json`), **Claude Desktop** (macOS 
 3. Rewrites the IDE's `mcpServers` map to a single entry pointing at the gateway
 4. Preserves every non-MCP top-level key verbatim (`permissions`, `preferences`, etc.)
 
-A second invocation is a no-op — the command detects a correctly-wired config and skips the write entirely. Safe to run from a login hook, a postinstall script, or on every Kanji reapply.
+A second invocation is a no-op — the command detects a correctly-wired config and skips the write entirely. Safe to run from a login hook, a postinstall script, or on every Kandji reapply.
 
 ## Headless / Config-Managed Install
 
-The gateway is designed to work under a fleet config-management tool (Kanji, Ansible, Jamf, MDM) that does not know any individual developer's home directory. Drop a config at `/etc/agentkeeper-mcp-gateway/config.json`, or set env vars, and the gateway picks it up.
+The gateway is designed to work under a fleet config-management tool (Kandji, Ansible, Jamf, MDM) that does not know any individual developer's home directory. Drop a config at `/etc/agentkeeper-mcp-gateway/config.json`, or set env vars, and the gateway picks it up.
 
 **Config path resolution (in priority order):**
 

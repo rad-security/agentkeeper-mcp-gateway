@@ -276,7 +276,7 @@ func TestApply_AlreadyWired_IsNoop(t *testing.T) {
 
 func TestApply_MissingFile_CreatesParent(t *testing.T) {
 	// If an IDE's config doesn't exist, Apply should still produce a valid
-	// config file — otherwise a developer who installs Cursor *after* Kanji
+	// config file — otherwise a developer who installs Cursor *after* Kandji
 	// runs gets no wiring. Creates the parent directory if necessary.
 	tmp := t.TempDir()
 	path := filepath.Join(tmp, "fresh", "cfg.json")
