@@ -132,6 +132,18 @@ func TestResolveConfigPath_FallbackWhenNothingExists(t *testing.T) {
 	}
 }
 
+func TestDefaultSystemConfigPathForGOOS(t *testing.T) {
+	if got := DefaultSystemConfigPathForGOOS("windows"); got != WindowsSystemConfigPath {
+		t.Fatalf("windows path = %q, want %q", got, WindowsSystemConfigPath)
+	}
+	if got := DefaultSystemConfigPathForGOOS("darwin"); got != SystemConfigPath {
+		t.Fatalf("darwin path = %q, want %q", got, SystemConfigPath)
+	}
+	if got := DefaultSystemConfigPathForGOOS("linux"); got != SystemConfigPath {
+		t.Fatalf("linux path = %q, want %q", got, SystemConfigPath)
+	}
+}
+
 func TestLoadWithPath_FileWinsOverEnv(t *testing.T) {
 	// If the file has a populated api_key, AGENTKEEPER_API_KEY must not
 	// shadow it — rotation happens by re-rendering the file.

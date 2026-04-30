@@ -18,7 +18,7 @@ var configShowCmd = &cobra.Command{
 	Short: "Display current configuration and where each field came from",
 	RunE: func(cmd *cobra.Command, args []string) error {
 		res, err := config.LoadWithSource(
-			config.ResolveConfigPath(configPath, config.SystemConfigPath),
+			config.ResolveConfigPath(configPath, config.DefaultSystemConfigPath()),
 		)
 		if err != nil {
 			return err
