@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -25,6 +26,39 @@ func mkAdapter(t *testing.T, path string) *Adapter {
 	return &Adapter{
 		Name:         "test-ide",
 		PathResolver: func() (string, error) { return path, nil },
+	}
+}
+
+func normalizeSep(path string) string {
+	return strings.ReplaceAll(path, "/", "\\")
+}
+
+func TestClaudeDesktopConfigPath_WindowsUsesAppData(t *testing.T) {
+	got := claudeDesktopConfigPath(
+		`C:\Users\alice`,
+		"windows",
+		`C:\Users\alice\AppData\Roaming`,
+	)
+	want := `C:\Users\alice\AppData\Roaming\Claude\claude_desktop_config.json`
+	if normalizeSep(got) != want {
+		t.Fatalf("windows Claude Desktop path = %q, want %q", got, want)
+	}
+}
+
+func TestClaudeDesktopConfigPath_WindowsFallsBackToProfileAppData(t *testing.T) {
+	got := claudeDesktopConfigPath(`C:\Users\alice`, "windows", "")
+	want := `C:\Users\alice\AppData\Roaming\Claude\claude_desktop_config.json`
+	if normalizeSep(got) != want {
+		t.Fatalf("windows fallback path = %q, want %q", got, want)
+	}
+}
+
+func TestClaudeDesktopConfigPath_KeepsPosixLayouts(t *testing.T) {
+	if got := claudeDesktopConfigPath("/Users/alice", "darwin", ""); got != "/Users/alice/Library/Application Support/Claude/claude_desktop_config.json" {
+		t.Fatalf("darwin path = %q", got)
+	}
+	if got := claudeDesktopConfigPath("/home/alice", "linux", ""); got != "/home/alice/.config/Claude/claude_desktop_config.json" {
+		t.Fatalf("linux path = %q", got)
 	}
 }
 

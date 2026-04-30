@@ -62,8 +62,8 @@ type NamedServer struct {
 // Adapter represents one IDE's MCP config location. Behavior is shared across
 // all three targets — they differ only in path.
 type Adapter struct {
-	Name         string                   // "claude-code", "claude-desktop", "cursor"
-	PathResolver func() (string, error)   // returns the per-OS path for this IDE
+	Name         string                 // "claude-code", "claude-desktop", "cursor"
+	PathResolver func() (string, error) // returns the per-OS path for this IDE
 }
 
 // Plan describes what Apply would do for a single IDE, in one struct so the
@@ -107,11 +107,22 @@ func claudeDesktopAdapter() *Adapter {
 			if err != nil {
 				return "", err
 			}
-			if runtime.GOOS == "darwin" {
-				return filepath.Join(home, "Library", "Application Support", "Claude", "claude_desktop_config.json"), nil
-			}
-			return filepath.Join(home, ".config", "Claude", "claude_desktop_config.json"), nil
+			return claudeDesktopConfigPath(home, runtime.GOOS, os.Getenv("APPDATA")), nil
 		},
+	}
+}
+
+func claudeDesktopConfigPath(home, goos, appData string) string {
+	switch goos {
+	case "darwin":
+		return filepath.Join(home, "Library", "Application Support", "Claude", "claude_desktop_config.json")
+	case "windows":
+		if appData != "" {
+			return filepath.Join(appData, "Claude", "claude_desktop_config.json")
+		}
+		return filepath.Join(home, "AppData", "Roaming", "Claude", "claude_desktop_config.json")
+	default:
+		return filepath.Join(home, ".config", "Claude", "claude_desktop_config.json")
 	}
 }
 

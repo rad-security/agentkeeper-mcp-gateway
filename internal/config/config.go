@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 )
 
 // Config represents the merged gateway configuration.
@@ -33,8 +34,8 @@ type Config struct {
 
 // DetectionConfig controls detection behavior.
 type DetectionConfig struct {
-	Threat         string   `json:"threat" yaml:"threat"`                   // "warn", "block", "monitor"
-	SensitiveData  string   `json:"sensitive_data" yaml:"sensitive_data"`   // "warn", "block", "monitor"
+	Threat         string   `json:"threat" yaml:"threat"`                 // "warn", "block", "monitor"
+	SensitiveData  string   `json:"sensitive_data" yaml:"sensitive_data"` // "warn", "block", "monitor"
 	CustomKeywords []string `json:"custom_keywords,omitempty" yaml:"custom_keywords,omitempty"`
 }
 
@@ -68,10 +69,17 @@ const (
 	envAPIURL     = "AGENTKEEPER_API_URL"
 )
 
-// SystemConfigPath is the well-known fleet-deploy location. Configuration-
-// management tools (Kandji, Ansible, Jamf, MDM) drop the gateway config here
-// because they do not know any individual developer's home directory.
-const SystemConfigPath = "/etc/agentkeeper-mcp-gateway/config.json"
+const (
+	// SystemConfigPath is the POSIX well-known fleet-deploy location.
+	// Configuration-management tools (Kandji, Ansible, Jamf, MDM) drop the
+	// gateway config here because they do not know any individual developer's
+	// home directory. Kept for backward compatibility with existing callers.
+	SystemConfigPath = "/etc/agentkeeper-mcp-gateway/config.json"
+
+	// WindowsSystemConfigPath is the Windows fleet-deploy location used by
+	// Intune Win32 apps and remediations.
+	WindowsSystemConfigPath = `C:\ProgramData\AgentKeeper\config.json`
+)
 
 // defaultAPIURL is treated as "blank" for env-override purposes — a config
 // file that leaves APIURL at the factory default does not block the env var.
@@ -103,6 +111,17 @@ var pathOverride string
 
 // SetPathOverride wires the --config flag into the resolver.
 func SetPathOverride(p string) { pathOverride = p }
+
+func DefaultSystemConfigPathForGOOS(goos string) string {
+	if goos == "windows" {
+		return WindowsSystemConfigPath
+	}
+	return SystemConfigPath
+}
+
+func DefaultSystemConfigPath() string {
+	return DefaultSystemConfigPathForGOOS(runtime.GOOS)
+}
 
 // DefaultConfig returns the default configuration.
 func DefaultConfig() Config {
@@ -224,7 +243,7 @@ func LoadWithSource(path string) (LoadResult, error) {
 // home / /etc / default fallback). Preserves the legacy signature so existing
 // callers (cmd/*, internal/auth) need no changes.
 func Load() (Config, error) {
-	return LoadWithPath(ResolveConfigPath(pathOverride, SystemConfigPath))
+	return LoadWithPath(ResolveConfigPath(pathOverride, DefaultSystemConfigPath()))
 }
 
 // Save writes cfg to the resolved config path, creating the parent directory
@@ -232,7 +251,7 @@ func Load() (Config, error) {
 // developer will get EACCES — that is intentional. The fix is to re-render
 // via the config-management tool, not to silently write to a different path.
 func Save(cfg Config) error {
-	path := ResolveConfigPath(pathOverride, SystemConfigPath)
+	path := ResolveConfigPath(pathOverride, DefaultSystemConfigPath())
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}

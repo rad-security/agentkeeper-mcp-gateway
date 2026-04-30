@@ -9,6 +9,7 @@ import (
 
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/config"
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/coworkposture"
+	"github.com/rad-security/agentkeeper-mcp-gateway/internal/machineid"
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/skillinventory"
 	"github.com/spf13/cobra"
 )
@@ -68,9 +69,11 @@ the network call.`,
 			return nil
 		}
 
-		payload := skillinventory.BuildPayload(inv, cwd, claudeVersion, "")
+		machineID := machineid.Detect()
+		payload := skillinventory.BuildPayload(inv, cwd, claudeVersion, machineID)
 		posturePayload, postureErr := coworkposture.Scan(coworkposture.ScanOptions{
 			AgentVersion: version,
+			MachineID:    machineID,
 		})
 		if postureErr != nil {
 			fmt.Fprintf(cmd.ErrOrStderr(), "scan-inventory: cowork posture scan error: %v\n", postureErr)
@@ -101,7 +104,7 @@ the network call.`,
 			return nil
 		}
 
-		respBody, err := skillinventory.Send(cfg.APIURL, cfg.APIKey, "", payload)
+		respBody, err := skillinventory.Send(cfg.APIURL, cfg.APIKey, machineID, payload)
 		if err != nil {
 			// Log, don't fail — SessionStart must never block Claude Code.
 			fmt.Fprintf(cmd.ErrOrStderr(), "scan-inventory: upload error: %v\n", err)
@@ -109,7 +112,7 @@ the network call.`,
 		}
 		var postureRespBody []byte
 		if postureErr == nil && posturePayload.Detected() {
-			postureRespBody, err = coworkposture.Send(cfg.APIURL, cfg.APIKey, "", posturePayload)
+			postureRespBody, err = coworkposture.Send(cfg.APIURL, cfg.APIKey, machineID, posturePayload)
 			if err != nil {
 				fmt.Fprintf(cmd.ErrOrStderr(), "scan-inventory: cowork posture upload error: %v\n", err)
 				return nil
