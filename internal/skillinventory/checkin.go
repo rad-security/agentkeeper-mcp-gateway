@@ -6,9 +6,10 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"strings"
 	"time"
+
+	"github.com/rad-security/agentkeeper-mcp-gateway/internal/hostidentity"
 )
 
 // CheckinPayload is the body shape the dashboard's /api/v1/claude-code/checkin
@@ -29,7 +30,7 @@ type CheckinPayload struct {
 // BuildPayload assembles the full checkin body from a scanned inventory +
 // the environmental metadata a Claude Code SessionStart hook provides.
 func BuildPayload(inv Inventory, cwd, claudeVersion, machineID string) CheckinPayload {
-	hostname, _ := os.Hostname()
+	hostname := hostidentity.StableHostname()
 	return CheckinPayload{
 		Hostname:           hostname,
 		OS:                 Platform(),

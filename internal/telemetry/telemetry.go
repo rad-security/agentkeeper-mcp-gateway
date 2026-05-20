@@ -6,12 +6,11 @@ import (
 	"fmt"
 	"net/http"
 	"os"
-	"os/exec"
 	"runtime"
-	"strings"
 	"sync"
 	"time"
 
+	"github.com/rad-security/agentkeeper-mcp-gateway/internal/hostidentity"
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/logging"
 )
 
@@ -41,12 +40,12 @@ type SyncPolicy struct {
 // DetectionConfig controls detection behavior from the dashboard.
 type DetectionConfig struct {
 	Threat        string `json:"threat"`         // "warn", "block", "monitor"
-	SensitiveData string `json:"sensitive_data"`  // "warn", "block", "monitor"
+	SensitiveData string `json:"sensitive_data"` // "warn", "block", "monitor"
 }
 
 // EvaluateResult holds the server-side detection verdict from /api/v1/mcp/evaluate.
 type EvaluateResult struct {
-	Verdict     string `json:"verdict"`      // "pass", "warn", "block"
+	Verdict     string `json:"verdict"` // "pass", "warn", "block"
 	PatternName string `json:"pattern_name"`
 	Severity    string `json:"severity"`
 	Description string `json:"description"`
@@ -71,16 +70,7 @@ type Client struct {
 // returns the network-assigned name which changes per Wi-Fi network. We use
 // scutil --get LocalHostName instead, falling back to os.Hostname().
 func StableHostname() string {
-	if runtime.GOOS == "darwin" {
-		out, err := exec.Command("scutil", "--get", "LocalHostName").Output()
-		if err == nil {
-			if h := strings.TrimSpace(string(out)); h != "" {
-				return h
-			}
-		}
-	}
-	h, _ := os.Hostname()
-	return h
+	return hostidentity.StableHostname()
 }
 
 // NewClient creates a telemetry client.

@@ -16,6 +16,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/rad-security/agentkeeper-mcp-gateway/internal/hostidentity"
 )
 
 const (
@@ -265,7 +267,7 @@ func Scan(opts ScanOptions) (ScanPayload, error) {
 		now = time.Now().UTC()
 	}
 
-	hostname, _ := os.Hostname()
+	hostname := hostidentity.StableHostname()
 	s := &scanner{
 		home:   home,
 		osName: osName,
