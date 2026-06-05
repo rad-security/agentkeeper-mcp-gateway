@@ -11,6 +11,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/detection"
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/logging"
@@ -22,7 +23,7 @@ import (
 // JSONRPCMessage represents a JSON-RPC 2.0 message.
 type JSONRPCMessage struct {
 	JSONRPC string           `json:"jsonrpc"`
-	ID      *json.RawMessage `json:"id,omitempty"`    // request ID (null for notifications)
+	ID      *json.RawMessage `json:"id,omitempty"`     // request ID (null for notifications)
 	Method  string           `json:"method,omitempty"` // request method
 	Params  json.RawMessage  `json:"params,omitempty"` // request params
 	Result  json.RawMessage  `json:"result,omitempty"` // response result
@@ -39,6 +40,7 @@ type JSONRPCError struct {
 // Config holds proxy configuration.
 type Config struct {
 	EnforceMode     bool
+	GatewayVersion  string
 	DetectionEngine *detection.Engine
 	Logger          *logging.Logger
 }
@@ -160,15 +162,40 @@ func (p *Proxy) handleInitialize(msg JSONRPCMessage) (*JSONRPCMessage, error) {
 		return nil, fmt.Errorf("starting servers: %w", err)
 	}
 
-	// Initialize each backend server
+	// Initialize local stdio backends concurrently. Cowork treats Gateway
+	// startup as MCP server attach; one slow customer server must not keep the
+	// gateway itself from attaching.
+	type initResult struct {
+		name string
+		err  error
+	}
+	names := p.manager.ServerNames()
+	results := make(chan initResult, len(names))
+	pending := 0
 	for _, name := range p.manager.ServerNames() {
 		srv := p.manager.Get(name)
 		if srv == nil {
 			continue
 		}
-		// Forward initialize to each server
-		if err := srv.Initialize(); err != nil {
-			p.config.Logger.Warn("failed to initialize server %s: %v", name, err)
+		if srv.IsHTTP() {
+			continue
+		}
+		pending++
+		go func(name string, srv *server.Server) {
+			results <- initResult{name: name, err: srv.Initialize()}
+		}(name, srv)
+	}
+	deadline := time.After(3 * time.Second)
+	for pending > 0 {
+		select {
+		case result := <-results:
+			pending--
+			if result.err != nil {
+				p.config.Logger.Warn("failed to initialize server %s: %v", result.name, result.err)
+			}
+		case <-deadline:
+			p.config.Logger.Warn("timed out while initializing %d MCP server(s)", pending)
+			pending = 0
 		}
 	}
 
@@ -182,7 +209,7 @@ func (p *Proxy) handleInitialize(msg JSONRPCMessage) (*JSONRPCMessage, error) {
 		},
 		"serverInfo": map[string]interface{}{
 			"name":    "agentkeeper-mcp-gateway",
-			"version": "0.1.0",
+			"version": p.gatewayVersion(),
 		},
 	}
 
@@ -194,29 +221,59 @@ func (p *Proxy) handleInitialize(msg JSONRPCMessage) (*JSONRPCMessage, error) {
 	}, nil
 }
 
-func (p *Proxy) handleToolsList(msg JSONRPCMessage) (*JSONRPCMessage, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+func (p *Proxy) gatewayVersion() string {
+	if strings.TrimSpace(p.config.GatewayVersion) != "" {
+		return p.config.GatewayVersion
+	}
+	return "dev"
+}
 
+func (p *Proxy) handleToolsList(msg JSONRPCMessage) (*JSONRPCMessage, error) {
+	type listResult struct {
+		name  string
+		tools []interface{}
+		err   error
+	}
+	names := p.manager.ServerNames()
+	results := make(chan listResult, len(names))
+	for _, name := range names {
+		go func(name string) {
+			srv := p.manager.Get(name)
+			if srv == nil {
+				results <- listResult{name: name}
+				return
+			}
+			tools, err := srv.ListTools()
+			results <- listResult{name: name, tools: tools, err: err}
+		}(name)
+	}
+
+	p.mu.Lock()
 	var allTools []interface{}
 	p.toolMap = make(map[string]string)
+	p.mu.Unlock()
 
-	for _, name := range p.manager.ServerNames() {
-		srv := p.manager.Get(name)
-		if srv == nil {
+	deadline := time.After(3 * time.Second)
+	for remaining := len(names); remaining > 0; {
+		var result listResult
+		select {
+		case result = <-results:
+			remaining--
+		case <-deadline:
+			p.config.Logger.Warn("timed out while listing tools from %d MCP server(s)", remaining)
+			remaining = 0
 			continue
 		}
 
-		tools, err := srv.ListTools()
-		if err != nil {
-			p.config.Logger.Warn("failed to list tools from %s: %v", name, err)
+		if result.err != nil {
+			p.config.Logger.Warn("failed to list tools from %s: %v", result.name, result.err)
 			continue
 		}
 
 		// Check for tool poisoning
 		if p.config.DetectionEngine != nil {
 			var descs []detection.ToolDescription
-			for _, t := range tools {
+			for _, t := range result.tools {
 				tm, ok := t.(map[string]interface{})
 				if !ok {
 					continue
@@ -243,20 +300,22 @@ func (p *Proxy) handleToolsList(msg JSONRPCMessage) (*JSONRPCMessage, error) {
 
 			results := p.config.DetectionEngine.EvaluateToolDescriptions(descs)
 			for _, r := range results {
-				p.config.Logger.LogDetection(name, "", r)
+				p.config.Logger.LogDetection(result.name, "", r)
 			}
 		}
 
 		// Namespace tool names and build toolMap
-		for _, t := range tools {
+		for _, t := range result.tools {
 			tm, ok := t.(map[string]interface{})
 			if !ok {
 				continue
 			}
 			originalName := fmt.Sprintf("%v", tm["name"])
-			namespacedName := name + "__" + originalName
+			namespacedName := result.name + "__" + originalName
 			tm["name"] = namespacedName
-			p.toolMap[namespacedName] = name
+			p.mu.Lock()
+			p.toolMap[namespacedName] = result.name
+			p.mu.Unlock()
 			allTools = append(allTools, tm)
 		}
 	}

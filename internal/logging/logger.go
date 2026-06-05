@@ -27,10 +27,10 @@ type Event struct {
 
 // Logger writes structured events to a JSONL file.
 type Logger struct {
-	file     *os.File
-	mu       sync.Mutex
-	logPath  string
-	verbose  bool
+	file    *os.File
+	mu      sync.Mutex
+	logPath string
+	verbose bool
 	// Buffer for batch telemetry upload
 	buffer   []Event
 	bufferMu sync.Mutex
@@ -64,12 +64,16 @@ func NewLogger(logPath string, verbose bool) (*Logger, error) {
 
 // LogToolCall logs an MCP tool call event.
 func (l *Logger) LogToolCall(serverName, toolName string, params map[string]interface{}, result detection.Result) {
+	verdict := result.Verdict
+	if verdict == "" {
+		verdict = detection.VerdictPass
+	}
 	event := Event{
 		Timestamp:   time.Now().UTC().Format(time.RFC3339Nano),
 		EventType:   "mcp.tool_call",
 		ServerName:  serverName,
 		ToolName:    toolName,
-		Verdict:     string(result.Verdict),
+		Verdict:     string(verdict),
 		Severity:    result.Severity,
 		PatternName: result.PatternName,
 		Category:    result.Category,

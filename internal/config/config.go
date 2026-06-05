@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 )
 
 // Config represents the merged gateway configuration.
@@ -123,6 +124,10 @@ func DefaultSystemConfigPath() string {
 	return DefaultSystemConfigPathForGOOS(runtime.GOOS)
 }
 
+func CurrentConfigPath() string {
+	return ResolveConfigPath(pathOverride, DefaultSystemConfigPath())
+}
+
 // DefaultConfig returns the default configuration.
 func DefaultConfig() Config {
 	return Config{
@@ -133,6 +138,19 @@ func DefaultConfig() Config {
 			Threat:        "warn",
 			SensitiveData: "warn",
 		},
+	}
+}
+
+func HasUsableAPIKey(apiKey string) bool {
+	key := strings.TrimSpace(apiKey)
+	if key == "" {
+		return false
+	}
+	switch key {
+	case "ak_live_YOURKEY", "ak_live_YOUR_KEY", "YOUR_API_KEY", "YOURKEY":
+		return false
+	default:
+		return true
 	}
 }
 

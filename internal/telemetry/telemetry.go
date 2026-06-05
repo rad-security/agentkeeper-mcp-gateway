@@ -22,6 +22,25 @@ type ServerInfo struct {
 	Tools     []ToolInfo `json:"tools,omitempty"`
 }
 
+// DiscoveredServerInfo describes a local MCP server discovered outside the
+// gateway config. It is redacted: only key names are sent for env/headers.
+type DiscoveredServerInfo struct {
+	Name           string   `json:"name"`
+	Client         string   `json:"client,omitempty"`
+	Scope          string   `json:"scope,omitempty"`
+	SourceKind     string   `json:"source_kind,omitempty"`
+	SourcePath     string   `json:"source_path,omitempty"`
+	SourceHash     string   `json:"source_hash,omitempty"`
+	Transport      string   `json:"transport,omitempty"`
+	RouteState     string   `json:"route_state,omitempty"`
+	Routeability   string   `json:"routeability,omitempty"`
+	Routable       bool     `json:"routable,omitempty"`
+	GatewayCovered bool     `json:"gateway_covered,omitempty"`
+	GatewayName    string   `json:"gateway_name,omitempty"`
+	EnvKeys        []string `json:"env_keys,omitempty"`
+	HeaderKeys     []string `json:"header_keys,omitempty"`
+}
+
 // ToolInfo describes a tool exposed by an MCP server.
 type ToolInfo struct {
 	Name        string `json:"name"`
@@ -41,12 +60,12 @@ type SyncPolicy struct {
 // DetectionConfig controls detection behavior from the dashboard.
 type DetectionConfig struct {
 	Threat        string `json:"threat"`         // "warn", "block", "monitor"
-	SensitiveData string `json:"sensitive_data"`  // "warn", "block", "monitor"
+	SensitiveData string `json:"sensitive_data"` // "warn", "block", "monitor"
 }
 
 // EvaluateResult holds the server-side detection verdict from /api/v1/mcp/evaluate.
 type EvaluateResult struct {
-	Verdict     string `json:"verdict"`      // "pass", "warn", "block"
+	Verdict     string `json:"verdict"` // "pass", "warn", "block"
 	PatternName string `json:"pattern_name"`
 	Severity    string `json:"severity"`
 	Description string `json:"description"`
@@ -60,6 +79,8 @@ type Client struct {
 	mode           string
 	gatewayVersion string
 	servers        []ServerInfo
+	discovered     []DiscoveredServerInfo
+	discover       func() []DiscoveredServerInfo
 	gatewayID      string
 	logger         *logging.Logger
 	done           chan struct{}
@@ -111,6 +132,17 @@ func (c *Client) SetServers(servers []ServerInfo) {
 	c.servers = servers
 }
 
+// SetDiscoveredServers sets a static discovered-server snapshot.
+func (c *Client) SetDiscoveredServers(servers []DiscoveredServerInfo) {
+	c.discovered = servers
+}
+
+// SetDiscoveryProvider sets a callback used on every sync heartbeat. This lets
+// the gateway report newly-added local MCP configs without requiring a restart.
+func (c *Client) SetDiscoveryProvider(discover func() []DiscoveredServerInfo) {
+	c.discover = discover
+}
+
 // Start registers the gateway and begins background flush/heartbeat loops.
 func (c *Client) Start() {
 	// Register immediately on startup
@@ -156,6 +188,9 @@ func (c *Client) Evaluate(serverName, toolName string, params map[string]interfa
 		"server_name": serverName,
 		"tool_name":   toolName,
 		"params":      params,
+		"hostname":    c.hostname,
+		"gateway_id":  c.gatewayID,
+		"source":      "agentkeeper-mcp-gateway",
 	}
 
 	data, err := json.Marshal(payload)
@@ -193,13 +228,14 @@ func (c *Client) Evaluate(serverName, toolName string, params map[string]interfa
 // sync registers or heartbeats the gateway via /api/v1/mcp/sync.
 func (c *Client) sync() {
 	payload := map[string]interface{}{
-		"hostname":          c.hostname,
-		"os":                runtime.GOOS,
-		"os_version":        runtime.GOARCH,
-		"gateway_version":   c.gatewayVersion,
-		"mode":              c.mode,
-		"connected_clients": []string{},
-		"connected_servers": c.servers,
+		"hostname":           c.hostname,
+		"os":                 runtime.GOOS,
+		"os_version":         runtime.GOARCH,
+		"gateway_version":    c.gatewayVersion,
+		"mode":               c.mode,
+		"connected_clients":  []string{},
+		"connected_servers":  c.servers,
+		"discovered_servers": c.discoveredServers(),
 	}
 
 	data, err := json.Marshal(payload)
@@ -243,6 +279,13 @@ func (c *Client) sync() {
 	}
 }
 
+func (c *Client) discoveredServers() []DiscoveredServerInfo {
+	if c.discover != nil {
+		return c.discover()
+	}
+	return c.discovered
+}
+
 func (c *Client) flush() {
 	events := c.logger.FlushBuffer()
 	if len(events) == 0 {
@@ -250,8 +293,10 @@ func (c *Client) flush() {
 	}
 
 	payload := map[string]interface{}{
-		"events":   events,
-		"hostname": c.hostname,
+		"events":     events,
+		"hostname":   c.hostname,
+		"gateway_id": c.gatewayID,
+		"source":     "agentkeeper-mcp-gateway",
 	}
 
 	data, err := json.Marshal(payload)

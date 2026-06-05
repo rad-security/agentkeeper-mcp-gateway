@@ -99,7 +99,7 @@ the network call.`,
 			fmt.Fprintf(cmd.ErrOrStderr(), "scan-inventory: config error: %v\n", err)
 			return nil
 		}
-		if cfg.APIKey == "" {
+		if !config.HasUsableAPIKey(cfg.APIKey) {
 			fmt.Fprintln(cmd.ErrOrStderr(), "scan-inventory: no API key — skipping upload (run `agentkeeper-mcp-gateway auth login` or set AGENTKEEPER_API_KEY)")
 			return nil
 		}

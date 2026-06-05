@@ -28,6 +28,52 @@ agentkeeper-mcp-gateway add filesystem "npx -y @modelcontextprotocol/server-file
 
 That's it. The gateway proxies all MCP traffic, detects threats in real-time, and logs everything locally.
 
+## Local Development
+
+This repository is the standalone Go MCP gateway used by AgentKeeper. The main
+AgentKeeper app, Helm chart, and dashboard live in
+[`rad-security/agentkeeper-web`](https://github.com/rad-security/agentkeeper-web).
+
+Requirements:
+
+- Go 1.23.3 or compatible
+- Node.js/npm if you want to test common `npx` MCP servers locally
+
+Build and test:
+
+```bash
+git clone https://github.com/rad-security/agentkeeper-mcp-gateway.git
+cd agentkeeper-mcp-gateway
+go test ./...
+go run . version
+go build -o bin/agentkeeper-mcp-gateway .
+```
+
+Run a local gateway with a disposable filesystem MCP server:
+
+```bash
+go run . add filesystem "npx -y @modelcontextprotocol/server-filesystem /tmp"
+go run . list
+go run . server
+```
+
+Important directories:
+
+```text
+cmd/                       Cobra CLI commands
+internal/config/           Config path resolution and env overrides
+internal/detection/        Threat and sensitive-data detection
+internal/ideconfig/        Claude/Cursor IDE config rewrites
+internal/policy/           Audit/enforce policy behavior
+internal/proxy/            MCP proxy path
+internal/skillinventory/   Local skill inventory scan and check-in
+internal/telemetry/        Dashboard event upload
+```
+
+Config resolution is documented below in "Headless / Config-Managed Install".
+Do not hardcode production AgentKeeper API keys while testing; use local config
+files or disposable dashboard keys.
+
 ## What It Detects
 
 **36 threat detection patterns** running locally at sub-50ms:
@@ -121,6 +167,71 @@ Supports **Claude Code** (`~/.claude/settings.json`), **Claude Desktop** (macOS 
 4. Preserves every non-MCP top-level key verbatim (`permissions`, `preferences`, etc.)
 
 A second invocation is a no-op — the command detects a correctly-wired config and skips the write entirely. Safe to run from a login hook, a postinstall script, or on every Kandji reapply.
+
+## Cowork MCP Gateway Routing
+
+Cowork can expose MCP servers from Claude Desktop config, plugin `.mcp.json`
+files, and remote MCP session state. The gateway must be the only MCP path; a
+backend that is both imported into AgentKeeper and still present as a native
+Cowork remote MCP source can bypass AgentKeeper telemetry.
+
+Important boundary: the standalone local gateway governs Cowork traffic when
+Cowork invokes the local `agentkeeper-mcp-gateway server` MCP process. This
+release covers MCP backends that are discoverable on disk as Claude Desktop
+config, Cowork plugin `.mcp.json`, or Cowork remote MCP session config. It
+imports those backends, ensures Cowork has a gateway MCP entrypoint to attach
+to, and removes direct remote MCP session entries that would bypass the
+gateway.
+
+Connector calls that Cowork never represents in local MCP config can still
+execute through Claude's cloud-managed connector API without invoking the local
+gateway process. Those cloud-only connector calls require the AgentKeeper
+Cowork plugin ZIP path:
+
+```text
+https://www.agentkeeper.dev/downloads/cowork/latest/agentkeeper-cowork-guardrail.zip
+```
+
+Run the Cowork-specific configure command after install and after plugin or
+remote MCP changes:
+
+```bash
+agentkeeper-mcp-gateway cowork configure --dry-run
+agentkeeper-mcp-gateway cowork configure
+agentkeeper-mcp-gateway cowork doctor --strict
+```
+
+`cowork configure` imports discovered local/plugin/remote MCP backends into the
+gateway config, ensures Claude Desktop/Cowork has an
+`agentkeeper-mcp-gateway server` MCP entrypoint, rewrites local `.mcp.json`
+files to point at that entrypoint, and disables direct Cowork
+`remoteMcpServersConfig` entries after backing up each touched file to
+`*.agentkeeper-backup-<unix-nanos>`.
+
+The local MCP success condition is:
+
+```text
+verdict: cowork_local_mcp_routed_native_connectors_require_zip
+direct_count: 0
+gateway_backend_count: >0
+```
+
+`cowork doctor` includes a redacted `gateway_backends` inventory so an
+entrypoint-only deployment cannot look healthy. Any direct Cowork MCP source is
+a bypass risk. `cowork doctor --strict` exits non-zero until direct sources are
+removed, and also exits non-zero when Cowork is wired to the gateway entrypoint
+but the gateway config has no backend MCP servers.
+
+If your deployment requires governance of Cowork native/cloud connectors, run:
+
+```bash
+agentkeeper-mcp-gateway cowork doctor --strict --require-native-connectors
+```
+
+That command intentionally exits non-zero because standalone local MCP routing
+cannot cover connector calls that are not exposed to the local gateway process;
+install the AgentKeeper Cowork plugin ZIP and verify with `cowork-status.sh`
+after a real Cowork tool action.
 
 ## Headless / Config-Managed Install
 
@@ -219,4 +330,4 @@ MIT
 
 - [Dashboard](https://www.agentkeeper.dev)
 - [Docs](https://www.agentkeeper.dev/docs)
-- [Claude Code Plugin](https://github.com/rad-security/claude-code-plugin)
+- [Claude Code Plugin](https://github.com/rad-security/agentkeeper-web/tree/main/plugin)
