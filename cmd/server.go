@@ -4,13 +4,16 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"strings"
+	"time"
 
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/config"
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/detection"
+	"github.com/rad-security/agentkeeper-mcp-gateway/internal/discovery"
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/logging"
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/proxy"
-	"github.com/rad-security/agentkeeper-mcp-gateway/internal/telemetry"
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/server"
+	"github.com/rad-security/agentkeeper-mcp-gateway/internal/telemetry"
 	"github.com/spf13/cobra"
 )
 
@@ -48,9 +51,27 @@ are blocked.`,
 		}
 		defer logger.Close()
 
+		if coworkAutoGuardEnabled() {
+			summary, err := runCoworkGuardOnce("", false)
+			if err != nil {
+				logger.Warn("Cowork guard startup pass failed: %v", err)
+			} else if coworkGuardChanged(summary) {
+				fmt.Fprintf(os.Stderr, "[agentkeeper] Cowork guard routed %d backend(s) and disabled %d native direct source(s)\n", summary.Migrated, summary.Disabled)
+				if reloaded, err := config.Load(); err == nil {
+					cfg = reloaded
+					if enforce {
+						cfg.Mode = "enforce"
+					}
+				} else {
+					logger.Warn("Cowork guard could not reload config after startup pass: %v", err)
+				}
+			}
+		}
+
 		// Start telemetry if connected
 		var tc *telemetry.Client
-		if cfg.APIKey != "" {
+		hasAPIKey := config.HasUsableAPIKey(cfg.APIKey)
+		if hasAPIKey {
 			apiURL := cfg.APIURL
 			if apiURL == "" {
 				apiURL = "https://www.agentkeeper.dev"
@@ -60,14 +81,11 @@ are blocked.`,
 			tc.SetVersion(version)
 
 			// Build server info for registration
-			var serverInfos []telemetry.ServerInfo
-			for _, s := range cfg.Servers {
-				serverInfos = append(serverInfos, telemetry.ServerInfo{
-					Name:      s.Name,
-					Transport: s.Transport,
-				})
-			}
-			tc.SetServers(serverInfos)
+			tc.SetServers(telemetryServerInfosFromConfig(cfg))
+			cwd, _ := os.Getwd()
+			tc.SetDiscoveryProvider(func() []telemetry.DiscoveredServerInfo {
+				return discoverTelemetryServers(cwd)
+			})
 			tc.Start()
 			defer tc.Stop()
 		}
@@ -76,21 +94,37 @@ are blocked.`,
 		engine := detection.NewEngine()
 
 		// Build server configs from config
-		var serverConfigs []server.ServerConfig
-		for _, s := range cfg.Servers {
-			serverConfigs = append(serverConfigs, server.ServerConfig{
-				Name:      s.Name,
-				Command:   s.Command,
-				Args:      s.Args,
-				Env:       s.Env,
-				Transport: s.Transport,
-				URL:       s.URL,
-				Headers:   s.Headers,
-			})
-		}
+		serverConfigs := serverConfigsFromConfig(cfg)
 
 		// Create server manager
 		mgr := server.NewManager(serverConfigs)
+		if coworkAutoGuardEnabled() {
+			interval := coworkAutoGuardInterval()
+			stop := make(chan struct{})
+			done := make(chan struct{})
+			go coworkGuardLoop(interval, "", os.Stderr, func(summary coworkGuardSummary) {
+				fmt.Fprintf(os.Stderr, "[agentkeeper] Cowork guard routed %d backend(s) and disabled %d native direct source(s)\n", summary.Migrated, summary.Disabled)
+				reloaded, err := config.Load()
+				if err != nil {
+					logger.Warn("Cowork guard could not reload config: %v", err)
+					return
+				}
+				if enforce {
+					reloaded.Mode = "enforce"
+				}
+				mgr.UpdateConfigs(serverConfigsFromConfig(reloaded))
+				if err := mgr.StartAll(); err != nil {
+					logger.Warn("Cowork guard could not start newly routed backend(s): %v", err)
+				}
+				if tc != nil {
+					tc.SetServers(telemetryServerInfosFromConfig(reloaded))
+				}
+			}, stop, done)
+			defer func() {
+				close(stop)
+				<-done
+			}()
+		}
 
 		// Log session start
 		hostname := telemetry.StableHostname()
@@ -107,7 +141,7 @@ are blocked.`,
 		}
 		fmt.Fprintf(os.Stderr, "[agentkeeper] MCP Gateway v%s starting in %s mode\n", version, mode)
 		fmt.Fprintf(os.Stderr, "[agentkeeper] %d servers configured, %d detection patterns loaded\n", len(serverConfigs), 36)
-		if cfg.APIKey != "" {
+		if hasAPIKey {
 			fmt.Fprintf(os.Stderr, "[agentkeeper] Connected to dashboard\n")
 		} else {
 			fmt.Fprintf(os.Stderr, "[agentkeeper] Local mode (run 'agentkeeper-mcp-gateway auth login' to connect)\n")
@@ -116,12 +150,91 @@ are blocked.`,
 		// Create and run proxy
 		p := proxy.NewProxy(proxy.Config{
 			EnforceMode:     cfg.Mode == "enforce",
+			GatewayVersion:  version,
 			DetectionEngine: engine,
 			Logger:          logger,
 		}, mgr, tc)
 
 		return p.Run()
 	},
+}
+
+func serverConfigsFromConfig(cfg config.Config) []server.ServerConfig {
+	var serverConfigs []server.ServerConfig
+	for _, s := range cfg.Servers {
+		serverConfigs = append(serverConfigs, server.ServerConfig{
+			Name:      s.Name,
+			Command:   s.Command,
+			Args:      s.Args,
+			Env:       s.Env,
+			Transport: s.Transport,
+			URL:       s.URL,
+			Headers:   s.Headers,
+		})
+	}
+	return serverConfigs
+}
+
+func telemetryServerInfosFromConfig(cfg config.Config) []telemetry.ServerInfo {
+	var serverInfos []telemetry.ServerInfo
+	for _, s := range cfg.Servers {
+		serverInfos = append(serverInfos, telemetry.ServerInfo{
+			Name:      s.Name,
+			Transport: s.Transport,
+		})
+	}
+	return serverInfos
+}
+
+func coworkAutoGuardEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("AGENTKEEPER_COWORK_GUARD"))) {
+	case "0", "false", "no", "off", "disabled":
+		return false
+	default:
+		return true
+	}
+}
+
+func coworkAutoGuardInterval() time.Duration {
+	if raw := strings.TrimSpace(os.Getenv("AGENTKEEPER_COWORK_GUARD_INTERVAL")); raw != "" {
+		if parsed, err := time.ParseDuration(raw); err == nil && parsed > 0 {
+			return parsed
+		}
+	}
+	if raw := strings.TrimSpace(os.Getenv("AGENTKEEPER_COWORK_GUARD_INTERVAL_MS")); raw != "" {
+		var ms int
+		if _, err := fmt.Sscanf(raw, "%d", &ms); err == nil && ms > 0 {
+			return time.Duration(ms) * time.Millisecond
+		}
+	}
+	return 250 * time.Millisecond
+}
+
+func discoverTelemetryServers(cwd string) []telemetry.DiscoveredServerInfo {
+	res, err := discovery.Discover(discovery.Options{Client: "all", CWD: cwd})
+	if err != nil {
+		return nil
+	}
+	out := make([]telemetry.DiscoveredServerInfo, 0, len(res.Servers))
+	for _, s := range res.Servers {
+		out = append(out, telemetry.DiscoveredServerInfo{
+			Name:           s.Name,
+			Client:         s.Client,
+			Scope:          s.Scope,
+			SourceKind:     s.SourceKind,
+			SourcePath:     s.SourcePath,
+			SourceHash:     s.SourceHash,
+			Transport:      s.Transport,
+			RouteState:     s.RouteState,
+			Routeability:   s.Routeability,
+			Routable:       s.Routable,
+			GatewayCovered: s.GatewayCovered,
+			GatewayName:    s.GatewayName,
+			EnvKeys:        s.EnvKeys,
+			HeaderKeys:     s.HeaderKeys,
+		})
+	}
+	return out
 }
 
 func init() {

@@ -1,10 +1,12 @@
 package cmd
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/config"
+	"github.com/rad-security/agentkeeper-mcp-gateway/internal/discovery"
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/ideconfig"
 	"github.com/spf13/cobra"
 )
@@ -12,6 +14,9 @@ import (
 var (
 	configureIDEDryRun bool
 	configureIDETarget []string
+	configureIDECWD    string
+	configureIDEScope  string
+	configureIDEJSON   bool
 )
 
 var configureIDECmd = &cobra.Command{
@@ -24,13 +29,34 @@ one up, and rewrites the MCP server list so the only entry is the AgentKeeper
 gateway. Any previously-registered MCP servers are migrated into the gateway's
 own config so no wiring is lost.
 
-This command is idempotent — if an IDE is already pointing at the gateway and
+This command is idempotent - if an IDE is already pointing at the gateway and
 nothing else, running it again is a no-op.
 
 By default every detected IDE is configured. Use --ide to target just one.
-Use --dry-run to preview changes without writing anything.`,
+	Use --dry-run to preview changes without writing anything.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		out := cmd.OutOrStdout()
+		if shouldUseProjectMigration() {
+			plan, err := discovery.MigrateProjectMCP(configureIDECWD, configureIDEDryRun)
+			if err != nil {
+				return err
+			}
+			if configureIDEJSON {
+				data, err := json.MarshalIndent(plan, "", "  ")
+				if err != nil {
+					return err
+				}
+				fmt.Fprintln(out, string(data))
+				return nil
+			}
+			printProjectMigrationPlan(out, plan)
+			if configureIDEDryRun {
+				fmt.Fprintln(out, "")
+				fmt.Fprintln(out, "(dry-run - no files written)")
+			}
+			return nil
+		}
+
 		adapters := ideconfig.Adapters()
 
 		// Filter by --ide if provided.
@@ -75,7 +101,7 @@ Use --dry-run to preview changes without writing anything.`,
 		if len(migratedAll) == 0 {
 			fmt.Fprintln(out, "")
 			if configureIDEDryRun {
-				fmt.Fprintln(out, "(dry-run — no files written)")
+				fmt.Fprintln(out, "(dry-run - no files written)")
 			}
 			return nil
 		}
@@ -102,7 +128,7 @@ Use --dry-run to preview changes without writing anything.`,
 				URL:     s.Entry.URL,
 				Headers: s.Entry.Headers,
 			}
-			// IDE "type:http" ↔ gateway "transport:http"
+			// IDE "type:http" maps to gateway "transport:http"
 			if s.Entry.Type != "" {
 				entry.Transport = s.Entry.Type
 			}
@@ -114,7 +140,7 @@ Use --dry-run to preview changes without writing anything.`,
 		}
 		if configureIDEDryRun {
 			fmt.Fprintln(out, "")
-			fmt.Fprintln(out, "(dry-run — no files written)")
+			fmt.Fprintln(out, "(dry-run - no files written)")
 		}
 		return nil
 	},
@@ -125,7 +151,7 @@ func printPlan(out interface {
 }, ide string, p ideconfig.Plan) {
 	status := "would wire"
 	if configureIDEDryRun {
-		// keep the same verb — it's already hypothetical by flag
+		// keep the same verb; it's already hypothetical by flag
 	}
 	switch {
 	case p.AlreadyWired:
@@ -135,9 +161,9 @@ func printPlan(out interface {
 	case len(p.Migrated) > 0:
 		status = fmt.Sprintf("migrate %d + wire", len(p.Migrated))
 	}
-	fmt.Fprintf(out, "  %-16s %s — %s\n", ide, status, p.ConfigPath)
+	fmt.Fprintf(out, "  %-16s %s - %s\n", ide, status, p.ConfigPath)
 	for _, m := range p.Migrated {
-		fmt.Fprintf(out, "    → migrate: %s (%s)\n", m.Name, renderCommand(m.Entry))
+		fmt.Fprintf(out, "    -> migrate: %s (%s)\n", m.Name, renderCommand(m.Entry))
 	}
 }
 
@@ -154,8 +180,57 @@ func renderCommand(e ideconfig.ServerEntry) string {
 	return e.Command + " " + strings.Join(e.Args, " ")
 }
 
+func shouldUseProjectMigration() bool {
+	if configureIDECWD == "" && configureIDEScope != "project" {
+		return false
+	}
+	if configureIDEScope != "" && configureIDEScope != "project" {
+		return false
+	}
+	if len(configureIDETarget) == 0 {
+		return false
+	}
+	for _, t := range configureIDETarget {
+		if strings.ToLower(t) != "claude-code" {
+			return false
+		}
+	}
+	return true
+}
+
+func printProjectMigrationPlan(out interface {
+	Write(p []byte) (int, error)
+}, plan discovery.MigrationPlan) {
+	status := "no project MCP servers discovered"
+	if plan.AlreadyRouted {
+		status = "already routed"
+	} else if len(plan.Servers) > 0 {
+		status = fmt.Sprintf("migrate %d + wire", len(plan.Servers))
+	}
+	fmt.Fprintf(out, "  %-16s %s - %s\n", plan.Client, status, plan.ConfigPath)
+	for _, s := range plan.Servers {
+		if s.RouteState == discovery.RouteRouted {
+			continue
+		}
+		rendered := s.Command
+		if rendered == "" {
+			rendered = s.URL
+		}
+		if s.ArgsCount > 0 {
+			rendered = fmt.Sprintf("%s (%d args)", rendered, s.ArgsCount)
+		}
+		fmt.Fprintf(out, "    -> migrate: %s (%s)\n", s.Name, rendered)
+	}
+	if plan.BackupPath != "" {
+		fmt.Fprintf(out, "  %-16s backup: %s\n", "", plan.BackupPath)
+	}
+}
+
 func init() {
 	configureIDECmd.Flags().BoolVar(&configureIDEDryRun, "dry-run", false, "Preview changes without writing any files")
 	configureIDECmd.Flags().StringSliceVar(&configureIDETarget, "ide", nil, "Restrict to a specific IDE (claude-code, claude-desktop, cursor). Repeatable.")
+	configureIDECmd.Flags().StringVar(&configureIDECWD, "cwd", "", "Project directory for Claude Code project-scoped MCP migration")
+	configureIDECmd.Flags().StringVar(&configureIDEScope, "scope", "", "MCP scope to configure (project for Claude Code .mcp.json)")
+	configureIDECmd.Flags().BoolVar(&configureIDEJSON, "json", false, "Emit JSON for project-scoped migration")
 	rootCmd.AddCommand(configureIDECmd)
 }

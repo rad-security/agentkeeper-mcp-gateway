@@ -87,10 +87,33 @@ func ideConfigPath(home, ide string) string {
 	return ""
 }
 
+func claudeAppSupportPath(home string) string {
+	switch runtime.GOOS {
+	case "darwin":
+		return filepath.Join(home, "Library", "Application Support", "Claude")
+	case "windows":
+		return filepath.Join(home, "AppData", "Roaming", "Claude")
+	default:
+		return filepath.Join(home, ".config", "Claude")
+	}
+}
+
 // writeFixture puts body at ideConfigPath(home, ide) and returns that path.
 func writeFixture(t *testing.T, home, ide, body string) string {
 	t.Helper()
 	path := ideConfigPath(home, ide)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func writeGatewayConfig(t *testing.T, home, body string) string {
+	t.Helper()
+	path := filepath.Join(home, ".config", "agentkeeper-mcp-gateway", "config.json")
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -155,6 +178,32 @@ func assertGatewayWired(t *testing.T, path string) {
 	}
 	if gw.Command != "agentkeeper-mcp-gateway" {
 		t.Errorf("%s: gateway.command = %q, want agentkeeper-mcp-gateway", path, gw.Command)
+	}
+	if len(gw.Args) != 1 || gw.Args[0] != "server" {
+		t.Errorf("%s: gateway.args = %v, want [server]", path, gw.Args)
+	}
+}
+
+func assertCoworkGatewayEntrypoint(t *testing.T, path string) {
+	t.Helper()
+	raw := readConfig(t, path)
+	rawServers, ok := raw["mcpServers"]
+	if !ok {
+		t.Fatalf("%s: mcpServers key missing", path)
+	}
+	var servers map[string]struct {
+		Command string   `json:"command"`
+		Args    []string `json:"args"`
+	}
+	if err := json.Unmarshal(rawServers, &servers); err != nil {
+		t.Fatalf("%s: parsing mcpServers: %v", path, err)
+	}
+	gw, ok := servers["agentkeeper-mcp-gateway"]
+	if !ok {
+		t.Fatalf("%s: gateway entry missing; keys=%v", path, servers)
+	}
+	if gw.Command != "/usr/local/bin/agentkeeper-mcp-gateway" {
+		t.Errorf("%s: gateway.command = %q, want /usr/local/bin/agentkeeper-mcp-gateway", path, gw.Command)
 	}
 	if len(gw.Args) != 1 || gw.Args[0] != "server" {
 		t.Errorf("%s: gateway.args = %v, want [server]", path, gw.Args)
@@ -665,5 +714,382 @@ func TestE2E25_KnownLimitation_NewServerBetweenRunsMissed(t *testing.T) {
 	gw, _ := os.ReadFile(filepath.Join(home, ".config", "agentkeeper-mcp-gateway", "config.json"))
 	if !strings.Contains(string(gw), `"second"`) {
 		t.Errorf("second server was not migrated on re-run; gateway config:\n%s", gw)
+	}
+}
+
+func TestE2E26_ClaudeCodeProjectMCPJSONMigrated(t *testing.T) {
+	home := t.TempDir()
+	project := filepath.Join(home, "repo")
+	projectMCP := filepath.Join(project, ".mcp.json")
+	if err := os.MkdirAll(project, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(projectMCP, []byte(`{
+		"mcpServers": {
+			"customer-mcp": {
+				"command": "node",
+				"args": ["server.js"],
+				"env": {"CUSTOMER_TOKEN": "secret"}
+			}
+		},
+		"other": true
+	}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	out, _, code := run(t, home, "configure-ide", "--ide=claude-code", "--cwd", project, "--scope=project", "--dry-run")
+	if code != 0 {
+		t.Fatalf("dry-run exit=%d out=%s", code, out)
+	}
+	if !strings.Contains(out, "customer-mcp") || !strings.Contains(out, "(dry-run") {
+		t.Fatalf("dry-run did not show migration: %s", out)
+	}
+	if countBackups(t, project) != 0 {
+		t.Fatalf("dry-run wrote backup")
+	}
+
+	out, _, code = run(t, home, "configure-ide", "--ide=claude-code", "--cwd", project, "--scope=project")
+	if code != 0 {
+		t.Fatalf("apply exit=%d out=%s", code, out)
+	}
+	if countBackups(t, project) != 1 {
+		t.Fatalf("expected one project backup, got %d", countBackups(t, project))
+	}
+
+	raw := readConfig(t, projectMCP)
+	var servers map[string]struct {
+		Command string   `json:"command"`
+		Args    []string `json:"args"`
+	}
+	if err := json.Unmarshal(raw["mcpServers"], &servers); err != nil {
+		t.Fatal(err)
+	}
+	if len(servers) != 1 || servers["agentkeeper-mcp-gateway"].Command != "/usr/local/bin/agentkeeper-mcp-gateway" {
+		t.Fatalf("project MCP not wired to gateway: %+v", servers)
+	}
+	if _, ok := raw["other"]; !ok {
+		t.Fatalf("non-MCP top-level key was not preserved")
+	}
+
+	gw, err := os.ReadFile(filepath.Join(home, ".config", "agentkeeper-mcp-gateway", "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"name": "customer-mcp"`, `"command": "node"`, `"CUSTOMER_TOKEN": "secret"`} {
+		if !strings.Contains(string(gw), want) {
+			t.Fatalf("gateway config missing %s:\n%s", want, gw)
+		}
+	}
+}
+
+func TestE2E27_CoworkPluginMCPJSONMigrated(t *testing.T) {
+	home := t.TempDir()
+	pluginMCP := filepath.Join(
+		claudeAppSupportPath(home),
+		"local-agent-mode-sessions",
+		"session-1",
+		"cowork_plugins",
+		"marketplaces",
+		"vendor",
+		"atlas",
+		".mcp.json",
+	)
+	if err := os.MkdirAll(filepath.Dir(pluginMCP), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(pluginMCP, []byte(`{
+		"mcpServers": {
+			"atlas": {
+				"command": "node",
+				"args": ["${CLAUDE_PLUGIN_ROOT}/dist/server.js"],
+				"env": {"ATLAS_TOKEN": "secret"}
+			}
+		},
+		"plugin": true
+	}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	out, _, code := run(t, home, "cowork", "configure", "--dry-run")
+	if code != 0 {
+		t.Fatalf("dry-run exit=%d out=%s", code, out)
+	}
+	if !strings.Contains(out, "atlas") || !strings.Contains(out, "(dry-run") {
+		t.Fatalf("dry-run did not show cowork migration: %s", out)
+	}
+	if countBackups(t, filepath.Dir(pluginMCP)) != 0 {
+		t.Fatalf("dry-run wrote backup")
+	}
+
+	out, _, code = run(t, home, "cowork", "configure")
+	if code != 0 {
+		t.Fatalf("apply exit=%d out=%s", code, out)
+	}
+	if countBackups(t, filepath.Dir(pluginMCP)) != 1 {
+		t.Fatalf("expected one cowork backup, got %d", countBackups(t, filepath.Dir(pluginMCP)))
+	}
+
+	raw := readConfig(t, pluginMCP)
+	var servers map[string]struct {
+		Command string   `json:"command"`
+		Args    []string `json:"args"`
+	}
+	if err := json.Unmarshal(raw["mcpServers"], &servers); err != nil {
+		t.Fatal(err)
+	}
+	if len(servers) != 1 || servers["agentkeeper-mcp-gateway"].Command != "/usr/local/bin/agentkeeper-mcp-gateway" {
+		t.Fatalf("cowork plugin MCP not wired to gateway: %+v", servers)
+	}
+	if _, ok := raw["plugin"]; !ok {
+		t.Fatalf("non-MCP top-level key was not preserved")
+	}
+
+	gw, err := os.ReadFile(filepath.Join(home, ".config", "agentkeeper-mcp-gateway", "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"name": "atlas"`, `"command": "node"`, `"ATLAS_TOKEN": "secret"`} {
+		if !strings.Contains(string(gw), want) {
+			t.Fatalf("gateway config missing %s:\n%s", want, gw)
+		}
+	}
+
+	out, _, code = run(t, home, "cowork", "doctor")
+	if code != 0 {
+		t.Fatalf("doctor exit=%d out=%s", code, out)
+	}
+	if !strings.Contains(out, "cowork_local_mcp_routed_native_connectors_require_zip") {
+		t.Fatalf("doctor did not report local MCP routed/native connector boundary: %s", out)
+	}
+	if !strings.Contains(out, `"coverage_scope": "local_mcp_only"`) || !strings.Contains(out, `"required_path": "agentkeeper_cowork_plugin_zip"`) {
+		t.Fatalf("doctor did not report Cowork native connector ZIP requirement: %s", out)
+	}
+	if !strings.Contains(out, `"gateway_backend_count": 1`) || !strings.Contains(out, `"name": "atlas"`) {
+		t.Fatalf("doctor did not report migrated gateway backend inventory: %s", out)
+	}
+}
+
+func TestE2E28_CoworkDoctorReportsPartialRouting(t *testing.T) {
+	home := t.TempDir()
+	writeFixture(t, home, "claude-desktop", `{
+		"mcpServers": {
+			"agentkeeper-mcp-gateway": {
+				"command": "agentkeeper-mcp-gateway",
+				"args": ["server"]
+			}
+		}
+	}`)
+
+	pluginMCP := filepath.Join(
+		claudeAppSupportPath(home),
+		"local-agent-mode-sessions",
+		"session-1",
+		"cowork_plugins",
+		"marketplaces",
+		"vendor",
+		"atlas",
+		".mcp.json",
+	)
+	if err := os.MkdirAll(filepath.Dir(pluginMCP), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(pluginMCP, []byte(`{
+		"mcpServers": {
+			"atlas": {"command": "node", "args": ["server.js"]}
+		}
+	}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	out, _, code := run(t, home, "cowork", "doctor")
+	if code != 0 {
+		t.Fatalf("doctor exit=%d out=%s", code, out)
+	}
+	if !strings.Contains(out, "cowork_gateway_routed_but_direct_bypass_detected") {
+		t.Fatalf("doctor did not report partial routing: %s", out)
+	}
+	if !strings.Contains(out, `"routed_count": 1`) || !strings.Contains(out, `"direct_count": 1`) {
+		t.Fatalf("doctor counts missing/wrong: %s", out)
+	}
+}
+
+func TestE2E29_CoworkRemoteMCPConfigImportedAndReportedCovered(t *testing.T) {
+	home := t.TempDir()
+	session := filepath.Join(
+		claudeAppSupportPath(home),
+		"local-agent-mode-sessions",
+		"account",
+		"env",
+		"local_google.json",
+	)
+	if err := os.MkdirAll(filepath.Dir(session), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(session, []byte(`{
+		"remoteMcpServersConfig": [{
+			"uuid": "0601e193-a1f4-4153-aa4e-850858ce2066",
+			"name": "Google Drive",
+			"url": "https://drivemcp.googleapis.com/mcp/v1"
+		}],
+		"enabledMcpTools": {
+			"0601e193-a1f4-4153-aa4e-850858ce2066:search": true
+		}
+	}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	out, _, code := run(t, home, "cowork", "configure", "--dry-run")
+	if code != 0 {
+		t.Fatalf("dry-run exit=%d out=%s", code, out)
+	}
+	if !strings.Contains(out, "google-drive") || !strings.Contains(out, "import 1 remote MCP backend") || !strings.Contains(out, "disable native direct source") || !strings.Contains(out, "wire gateway entrypoint") {
+		t.Fatalf("dry-run did not show remote import: %s", out)
+	}
+
+	out, _, code = run(t, home, "cowork", "configure")
+	if code != 0 {
+		t.Fatalf("configure exit=%d out=%s", code, out)
+	}
+	if !strings.Contains(out, "imported 1 remote MCP backend") || !strings.Contains(out, "disabled 1 native direct source") {
+		t.Fatalf("configure did not import remote MCP: %s", out)
+	}
+	if !strings.Contains(out, "wired gateway entrypoint") {
+		t.Fatalf("configure did not wire Cowork gateway entrypoint: %s", out)
+	}
+	gw, err := os.ReadFile(filepath.Join(home, ".config", "agentkeeper-mcp-gateway", "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"name": "google-drive"`, `"transport": "http"`, `"url": "https://drivemcp.googleapis.com/mcp/v1"`} {
+		if !strings.Contains(string(gw), want) {
+			t.Fatalf("gateway config missing %s:\n%s", want, gw)
+		}
+	}
+	rewritten, err := os.ReadFile(session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(rewritten), "https://drivemcp.googleapis.com/mcp/v1") || strings.Contains(string(rewritten), "0601e193-a1f4-4153-aa4e-850858ce2066:search") {
+		t.Fatalf("cowork remote MCP direct source still present after configure: %s", rewritten)
+	}
+	assertCoworkGatewayEntrypoint(t, ideConfigPath(home, "claude-desktop"))
+
+	out, _, code = run(t, home, "cowork", "doctor")
+	if code != 0 {
+		t.Fatalf("doctor exit=%d out=%s", code, out)
+	}
+	if !strings.Contains(out, "cowork_local_mcp_routed_native_connectors_require_zip") {
+		t.Fatalf("doctor did not report local MCP routed/native connector boundary after disabling direct source: %s", out)
+	}
+	if !strings.Contains(out, `"direct_count": 0`) {
+		t.Fatalf("doctor still reports direct routes: %s", out)
+	}
+	if !strings.Contains(out, `"standalone_gateway_supported": false`) || !strings.Contains(out, `"required_path": "agentkeeper_cowork_plugin_zip"`) {
+		t.Fatalf("doctor did not report Cowork native connector ZIP requirement: %s", out)
+	}
+	if !strings.Contains(out, `"gateway_backend_count": 1`) || !strings.Contains(out, `"name": "google-drive"`) {
+		t.Fatalf("doctor did not report imported remote backend inventory: %s", out)
+	}
+}
+
+func TestE2E30_CoworkGuardOnceDisablesNewRemoteMCPSource(t *testing.T) {
+	home := t.TempDir()
+	session := filepath.Join(
+		claudeAppSupportPath(home),
+		"local-agent-mode-sessions",
+		"account",
+		"env",
+		"local_runtime_google.json",
+	)
+	if err := os.MkdirAll(filepath.Dir(session), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(session, []byte(`{
+		"remoteMcpServersConfig": [{
+			"uuid": "0601e193-a1f4-4153-aa4e-850858ce2066",
+			"name": "Google Drive",
+			"url": "https://drivemcp.googleapis.com/mcp/v1"
+		}]
+	}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	out, _, code := run(t, home, "cowork", "guard", "--once")
+	if code != 0 {
+		t.Fatalf("guard exit=%d out=%s", code, out)
+	}
+	if !strings.Contains(out, "Cowork guard routed 1 backend(s) and disabled 1 native direct source(s)") {
+		t.Fatalf("guard did not report runtime cleanup: %s", out)
+	}
+
+	rewritten, err := os.ReadFile(session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(rewritten), "https://drivemcp.googleapis.com/mcp/v1") {
+		t.Fatalf("guard left direct Cowork remote MCP source in place: %s", rewritten)
+	}
+	assertCoworkGatewayEntrypoint(t, ideConfigPath(home, "claude-desktop"))
+
+	out, _, code = run(t, home, "cowork", "doctor", "--strict")
+	if code != 0 {
+		t.Fatalf("doctor strict exit=%d out=%s", code, out)
+	}
+	if !strings.Contains(out, `"direct_count": 0`) || !strings.Contains(out, "cowork_local_mcp_routed_native_connectors_require_zip") {
+		t.Fatalf("doctor did not report fully routed after guard: %s", out)
+	}
+}
+
+func TestE2E31_CoworkDoctorCanFailWhenNativeConnectorCoverageIsRequired(t *testing.T) {
+	home := t.TempDir()
+	writeFixture(t, home, "claude-desktop", `{
+		"mcpServers": {
+			"agentkeeper-mcp-gateway": {
+				"command": "agentkeeper-mcp-gateway",
+				"args": ["server"]
+			}
+		}
+	}`)
+	writeGatewayConfig(t, home, `{
+		"mode": "audit",
+		"servers": [{
+			"name": "atlas",
+			"command": "node",
+			"args": ["server.js"]
+		}]
+	}`)
+
+	out, stderr, code := run(t, home, "cowork", "doctor", "--strict", "--require-native-connectors")
+	if code == 0 {
+		t.Fatalf("doctor should fail when native Cowork connector coverage is required; out=%s stderr=%s", out, stderr)
+	}
+	if !strings.Contains(out, "cowork_local_mcp_routed_native_connectors_require_zip") {
+		t.Fatalf("doctor did not report local-only routeability before failing: %s", out)
+	}
+	if !strings.Contains(stderr, "Cowork native connector governance is not supported by the standalone local gateway") {
+		t.Fatalf("doctor did not explain native connector limitation: %s", stderr)
+	}
+}
+
+func TestE2E32_CoworkDoctorStrictFailsWhenGatewayHasNoBackends(t *testing.T) {
+	home := t.TempDir()
+	writeFixture(t, home, "claude-desktop", `{
+		"mcpServers": {
+			"agentkeeper-mcp-gateway": {
+				"command": "agentkeeper-mcp-gateway",
+				"args": ["server"]
+			}
+		}
+	}`)
+
+	out, stderr, code := run(t, home, "cowork", "doctor", "--strict")
+	if code == 0 {
+		t.Fatalf("doctor strict should fail when gateway has no backend servers; out=%s stderr=%s", out, stderr)
+	}
+	if !strings.Contains(out, "cowork_gateway_entrypoint_routed_but_no_backends_configured") || !strings.Contains(out, `"gateway_backend_count": 0`) {
+		t.Fatalf("doctor did not report missing gateway backend inventory: %s", out)
+	}
+	if !strings.Contains(stderr, "gateway config has no backend MCP servers") {
+		t.Fatalf("doctor did not explain missing backends: %s", stderr)
 	}
 }

@@ -99,7 +99,7 @@ func Login() error {
 // Status checks the current auth status.
 func Status() error {
 	cfg, _ := config.Load()
-	if cfg.APIKey == "" {
+	if !config.HasUsableAPIKey(cfg.APIKey) {
 		fmt.Println("Not connected. Run 'agentkeeper-mcp-gateway auth login' to connect.")
 		return nil
 	}

@@ -144,6 +144,17 @@ func TestDefaultSystemConfigPathForGOOS(t *testing.T) {
 	}
 }
 
+func TestHasUsableAPIKeyRejectsPlaceholders(t *testing.T) {
+	for _, key := range []string{"", " ", "ak_live_YOURKEY", "ak_live_YOUR_KEY", "YOUR_API_KEY", "YOURKEY"} {
+		if HasUsableAPIKey(key) {
+			t.Fatalf("expected placeholder %q to be unusable", key)
+		}
+	}
+	if !HasUsableAPIKey("ak_live_realisticfixture123") {
+		t.Fatal("expected non-placeholder key to be usable")
+	}
+}
+
 func TestLoadWithPath_FileWinsOverEnv(t *testing.T) {
 	// If the file has a populated api_key, AGENTKEEPER_API_KEY must not
 	// shadow it — rotation happens by re-rendering the file.

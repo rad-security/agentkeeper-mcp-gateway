@@ -4,13 +4,17 @@ package server
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // ServerConfig defines a backend MCP server.
@@ -26,14 +30,22 @@ type ServerConfig struct {
 
 // Server represents a running MCP server process.
 type Server struct {
-	config  ServerConfig
-	cmd     *exec.Cmd
-	stdin   io.WriteCloser
-	stdout  *bufio.Reader
-	mu      sync.Mutex
-	nextID  atomic.Int64
-	pending map[int64]chan json.RawMessage
-	pendMu  sync.Mutex
+	config      ServerConfig
+	cmd         *exec.Cmd
+	stdin       io.WriteCloser
+	stdout      *bufio.Reader
+	mu          sync.Mutex
+	initMu      sync.Mutex
+	initialized bool
+	sessionID   string
+	nextID      atomic.Int64
+	pending     map[int64]chan rpcResponse
+	pendMu      sync.Mutex
+}
+
+type rpcResponse struct {
+	result json.RawMessage
+	err    error
 }
 
 // Manager manages multiple MCP server processes.
@@ -53,22 +65,52 @@ func NewManager(configs []ServerConfig) *Manager {
 
 // StartAll starts all configured servers.
 func (m *Manager) StartAll() error {
-	for _, cfg := range m.configs {
-		if cfg.Transport == "http" {
+	m.mu.RLock()
+	configs := append([]ServerConfig(nil), m.configs...)
+	m.mu.RUnlock()
+
+	for _, cfg := range configs {
+		if cfg.Name == "" {
+			fmt.Fprintln(os.Stderr, "[agentkeeper] skipping MCP server with empty name")
+			continue
+		}
+		if m.Get(cfg.Name) != nil {
+			continue
+		}
+		transport := normalizeTransport(cfg)
+		if transport == "http" {
+			if strings.TrimSpace(cfg.URL) == "" {
+				fmt.Fprintf(os.Stderr, "[agentkeeper] skipping MCP server %s: empty URL for HTTP transport\n", cfg.Name)
+				continue
+			}
+			cfg.Transport = "http"
 			// HTTP servers don't need to be spawned — they're remote
 			m.mu.Lock()
 			m.servers[cfg.Name] = &Server{
 				config:  cfg,
-				pending: make(map[int64]chan json.RawMessage),
+				pending: make(map[int64]chan rpcResponse),
 			}
 			m.mu.Unlock()
 			continue
 		}
+		if strings.TrimSpace(cfg.Command) == "" {
+			fmt.Fprintf(os.Stderr, "[agentkeeper] skipping MCP server %s: empty command\n", cfg.Name)
+			continue
+		}
 		if err := m.startServer(cfg); err != nil {
-			return fmt.Errorf("starting %s: %w", cfg.Name, err)
+			fmt.Fprintf(os.Stderr, "[agentkeeper] skipping MCP server %s: %v\n", cfg.Name, err)
+			continue
 		}
 	}
 	return nil
+}
+
+// UpdateConfigs replaces the desired backend set. Existing live servers are
+// retained; StartAll will attach any newly discovered backends.
+func (m *Manager) UpdateConfigs(configs []ServerConfig) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.configs = append([]ServerConfig(nil), configs...)
 }
 
 func (m *Manager) startServer(cfg ServerConfig) error {
@@ -108,7 +150,7 @@ func (m *Manager) startServer(cfg ServerConfig) error {
 		cmd:     cmd,
 		stdin:   stdin,
 		stdout:  bufio.NewReader(stdout),
-		pending: make(map[int64]chan json.RawMessage),
+		pending: make(map[int64]chan rpcResponse),
 	}
 
 	// Read responses in background
@@ -153,6 +195,16 @@ func (m *Manager) StopAll() {
 
 // Initialize sends the initialize handshake to a server.
 func (s *Server) Initialize() error {
+	if s.IsHTTP() {
+		return s.ensureHTTPInitialized()
+	}
+
+	s.initMu.Lock()
+	defer s.initMu.Unlock()
+	if s.initialized {
+		return nil
+	}
+
 	params := map[string]interface{}{
 		"protocolVersion": "2024-11-05",
 		"capabilities":    map[string]interface{}{},
@@ -168,11 +220,15 @@ func (s *Server) Initialize() error {
 	}
 	// Send initialized notification
 	s.sendNotification("notifications/initialized", nil)
+	s.initialized = true
 	return nil
 }
 
 // ListTools calls tools/list on the server.
 func (s *Server) ListTools() ([]interface{}, error) {
+	if err := s.Initialize(); err != nil {
+		return nil, err
+	}
 	resp, err := s.Call("tools/list", nil)
 	if err != nil {
 		return nil, err
@@ -188,6 +244,9 @@ func (s *Server) ListTools() ([]interface{}, error) {
 
 // ListResources calls resources/list on the server.
 func (s *Server) ListResources() ([]interface{}, error) {
+	if err := s.Initialize(); err != nil {
+		return nil, err
+	}
 	resp, err := s.Call("resources/list", nil)
 	if err != nil {
 		return nil, err
@@ -203,6 +262,9 @@ func (s *Server) ListResources() ([]interface{}, error) {
 
 // ListPrompts calls prompts/list on the server.
 func (s *Server) ListPrompts() ([]interface{}, error) {
+	if err := s.Initialize(); err != nil {
+		return nil, err
+	}
 	resp, err := s.Call("prompts/list", nil)
 	if err != nil {
 		return nil, err
@@ -218,6 +280,15 @@ func (s *Server) ListPrompts() ([]interface{}, error) {
 
 // Call sends a JSON-RPC request and waits for the response.
 func (s *Server) Call(method string, params json.RawMessage) (json.RawMessage, error) {
+	if s.IsHTTP() {
+		if method != "initialize" && !strings.HasPrefix(method, "notifications/") {
+			if err := s.ensureHTTPInitialized(); err != nil {
+				return nil, err
+			}
+		}
+		return s.callHTTP(method, params)
+	}
+
 	s.mu.Lock()
 	id := s.nextID.Add(1)
 
@@ -230,7 +301,7 @@ func (s *Server) Call(method string, params json.RawMessage) (json.RawMessage, e
 		msg["params"] = json.RawMessage(params)
 	}
 
-	ch := make(chan json.RawMessage, 1)
+	ch := make(chan rpcResponse, 1)
 	s.pendMu.Lock()
 	s.pending[id] = ch
 	s.pendMu.Unlock()
@@ -247,12 +318,26 @@ func (s *Server) Call(method string, params json.RawMessage) (json.RawMessage, e
 		return nil, err
 	}
 
-	// Wait for response (with timeout handled upstream)
-	result := <-ch
-	return result, nil
+	select {
+	case resp := <-ch:
+		if resp.err != nil {
+			return nil, resp.err
+		}
+		return resp.result, nil
+	case <-time.After(timeoutForMethod(method)):
+		s.pendMu.Lock()
+		delete(s.pending, id)
+		s.pendMu.Unlock()
+		return nil, fmt.Errorf("%s timed out after %s", method, timeoutForMethod(method))
+	}
 }
 
 func (s *Server) sendNotification(method string, params json.RawMessage) {
+	if s.IsHTTP() {
+		s.sendHTTPNotification(method, params)
+		return
+	}
+
 	msg := map[string]interface{}{
 		"jsonrpc": "2.0",
 		"method":  method,
@@ -265,6 +350,191 @@ func (s *Server) sendNotification(method string, params json.RawMessage) {
 	s.mu.Lock()
 	s.stdin.Write(data)
 	s.mu.Unlock()
+}
+
+func (s *Server) IsHTTP() bool {
+	return normalizeTransport(s.config) == "http"
+}
+
+func (s *Server) ensureHTTPInitialized() error {
+	s.initMu.Lock()
+	defer s.initMu.Unlock()
+	if s.initialized {
+		return nil
+	}
+	params := map[string]interface{}{
+		"protocolVersion": "2024-11-05",
+		"capabilities":    map[string]interface{}{},
+		"clientInfo": map[string]interface{}{
+			"name":    "agentkeeper-mcp-gateway",
+			"version": "0.1.0",
+		},
+	}
+	paramsJSON, _ := json.Marshal(params)
+	if _, err := s.callHTTP("initialize", paramsJSON); err != nil {
+		return err
+	}
+	s.sendHTTPNotification("notifications/initialized", nil)
+	s.initialized = true
+	return nil
+}
+
+func (s *Server) callHTTP(method string, params json.RawMessage) (json.RawMessage, error) {
+	id := s.nextID.Add(1)
+	msg := map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      id,
+		"method":  method,
+	}
+	if params != nil {
+		msg["params"] = json.RawMessage(params)
+	}
+
+	return s.postHTTP(msg, id, true, timeoutForMethod(method))
+}
+
+func (s *Server) sendHTTPNotification(method string, params json.RawMessage) {
+	msg := map[string]interface{}{
+		"jsonrpc": "2.0",
+		"method":  method,
+	}
+	if params != nil {
+		msg["params"] = json.RawMessage(params)
+	}
+	_, _ = s.postHTTP(msg, 0, false, 2*time.Second)
+}
+
+func (s *Server) postHTTP(msg map[string]interface{}, id int64, expectResult bool, timeout time.Duration) (json.RawMessage, error) {
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequest(http.MethodPost, s.config.URL, bytes.NewReader(data))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	for k, v := range s.config.Headers {
+		req.Header.Set(k, v)
+	}
+	if s.sessionID != "" {
+		req.Header.Set("Mcp-Session-Id", s.sessionID)
+	}
+
+	client := &http.Client{Timeout: timeout}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if sid := resp.Header.Get("Mcp-Session-Id"); sid != "" {
+		s.sessionID = sid
+	}
+	if !expectResult || resp.StatusCode == http.StatusAccepted {
+		return json.RawMessage(`{}`), nil
+	}
+
+	contentType := strings.ToLower(resp.Header.Get("Content-Type"))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		if strings.Contains(contentType, "application/json") {
+			if result, err := readJSONRPCResult(resp.Body, id); err == nil {
+				return result, nil
+			}
+		}
+		if challenge := strings.TrimSpace(resp.Header.Get("WWW-Authenticate")); challenge != "" {
+			return nil, fmt.Errorf("HTTP %d from %s (%s)", resp.StatusCode, s.config.URL, challenge)
+		}
+		return nil, fmt.Errorf("HTTP %d from %s", resp.StatusCode, s.config.URL)
+	}
+	if strings.Contains(contentType, "text/event-stream") {
+		return readSSEResult(resp.Body, id)
+	}
+	return readJSONRPCResult(resp.Body, id)
+}
+
+func timeoutForMethod(method string) time.Duration {
+	switch method {
+	case "initialize", "tools/list", "resources/list", "prompts/list":
+		return 2 * time.Second
+	case "tools/call":
+		return 60 * time.Second
+	default:
+		return 8 * time.Second
+	}
+}
+
+func readJSONRPCResult(r io.Reader, id int64) (json.RawMessage, error) {
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return nil, err
+	}
+	if len(bytes.TrimSpace(data)) == 0 {
+		return json.RawMessage(`{}`), nil
+	}
+	return parseJSONRPCResult(data, id)
+}
+
+func readSSEResult(r io.Reader, id int64) (json.RawMessage, error) {
+	scanner := bufio.NewScanner(r)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if payload == "" || payload == "[DONE]" {
+			continue
+		}
+		result, err := parseJSONRPCResult([]byte(payload), id)
+		if err == nil {
+			return result, nil
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return nil, fmt.Errorf("no JSON-RPC response for id %d in SSE stream", id)
+}
+
+func parseJSONRPCResult(data []byte, id int64) (json.RawMessage, error) {
+	var msg struct {
+		ID     *int64          `json:"id"`
+		Result json.RawMessage `json:"result"`
+		Error  *struct {
+			Code    int    `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(data, &msg); err != nil {
+		return nil, err
+	}
+	if msg.ID != nil && *msg.ID != id {
+		return nil, fmt.Errorf("unexpected JSON-RPC response id %d, want %d", *msg.ID, id)
+	}
+	if msg.Error != nil {
+		return nil, fmt.Errorf("%s", msg.Error.Message)
+	}
+	if msg.Result == nil {
+		return json.RawMessage(`{}`), nil
+	}
+	return msg.Result, nil
+}
+
+func normalizeTransport(cfg ServerConfig) string {
+	transport := strings.ToLower(strings.TrimSpace(cfg.Transport))
+	switch transport {
+	case "http", "sse", "streamable-http":
+		return "http"
+	case "":
+		if strings.TrimSpace(cfg.URL) != "" {
+			return "http"
+		}
+		return "stdio"
+	default:
+		return transport
+	}
 }
 
 func (s *Server) readResponses() {
@@ -300,9 +570,12 @@ func (s *Server) readResponses() {
 
 		if ok {
 			if msg.Error != nil {
-				ch <- json.RawMessage(fmt.Sprintf(`{"error": "%s"}`, msg.Error.Message))
+				ch <- rpcResponse{err: fmt.Errorf("%s", msg.Error.Message)}
 			} else {
-				ch <- msg.Result
+				if msg.Result == nil {
+					msg.Result = json.RawMessage(`{}`)
+				}
+				ch <- rpcResponse{result: msg.Result}
 			}
 		}
 	}
