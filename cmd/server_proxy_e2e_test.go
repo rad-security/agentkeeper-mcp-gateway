@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,6 +13,11 @@ import (
 	"testing"
 	"time"
 )
+
+type capturedAPIRequest struct {
+	path string
+	body map[string]any
+}
 
 func TestE2E33_ServerProxiesConfiguredMCPToolCall(t *testing.T) {
 	home := t.TempDir()
@@ -75,6 +82,107 @@ func TestE2E33_ServerProxiesConfiguredMCPToolCall(t *testing.T) {
 	}
 }
 
+func TestE2E34_ServerReportsProxiedToolCallToAgentKeeperAPI(t *testing.T) {
+	requests := make(chan capturedAPIRequest, 10)
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if r.Body != nil {
+			_ = json.NewDecoder(r.Body).Decode(&body)
+		}
+		requests <- capturedAPIRequest{path: r.URL.Path, body: body}
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/v1/mcp/sync":
+			_, _ = w.Write([]byte(`{"ok":true,"gateway_id":"gw_e2e","policy":{"mode":"audit"}}`))
+		case "/api/v1/mcp/evaluate":
+			_, _ = w.Write([]byte(`{"verdict":"pass"}`))
+		case "/api/v1/mcp/events":
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer api.Close()
+
+	home := t.TempDir()
+	configPath := writeGatewayConfig(t, home, `{
+		"mode": "audit",
+		"api_key": "ak_live_test_e2e",
+		"api_url": "`+api.URL+`",
+		"servers": [{
+			"name": "atlas",
+			"command": "/bin/sh",
+			"args": ["-c", "while IFS= read -r line; do case \"$line\" in *\\\"method\\\":\\\"initialize\\\"*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":\"fake-atlas\",\"version\":\"test\"}}}' ;; *\\\"method\\\":\\\"tools/list\\\"*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"list_accounts\",\"description\":\"List accounts\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}]}}' ;; *\\\"method\\\":\\\"tools/call\\\"*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"atlas-ok\"}]}}' ;; esac; done"]
+		}]
+	}`)
+
+	cmd := exec.Command(binary, "--config", configPath, "server")
+	cmd.Env = []string{
+		"HOME=" + home,
+		"PATH=" + os.Getenv("PATH"),
+		"AGENTKEEPER_COWORK_GUARD=0",
+	}
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = stdin.Close()
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		_, _ = cmd.Process.Wait()
+	}()
+
+	reader := bufio.NewReader(stdout)
+	writeRPC(t, stdin, `{"jsonrpc":"2.0","id":200,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e","version":"test"}}}`)
+	_ = readRPCLine(t, reader)
+	writeRPC(t, stdin, `{"jsonrpc":"2.0","id":201,"method":"tools/list","params":{}}`)
+	_ = readRPCLine(t, reader)
+	writeRPC(t, stdin, `{"jsonrpc":"2.0","id":202,"method":"tools/call","params":{"name":"atlas__list_accounts","arguments":{"account_id":"acct_test"}}}`)
+	callResp := readRPCLine(t, reader)
+	if !strings.Contains(callResp, "atlas-ok") {
+		t.Fatalf("gateway did not proxy backend tool call: %s stderr=%s", callResp, stderr.String())
+	}
+
+	evaluate := waitForAPIPath(t, requests, "/api/v1/mcp/evaluate", 6*time.Second)
+	if evaluate["server_name"] != "atlas" || evaluate["tool_name"] != "list_accounts" || evaluate["source"] != "agentkeeper-mcp-gateway" {
+		t.Fatalf("unexpected evaluate payload: %#v", evaluate)
+	}
+	if evaluate["gateway_id"] != "gw_e2e" {
+		t.Fatalf("evaluate did not include synced gateway id: %#v", evaluate)
+	}
+
+	events := waitForAPIPath(t, requests, "/api/v1/mcp/events", 7*time.Second)
+	rawEvents, ok := events["events"].([]any)
+	if !ok || len(rawEvents) == 0 {
+		t.Fatalf("events upload missing events array: %#v", events)
+	}
+	var sawToolCall bool
+	for _, raw := range rawEvents {
+		event, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if event["event_type"] == "mcp.tool_call" && event["server_name"] == "atlas" && event["tool_name"] == "list_accounts" {
+			sawToolCall = true
+			break
+		}
+	}
+	if !sawToolCall {
+		t.Fatalf("events upload did not contain routed atlas/list_accounts tool call: %#v", rawEvents)
+	}
+}
+
 func writeRPC(t *testing.T, stdin interface {
 	Write([]byte) (int, error)
 }, payload string) {
@@ -108,4 +216,19 @@ func readRPCLine(t *testing.T, reader *bufio.Reader) string {
 		t.Fatal("timed out waiting for gateway JSON-RPC response")
 	}
 	return ""
+}
+
+func waitForAPIPath(t *testing.T, requests <-chan capturedAPIRequest, path string, timeout time.Duration) map[string]any {
+	t.Helper()
+	deadline := time.After(timeout)
+	for {
+		select {
+		case req := <-requests:
+			if req.path == path {
+				return req.body
+			}
+		case <-deadline:
+			t.Fatalf("timed out waiting for %s", path)
+		}
+	}
 }
