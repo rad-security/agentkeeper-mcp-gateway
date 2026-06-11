@@ -10,23 +10,17 @@ Sits between any MCP client (Cursor, Claude Code, Windsurf, Copilot) and your MC
 # Install from the latest GitHub Release
 curl -fsSL https://www.agentkeeper.dev/install-gateway.sh | bash
 
-# Add your MCP servers
-agentkeeper-mcp-gateway add github "npx -y @modelcontextprotocol/server-github"
-agentkeeper-mcp-gateway add filesystem "npx -y @modelcontextprotocol/server-filesystem /path/to/allowed"
+# Preview supported local MCP client migration
+agentkeeper-mcp-gateway configure-ide --dry-run
 
-# Point your MCP client at the gateway
-# In Cursor (~/.cursor/mcp.json) or Claude Code:
-{
-  "mcpServers": {
-    "agentkeeper-mcp-gateway": {
-      "command": "agentkeeper-mcp-gateway",
-      "args": ["server"]
-    }
-  }
-}
+# Move supported MCP client configs behind Gateway
+agentkeeper-mcp-gateway configure-ide
+
+# Check discovery, routing, auth, and next steps
+agentkeeper-mcp-gateway list --health
 ```
 
-That's it. The gateway proxies all MCP traffic, detects threats in real-time, and logs everything locally.
+Restart the MCP client after `configure-ide`, then make one real tool call. The gateway proxies routed MCP traffic, detects threats in real time, and logs everything locally. Manual `agentkeeper-mcp-gateway add` is still available for unsupported config sources, gateway-native admin setup, and lab cases, but it is not the default rollout workflow.
 
 ## Local Development
 
@@ -131,7 +125,7 @@ Opens your browser for device authorization. Once connected, events stream to th
 
 ```bash
 # Server management
-agentkeeper-mcp-gateway add <name> <command>
+agentkeeper-mcp-gateway add <name> <command>    # fallback/admin only
 agentkeeper-mcp-gateway remove <name>
 agentkeeper-mcp-gateway list [--health] [--json]
 
@@ -167,6 +161,17 @@ Supports **Claude Code** (`~/.claude/settings.json`), **Claude Desktop** (macOS 
 4. Preserves every non-MCP top-level key verbatim (`permissions`, `preferences`, etc.)
 
 A second invocation is a no-op — the command detects a correctly-wired config and skips the write entirely. Safe to run from a login hook, a postinstall script, or on every Kandji reapply.
+
+## Manual fallback/admin registration
+
+Use `add` only when no supported local MCP client config can be migrated, or when an admin intentionally wants a gateway-native server entry.
+
+```bash
+agentkeeper-mcp-gateway add github "npx -y @modelcontextprotocol/server-github"
+agentkeeper-mcp-gateway add remote https://api.example.com/mcp --header "Authorization:Bearer tok"
+```
+
+For enterprise rollout, prefer `configure-ide --dry-run`, `configure-ide`, MCP client restart, a real tool call, and `list --health`.
 
 ## Cowork MCP Gateway Routing
 

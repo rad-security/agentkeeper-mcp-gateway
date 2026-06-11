@@ -22,6 +22,7 @@ const (
 	ClientClaudeCode    = "claude-code"
 	ClientClaudeDesktop = "claude-desktop"
 	ClientCowork        = "cowork"
+	ClientCursor        = "cursor"
 
 	RouteDirect  = "direct"
 	RouteRouted  = "routed"
@@ -76,7 +77,7 @@ type DiscoveredServer struct {
 }
 
 // Discover returns MCP servers configured for the requested client. Client may
-// be "all", "claude-code", "claude-desktop", or "cowork".
+// be "all", "claude-code", "claude-desktop", "cowork", or "cursor".
 func Discover(opts Options) (Result, error) {
 	home := opts.Home
 	if home == "" {
@@ -107,12 +108,15 @@ func Discover(opts Options) (Result, error) {
 		add(discoverClaudeCode(home, cwd))
 		add(discoverClaudeDesktop(home))
 		add(discoverCowork(home))
+		add(discoverCursor(home))
 	case ClientClaudeCode:
 		add(discoverClaudeCode(home, cwd))
 	case ClientClaudeDesktop:
 		add(discoverClaudeDesktop(home))
 	case ClientCowork:
 		add(discoverCowork(home))
+	case ClientCursor:
+		add(discoverCursor(home))
 	default:
 		return Result{}, fmt.Errorf("unknown client %q", opts.Client)
 	}
@@ -127,6 +131,7 @@ func discoverClaudeCode(home, cwd string) []DiscoveredServer {
 		out = append(out, readMCPServers(filepath.Join(cwd, ".mcp.json"), ClientClaudeCode, "project", "project_mcp_json", RouteabilityLocalRoutable)...)
 		out = append(out, readClaudeJSONProject(home, cwd)...)
 	}
+	out = append(out, readMCPServers(filepath.Join(home, ".claude", "settings.json"), ClientClaudeCode, "global", "claude_code_settings", RouteabilityLocalRoutable)...)
 	out = append(out, readClaudeJSONUser(home)...)
 	return out
 }
@@ -137,6 +142,10 @@ func discoverClaudeDesktop(home string) []DiscoveredServer {
 		return nil
 	}
 	return readMCPServers(path, ClientClaudeDesktop, "global", "claude_desktop_config", RouteabilityLocalRoutable)
+}
+
+func discoverCursor(home string) []DiscoveredServer {
+	return readMCPServers(filepath.Join(home, ".cursor", "mcp.json"), ClientCursor, "global", "cursor_mcp_json", RouteabilityLocalRoutable)
 }
 
 func discoverCowork(home string) []DiscoveredServer {

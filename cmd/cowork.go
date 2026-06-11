@@ -119,7 +119,7 @@ var coworkDoctorCmd = &cobra.Command{
 			return fmt.Errorf("%s: %d direct Cowork MCP source(s) can bypass the gateway; run `agentkeeper-mcp-gateway cowork configure` or keep `agentkeeper-mcp-gateway cowork guard` running, then restart Cowork", verdict, directCount)
 		}
 		if coworkStrict && routedCount > 0 && gatewayBackendCount == 0 {
-			return fmt.Errorf("%s: Cowork is wired to the gateway entrypoint, but the gateway config has no backend MCP servers; run `agentkeeper-mcp-gateway cowork configure` or import servers with `agentkeeper-mcp-gateway add`", verdict)
+			return fmt.Errorf("%s: Cowork is wired to the gateway entrypoint, but the gateway config has no backend MCP servers; run `agentkeeper-mcp-gateway cowork configure` first, or use fallback/admin `agentkeeper-mcp-gateway add` for unsupported sources", verdict)
 		}
 		if coworkRequireNativeConnectors {
 			return fmt.Errorf("Cowork native connector governance is not supported by the standalone local gateway; use the AgentKeeper Cowork plugin ZIP path")
