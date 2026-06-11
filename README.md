@@ -141,17 +141,19 @@ agentkeeper-mcp-gateway auth login|status|logout
 agentkeeper-mcp-gateway completion zsh|bash|fish
 
 # IDE integration (zero-touch)
-agentkeeper-mcp-gateway configure-ide [--dry-run] [--ide=claude-code|claude-desktop|cursor]
+agentkeeper-mcp-gateway configure-ide [--dry-run] [--ide=claude-code|claude-desktop|cursor|cowork]
 ```
 
 ## Zero-touch IDE wiring
 
-`configure-ide` rewrites every installed IDE's MCP config to route through the gateway. One command, all IDEs, fully idempotent.
+`configure-ide` rewrites every supported local MCP client config to route through the gateway. One command, all supported clients, fully idempotent. This includes Claude Desktop, Claude Code settings, Claude Code user-scoped and project-scoped `~/.claude.json` servers, Cursor, and current Cowork local/plugin/remote MCP sources.
 
 ```bash
 agentkeeper-mcp-gateway configure-ide --dry-run   # preview; writes nothing
 agentkeeper-mcp-gateway configure-ide              # apply
 ```
+
+For Cowork sources created after setup, run `agentkeeper-mcp-gateway cowork guard` from a login item/service, or rerun `configure-ide`. Native Cowork cloud connectors that are not represented as local MCP sources require the AgentKeeper Cowork ZIP/guardrail path; the standalone gateway can only govern MCP traffic it can route.
 
 Supports **Claude Code** (`~/.claude/settings.json`), **Claude Desktop** (macOS + Linux), and **Cursor** (`~/.cursor/mcp.json`). For each detected IDE it:
 

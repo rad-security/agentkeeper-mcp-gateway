@@ -782,6 +782,87 @@ func TestE2E26_ClaudeCodeProjectMCPJSONMigrated(t *testing.T) {
 	}
 }
 
+func TestE2E30_ClaudeCodeUserClaudeJSONMigrated(t *testing.T) {
+	home := t.TempDir()
+	claudeJSON := filepath.Join(home, ".claude.json")
+	if err := os.WriteFile(claudeJSON, []byte(`{
+		"mcpServers": {
+			"notion": {
+				"type": "http",
+				"url": "https://mcp.notion.com/mcp",
+				"headers": {"Authorization": "Bearer secret"}
+			},
+			"raindrop": {
+				"type": "http",
+				"url": "https://mcp.raindrop.ai/mcp"
+			}
+		},
+		"projects": {
+			"/Users/alice/project": {
+				"mcpServers": {}
+			}
+		},
+		"keep_me": true
+	}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	out, _, code := run(t, home, "configure-ide", "--ide=claude-code", "--dry-run")
+	if code != 0 {
+		t.Fatalf("dry-run exit=%d out=%s", code, out)
+	}
+	for _, want := range []string{"claude-code:user", "notion", "raindrop", "(dry-run"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("dry-run output missing %q:\n%s", want, out)
+		}
+	}
+	if countBackups(t, home) != 0 {
+		t.Fatalf("dry-run wrote backup")
+	}
+
+	out, _, code = run(t, home, "configure-ide", "--ide=claude-code")
+	if code != 0 {
+		t.Fatalf("apply exit=%d out=%s", code, out)
+	}
+	if countBackups(t, home) != 1 {
+		t.Fatalf("expected one ~/.claude.json backup, got %d", countBackups(t, home))
+	}
+
+	raw := readConfig(t, claudeJSON)
+	var servers map[string]struct {
+		Command string   `json:"command"`
+		Args    []string `json:"args"`
+	}
+	if err := json.Unmarshal(raw["mcpServers"], &servers); err != nil {
+		t.Fatal(err)
+	}
+	if len(servers) != 1 || servers["agentkeeper-mcp-gateway"].Command != "/usr/local/bin/agentkeeper-mcp-gateway" {
+		t.Fatalf("user-scoped Claude JSON not wired to gateway: %+v", servers)
+	}
+	if _, ok := raw["projects"]; !ok {
+		t.Fatalf("project-scoped Claude JSON settings were not preserved")
+	}
+	if _, ok := raw["keep_me"]; !ok {
+		t.Fatalf("non-MCP top-level key was not preserved")
+	}
+
+	gw, err := os.ReadFile(filepath.Join(home, ".config", "agentkeeper-mcp-gateway", "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		`"name": "notion"`,
+		`"url": "https://mcp.notion.com/mcp"`,
+		`"Authorization": "Bearer secret"`,
+		`"name": "raindrop"`,
+		`"url": "https://mcp.raindrop.ai/mcp"`,
+	} {
+		if !strings.Contains(string(gw), want) {
+			t.Fatalf("gateway config missing %s:\n%s", want, gw)
+		}
+	}
+}
+
 func TestE2E27_CoworkPluginMCPJSONMigrated(t *testing.T) {
 	home := t.TempDir()
 	pluginMCP := filepath.Join(
@@ -1091,5 +1172,140 @@ func TestE2E32_CoworkDoctorStrictFailsWhenGatewayHasNoBackends(t *testing.T) {
 	}
 	if !strings.Contains(stderr, "gateway config has no backend MCP servers") {
 		t.Fatalf("doctor did not explain missing backends: %s", stderr)
+	}
+}
+
+func TestE2E33_ConfigureIDEAlsoRoutesCoworkMCPSourcesByDefault(t *testing.T) {
+	home := t.TempDir()
+	pluginMCP := filepath.Join(
+		claudeAppSupportPath(home),
+		"local-agent-mode-sessions",
+		"session-1",
+		"cowork_plugins",
+		"marketplaces",
+		"vendor",
+		"linear",
+		".mcp.json",
+	)
+	if err := os.MkdirAll(filepath.Dir(pluginMCP), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(pluginMCP, []byte(`{
+		"mcpServers": {
+			"linear": {
+				"command": "node",
+				"args": ["${CLAUDE_PLUGIN_ROOT}/dist/server.js"],
+				"env": {"LINEAR_API_KEY": "secret"}
+			}
+		}
+	}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	out, _, code := run(t, home, "configure-ide", "--dry-run")
+	if code != 0 {
+		t.Fatalf("dry-run exit=%d out=%s", code, out)
+	}
+	if !strings.Contains(out, "cowork") || !strings.Contains(out, "linear") || !strings.Contains(out, "migrate 1 + wire") {
+		t.Fatalf("default configure-ide did not preview Cowork MCP routing: %s", out)
+	}
+
+	out, _, code = run(t, home, "configure-ide")
+	if code != 0 {
+		t.Fatalf("configure-ide exit=%d out=%s", code, out)
+	}
+	raw := readConfig(t, pluginMCP)
+	var servers map[string]struct {
+		Command string   `json:"command"`
+		Args    []string `json:"args"`
+	}
+	if err := json.Unmarshal(raw["mcpServers"], &servers); err != nil {
+		t.Fatal(err)
+	}
+	if len(servers) != 1 || servers["agentkeeper-mcp-gateway"].Command != "/usr/local/bin/agentkeeper-mcp-gateway" {
+		t.Fatalf("Cowork plugin MCP was not wired by configure-ide: %+v", servers)
+	}
+	assertGatewayWired(t, ideConfigPath(home, "claude-desktop"))
+
+	gw, err := os.ReadFile(filepath.Join(home, ".config", "agentkeeper-mcp-gateway", "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"name": "linear"`, `"command": "node"`, `"LINEAR_API_KEY": "secret"`} {
+		if !strings.Contains(string(gw), want) {
+			t.Fatalf("gateway config missing %s:\n%s", want, gw)
+		}
+	}
+}
+
+func TestE2E34_ConfigureIDEMigratesAllClaudeJSONProjectServers(t *testing.T) {
+	home := t.TempDir()
+	claudeJSON := filepath.Join(home, ".claude.json")
+	if err := os.WriteFile(claudeJSON, []byte(`{
+		"projects": {
+			"/Users/alice/api": {
+				"mcpServers": {
+					"linear": {"command": "node", "args": ["linear.js"]},
+					"supabase": {"type": "http", "url": "https://mcp.supabase.com/mcp"}
+				}
+			},
+			"/Users/alice/web": {
+				"mcpServers": {
+					"github": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-github"]}
+				}
+			}
+		}
+	}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	out, _, code := run(t, home, "configure-ide", "--ide=claude-code", "--dry-run")
+	if code != 0 {
+		t.Fatalf("dry-run exit=%d out=%s", code, out)
+	}
+	for _, want := range []string{"claude-code:projects", "linear", "supabase", "github"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("dry-run output missing %q:\n%s", want, out)
+		}
+	}
+
+	out, _, code = run(t, home, "configure-ide", "--ide=claude-code")
+	if code != 0 {
+		t.Fatalf("apply exit=%d out=%s", code, out)
+	}
+	raw := readConfig(t, claudeJSON)
+	var doc struct {
+		Projects map[string]struct {
+			MCPServers map[string]struct {
+				Command string   `json:"command"`
+				Args    []string `json:"args"`
+			} `json:"mcpServers"`
+		} `json:"projects"`
+	}
+	data, err := os.ReadFile(claudeJSON)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(data, &doc); err != nil {
+		t.Fatal(err)
+	}
+	if len(raw["projects"]) == 0 || len(doc.Projects) != 2 {
+		t.Fatalf("project map was not preserved: %s", data)
+	}
+	for project, value := range doc.Projects {
+		gw := value.MCPServers["agentkeeper-mcp-gateway"]
+		if len(value.MCPServers) != 1 || gw.Command != "/usr/local/bin/agentkeeper-mcp-gateway" || len(gw.Args) != 1 || gw.Args[0] != "server" {
+			t.Fatalf("project %s not wired to gateway: %+v", project, value.MCPServers)
+		}
+	}
+
+	gw, err := os.ReadFile(filepath.Join(home, ".config", "agentkeeper-mcp-gateway", "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"name": "linear"`, `"name": "supabase"`, `"url": "https://mcp.supabase.com/mcp"`, `"name": "github"`} {
+		if !strings.Contains(string(gw), want) {
+			t.Fatalf("gateway config missing %s:\n%s", want, gw)
+		}
 	}
 }

@@ -181,18 +181,12 @@ func printListEmptyState(out interface{ Write([]byte) (int, error) }) {
 }
 
 func countSeenOnly(discovered []discovery.DiscoveredServer, routed []config.ServerEntry) int {
-	routedNames := map[string]bool{}
-	for _, s := range routed {
-		if s.Name != "" {
-			routedNames[s.Name] = true
-		}
-	}
 	count := 0
 	for _, s := range discovered {
 		if s.RouteState == discovery.RouteRouted || s.Name == "agentkeeper-mcp-gateway" {
 			continue
 		}
-		if !routedNames[s.Name] {
+		if s.Routable {
 			count++
 		}
 	}
@@ -211,6 +205,9 @@ func healthNextSteps(cfg config.Config, discovered []discovery.DiscoveredServer,
 	if seenOnly > 0 {
 		steps = append(steps, "Run agentkeeper-mcp-gateway configure-ide --dry-run, verify supported config paths, then apply configure-ide.")
 	}
+	if hasDirectCoworkSource(discovered) {
+		steps = append(steps, "For Cowork sources created after setup, run agentkeeper-mcp-gateway cowork guard --once now and keep cowork guard running from a login item or service.")
+	}
 	if len(cfg.Servers) > 0 {
 		steps = append(steps, "Restart the MCP client and make one real harmless tool call through Gateway.")
 	}
@@ -219,6 +216,15 @@ func healthNextSteps(cfg config.Config, discovered []discovery.DiscoveredServer,
 	}
 	steps = append(steps, "Use manual add only for unsupported config sources or gateway-native admin setup.")
 	return steps
+}
+
+func hasDirectCoworkSource(discovered []discovery.DiscoveredServer) bool {
+	for _, s := range discovered {
+		if s.Client == discovery.ClientCowork && s.RouteState != discovery.RouteRouted && s.Routable {
+			return true
+		}
+	}
+	return false
 }
 
 func configPathsChecked(discovered []discovery.DiscoveredServer) []string {

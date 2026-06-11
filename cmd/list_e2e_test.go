@@ -57,6 +57,41 @@ func TestListHealthShowsDiscoveredSeenOnly(t *testing.T) {
 	}
 }
 
+func TestListHealthTreatsDirectConfigAsSeenOnlyEvenWhenBackendExists(t *testing.T) {
+	home := t.TempDir()
+	writeFixture(t, home, "cursor", `{
+		"mcpServers": {
+			"github": {
+				"command": "npx",
+				"args": ["-y", "@modelcontextprotocol/server-github"]
+			}
+		}
+	}`)
+	writeGatewayConfig(t, home, `{
+		"mode": "audit",
+		"servers": [{
+			"name": "github",
+			"command": "npx",
+			"args": ["-y", "@modelcontextprotocol/server-github"]
+		}]
+	}`)
+
+	out, stderr, code := run(t, home, "list", "--health")
+	if code != 0 {
+		t.Fatalf("exit %d, stderr: %s", code, stderr)
+	}
+	for _, want := range []string{
+		"Routed servers: 1",
+		"Discovered local config servers: 1",
+		"Seen only: 1",
+		"Run agentkeeper-mcp-gateway configure-ide --dry-run",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("missing %q in output:\n%s", want, out)
+		}
+	}
+}
+
 func TestListHealthJSONForMDMStatus(t *testing.T) {
 	home := t.TempDir()
 	writeFixture(t, home, "claude-code", `{
