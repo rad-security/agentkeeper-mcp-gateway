@@ -54,6 +54,30 @@ func TestDiscoverClaudeCodeProjectMCPJSON(t *testing.T) {
 	}
 }
 
+func TestDiscoverClaudeCodeSettingsJSON(t *testing.T) {
+	home := t.TempDir()
+	writeFixture(t, filepath.Join(home, ".claude", "settings.json"), `{
+		"mcpServers": {
+			"filesystem": {
+				"command": "npx",
+				"args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+			}
+		}
+	}`)
+
+	res, err := Discover(Options{Home: home, Client: ClientClaudeCode})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Servers) != 1 {
+		t.Fatalf("want 1 server, got %d: %+v", len(res.Servers), res.Servers)
+	}
+	got := res.Servers[0]
+	if got.Name != "filesystem" || got.SourceKind != "claude_code_settings" || got.Scope != "global" {
+		t.Fatalf("unexpected Claude Code settings discovery: %+v", got)
+	}
+}
+
 func TestDiscoverClaudeJSONUserAndProject(t *testing.T) {
 	home := t.TempDir()
 	cwd := filepath.Join(home, "repo")
@@ -86,6 +110,38 @@ func TestDiscoverClaudeJSONUserAndProject(t *testing.T) {
 	}
 	if len(byName["user-server"].HeaderKeys) != 1 || byName["user-server"].HeaderKeys[0] != "Authorization" {
 		t.Fatalf("header keys not redacted/preserved as keys: %+v", byName["user-server"].HeaderKeys)
+	}
+}
+
+func TestDiscoverCursorMCPJSON(t *testing.T) {
+	home := t.TempDir()
+	writeFixture(t, filepath.Join(home, ".cursor", "mcp.json"), `{
+		"mcpServers": {
+			"github": {
+				"command": "npx",
+				"args": ["-y", "@modelcontextprotocol/server-github"],
+				"env": {"GITHUB_TOKEN": "secret"}
+			}
+		}
+	}`)
+
+	res, err := Discover(Options{Home: home, Client: ClientCursor})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Servers) != 1 {
+		t.Fatalf("want 1 server, got %d: %+v", len(res.Servers), res.Servers)
+	}
+	got := res.Servers[0]
+	if got.Name != "github" || got.Client != ClientCursor || got.SourceKind != "cursor_mcp_json" || !got.Routable {
+		t.Fatalf("unexpected cursor discovery: %+v", got)
+	}
+	if len(got.EnvKeys) != 1 || got.EnvKeys[0] != "GITHUB_TOKEN" {
+		t.Fatalf("env keys not redacted/preserved as keys: %+v", got.EnvKeys)
+	}
+	data, _ := json.Marshal(got)
+	if strings.Contains(string(data), "secret") {
+		t.Fatalf("serialized discovery leaked secret: %s", data)
 	}
 }
 

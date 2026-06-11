@@ -16,9 +16,12 @@ var (
 
 var addCmd = &cobra.Command{
 	Use:   "add <name> <command_or_url>",
-	Short: "Register an MCP server with the gateway",
-	Long: `Register an MCP server to be proxied through the gateway. The server
-can be a local stdio command or a remote SSE URL.
+	Short: "Fallback/admin registration for a Gateway-native MCP server",
+	Long: `Register an MCP server directly with the gateway when there is no
+supported local MCP client config to migrate. For normal workstation rollout,
+run configure-ide --dry-run and configure-ide first.
+
+The server can be a local stdio command or a remote SSE URL.
 
 Examples:
   agentkeeper-mcp-gateway add filesystem npx -y @modelcontextprotocol/server-filesystem /tmp
