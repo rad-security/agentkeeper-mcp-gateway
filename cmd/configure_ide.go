@@ -24,10 +24,10 @@ var configureIDECmd = &cobra.Command{
 	Short: "Rewrite local IDE MCP configs to route through the gateway",
 	Long: `Point your AI coding IDE(s) at the gateway with a single command.
 
-Finds installed IDE configs (Claude Code, Claude Desktop, Cursor), backs each
-one up, and rewrites the MCP server list so the only entry is the AgentKeeper
-gateway. Any previously-registered MCP servers are migrated into the gateway's
-own config so no wiring is lost.
+Finds supported local MCP client configs (Claude Code, Claude Desktop, Cursor,
+and Cowork MCP sources), backs each one up, and rewrites the MCP server list so
+the client launches AgentKeeper Gateway. Any previously-registered MCP servers
+are migrated into the gateway's own config so no wiring is lost.
 
 This command is idempotent - if an IDE is already pointing at the gateway and
 nothing else, running it again is a no-op.
@@ -65,6 +65,7 @@ By default every detected IDE is configured. Use --ide to target just one.
 			for _, t := range configureIDETarget {
 				wanted[strings.ToLower(t)] = true
 			}
+			wantsCowork := wanted[discovery.ClientCowork]
 			filtered := adapters[:0]
 			for _, a := range adapters {
 				if wanted[a.Name] {
@@ -72,8 +73,8 @@ By default every detected IDE is configured. Use --ide to target just one.
 				}
 			}
 			adapters = filtered
-			if len(adapters) == 0 {
-				return fmt.Errorf("no matching IDE (known: claude-code, claude-desktop, cursor)")
+			if len(adapters) == 0 && !wantsCowork {
+				return fmt.Errorf("no matching IDE (known: claude-code, claude-desktop, cursor, cowork)")
 			}
 		}
 
@@ -96,6 +97,38 @@ By default every detected IDE is configured. Use --ide to target just one.
 				fmt.Fprintf(out, "  %-16s backup: %s\n", "", plan.BackupPath)
 			}
 			migratedAll = append(migratedAll, plan.Migrated...)
+		}
+
+		if configureIDETargetIncludes("claude-code") {
+			plan, err := discovery.MigrateClaudeJSONUser(configureIDEDryRun)
+			if err != nil {
+				fmt.Fprintf(out, "  %-16s error applying: %v\n", "claude-code:user", err)
+			} else {
+				printMigrationPlan(out, plan)
+			}
+			plan, err = discovery.MigrateClaudeJSONProjects(configureIDEDryRun)
+			if err != nil {
+				fmt.Fprintf(out, "  %-16s error applying: %v\n", "claude-code:projects", err)
+			} else {
+				printMigrationPlan(out, plan)
+			}
+		}
+
+		if configureIDETargetIncludes(discovery.ClientCowork) {
+			result, err := discovery.MigrateCoworkMCP("", configureIDEDryRun)
+			if err != nil {
+				fmt.Fprintf(out, "  %-16s error applying: %v\n", discovery.ClientCowork, err)
+			} else {
+				for _, plan := range result.Plans {
+					printCoworkMigrationPlan(out, plan)
+				}
+				if result.GatewayEntrypoint != nil {
+					wasCoworkDryRun := coworkDryRun
+					coworkDryRun = configureIDEDryRun
+					printCoworkGatewayEntrypointPlan(out, *result.GatewayEntrypoint)
+					coworkDryRun = wasCoworkDryRun
+				}
+			}
 		}
 
 		if len(migratedAll) == 0 {
@@ -198,16 +231,39 @@ func shouldUseProjectMigration() bool {
 	return true
 }
 
+func configureIDETargetIncludes(target string) bool {
+	if len(configureIDETarget) == 0 {
+		return true
+	}
+	target = strings.ToLower(target)
+	for _, t := range configureIDETarget {
+		if strings.ToLower(t) == target {
+			return true
+		}
+	}
+	return false
+}
+
 func printProjectMigrationPlan(out interface {
 	Write(p []byte) (int, error)
 }, plan discovery.MigrationPlan) {
-	status := "no project MCP servers discovered"
+	printMigrationPlan(out, plan)
+}
+
+func printMigrationPlan(out interface {
+	Write(p []byte) (int, error)
+}, plan discovery.MigrationPlan) {
+	status := "no MCP servers discovered"
 	if plan.AlreadyRouted {
 		status = "already routed"
 	} else if len(plan.Servers) > 0 {
 		status = fmt.Sprintf("migrate %d + wire", len(plan.Servers))
 	}
-	fmt.Fprintf(out, "  %-16s %s - %s\n", plan.Client, status, plan.ConfigPath)
+	label := plan.Client
+	if plan.Scope != "" && plan.Scope != "global" {
+		label = fmt.Sprintf("%s:%s", plan.Client, plan.Scope)
+	}
+	fmt.Fprintf(out, "  %-16s %s - %s\n", label, status, plan.ConfigPath)
 	for _, s := range plan.Servers {
 		if s.RouteState == discovery.RouteRouted {
 			continue
@@ -228,7 +284,7 @@ func printProjectMigrationPlan(out interface {
 
 func init() {
 	configureIDECmd.Flags().BoolVar(&configureIDEDryRun, "dry-run", false, "Preview changes without writing any files")
-	configureIDECmd.Flags().StringSliceVar(&configureIDETarget, "ide", nil, "Restrict to a specific IDE (claude-code, claude-desktop, cursor). Repeatable.")
+	configureIDECmd.Flags().StringSliceVar(&configureIDETarget, "ide", nil, "Restrict to a specific MCP client (claude-code, claude-desktop, cursor, cowork). Repeatable.")
 	configureIDECmd.Flags().StringVar(&configureIDECWD, "cwd", "", "Project directory for Claude Code project-scoped MCP migration")
 	configureIDECmd.Flags().StringVar(&configureIDEScope, "scope", "", "MCP scope to configure (project for Claude Code .mcp.json)")
 	configureIDECmd.Flags().BoolVar(&configureIDEJSON, "json", false, "Emit JSON for project-scoped migration")

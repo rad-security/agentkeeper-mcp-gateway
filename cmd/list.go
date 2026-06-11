@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/config"
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/discovery"
@@ -77,6 +78,7 @@ type listHealthReport struct {
 	DashboardConnected bool                         `json:"dashboard_connected"`
 	APIURL             string                       `json:"api_url,omitempty"`
 	RoutedServers      []config.ServerEntry         `json:"routed_servers"`
+	BackendToolHealth  []backendToolHealth          `json:"backend_tool_health"`
 	DiscoveredServers  []discovery.DiscoveredServer `json:"discovered_servers"`
 	ConfigPathsChecked []string                     `json:"config_paths_checked"`
 	SeenOnlyCount      int                          `json:"seen_only_count"`
@@ -85,28 +87,31 @@ type listHealthReport struct {
 	DiscoveryError     string                       `json:"discovery_error,omitempty"`
 }
 
+type backendToolHealth struct {
+	Name      string `json:"name"`
+	Transport string `json:"transport"`
+	Status    string `json:"status"`
+	ToolCount int    `json:"tool_count"`
+	Error     string `json:"error,omitempty"`
+}
+
 func buildListHealthReport(cfg config.Config) listHealthReport {
 	cwd, _ := os.Getwd()
 	res, err := discovery.Discover(discovery.Options{CWD: cwd})
 	discovered := res.Servers
 	seenOnly := countSeenOnly(discovered, cfg.Servers)
-	nextSteps := healthNextSteps(cfg, discovered, seenOnly)
-	status := "unknown"
-	if len(cfg.Servers) > 0 {
-		status = "pending"
-	}
-	if hasConfiguredTools(cfg.Servers) {
-		status = "observed"
-	}
+	backendHealth := probeBackendToolHealth(cfg)
+	nextSteps := healthNextSteps(cfg, discovered, seenOnly, backendHealth)
 	report := listHealthReport{
 		ConfigPath:         config.CurrentConfigPath(),
 		DashboardConnected: config.HasUsableAPIKey(cfg.APIKey),
 		APIURL:             cfg.APIURL,
 		RoutedServers:      cfg.Servers,
+		BackendToolHealth:  backendHealth,
 		DiscoveredServers:  discovered,
 		ConfigPathsChecked: configPathsChecked(discovered),
 		SeenOnlyCount:      seenOnly,
-		ToolManifestStatus: status,
+		ToolManifestStatus: summarizeToolManifestStatus(cfg.Servers, backendHealth),
 		NextSteps:          nextSteps,
 	}
 	if err != nil {
@@ -159,6 +164,14 @@ func printListHealth(out interface{ Write([]byte) (int, error) }, report listHea
 			fmt.Fprintf(out, "%-20s %-10s %s\n", s.Name, transport, target)
 		}
 	}
+	if len(report.BackendToolHealth) > 0 {
+		fmt.Fprintln(out, "")
+		fmt.Fprintf(out, "%-20s %-10s %-16s %-6s %s\n", "BACKEND", "TRANSPORT", "TOOLS", "COUNT", "DETAIL")
+		fmt.Fprintf(out, "%-20s %-10s %-16s %-6s %s\n", "-------", "---------", "-----", "-----", "------")
+		for _, h := range report.BackendToolHealth {
+			fmt.Fprintf(out, "%-20s %-10s %-16s %-6d %s\n", h.Name, h.Transport, h.Status, h.ToolCount, h.Error)
+		}
+	}
 	fmt.Fprintln(out, "")
 	fmt.Fprintln(out, "Next steps:")
 	for _, step := range report.NextSteps {
@@ -181,18 +194,12 @@ func printListEmptyState(out interface{ Write([]byte) (int, error) }) {
 }
 
 func countSeenOnly(discovered []discovery.DiscoveredServer, routed []config.ServerEntry) int {
-	routedNames := map[string]bool{}
-	for _, s := range routed {
-		if s.Name != "" {
-			routedNames[s.Name] = true
-		}
-	}
 	count := 0
 	for _, s := range discovered {
 		if s.RouteState == discovery.RouteRouted || s.Name == "agentkeeper-mcp-gateway" {
 			continue
 		}
-		if !routedNames[s.Name] {
+		if s.Routable {
 			count++
 		}
 	}
@@ -203,13 +210,22 @@ func hasConfiguredTools(servers []config.ServerEntry) bool {
 	return false
 }
 
-func healthNextSteps(cfg config.Config, discovered []discovery.DiscoveredServer, seenOnly int) []string {
+func healthNextSteps(cfg config.Config, discovered []discovery.DiscoveredServer, seenOnly int, backendHealth []backendToolHealth) []string {
 	var steps []string
 	if len(discovered) == 0 && len(cfg.Servers) == 0 {
 		steps = append(steps, "Run agentkeeper-mcp-gateway configure-ide --dry-run to discover supported local MCP client configs.")
 	}
 	if seenOnly > 0 {
 		steps = append(steps, "Run agentkeeper-mcp-gateway configure-ide --dry-run, verify supported config paths, then apply configure-ide.")
+	}
+	if hasDirectCoworkSource(discovered) {
+		steps = append(steps, "For Cowork sources created after setup, run agentkeeper-mcp-gateway cowork guard --once now and keep cowork guard running from a login item or service.")
+	}
+	if countBackendStatus(backendHealth, "auth_required") > 0 {
+		steps = append(steps, "Reconnect or authenticate remote MCP backends that report auth_required; native Claude/Cowork connectors may use separate cloud auth and bypass the standalone local gateway.")
+	}
+	if countBackendStatus(backendHealth, "unreachable") > 0 {
+		steps = append(steps, "Fix remote MCP backend connectivity for unreachable servers, then rerun agentkeeper-mcp-gateway list --health.")
 	}
 	if len(cfg.Servers) > 0 {
 		steps = append(steps, "Restart the MCP client and make one real harmless tool call through Gateway.")
@@ -219,6 +235,94 @@ func healthNextSteps(cfg config.Config, discovered []discovery.DiscoveredServer,
 	}
 	steps = append(steps, "Use manual add only for unsupported config sources or gateway-native admin setup.")
 	return steps
+}
+
+func hasDirectCoworkSource(discovered []discovery.DiscoveredServer) bool {
+	for _, s := range discovered {
+		if s.Client == discovery.ClientCowork && s.RouteState != discovery.RouteRouted && s.Routable {
+			return true
+		}
+	}
+	return false
+}
+
+func probeBackendToolHealth(cfg config.Config) []backendToolHealth {
+	if len(cfg.Servers) == 0 {
+		return nil
+	}
+	health := make([]backendToolHealth, 0, len(cfg.Servers))
+	for _, s := range cfg.Servers {
+		transport := normalizeListTransport(s)
+		h := backendToolHealth{
+			Name:      s.Name,
+			Transport: transport,
+			Status:    "pending",
+		}
+		if transport == "http" {
+			if knownOAuthMCPURL(s.URL) && !hasAuthHeader(s.Headers) {
+				h.Status = "auth_required"
+				h.Error = "remote MCP endpoint requires OAuth/auth headers; native Claude/Cowork connector auth is separate from the standalone local gateway"
+			} else if hasAuthHeader(s.Headers) {
+				h.Status = "auth_configured"
+			}
+		}
+		health = append(health, h)
+	}
+	return health
+}
+
+func summarizeToolManifestStatus(servers []config.ServerEntry, health []backendToolHealth) string {
+	if len(servers) == 0 {
+		return "unknown"
+	}
+	if countBackendStatus(health, "auth_required") > 0 || countBackendStatus(health, "unreachable") > 0 {
+		return "action_required"
+	}
+	if countBackendStatus(health, "tools_observed") > 0 {
+		return "observed"
+	}
+	return "pending"
+}
+
+func countBackendStatus(health []backendToolHealth, status string) int {
+	count := 0
+	for _, h := range health {
+		if h.Status == status {
+			count++
+		}
+	}
+	return count
+}
+
+func normalizeListTransport(s config.ServerEntry) string {
+	transport := strings.ToLower(strings.TrimSpace(s.Transport))
+	switch transport {
+	case "http", "sse", "streamable-http":
+		return "http"
+	case "":
+		if strings.TrimSpace(s.URL) != "" {
+			return "http"
+		}
+		return "stdio"
+	default:
+		return transport
+	}
+}
+
+func hasAuthHeader(headers map[string]string) bool {
+	for k, v := range headers {
+		if strings.EqualFold(strings.TrimSpace(k), "authorization") && strings.TrimSpace(v) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func knownOAuthMCPURL(raw string) bool {
+	u := strings.ToLower(strings.TrimSpace(raw))
+	return strings.Contains(u, "mcp.notion.com") ||
+		strings.Contains(u, "mcp.raindrop.ai") ||
+		strings.Contains(u, "mcp.linear.app")
 }
 
 func configPathsChecked(discovered []discovery.DiscoveredServer) []string {

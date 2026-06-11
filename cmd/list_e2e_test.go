@@ -57,6 +57,41 @@ func TestListHealthShowsDiscoveredSeenOnly(t *testing.T) {
 	}
 }
 
+func TestListHealthTreatsDirectConfigAsSeenOnlyEvenWhenBackendExists(t *testing.T) {
+	home := t.TempDir()
+	writeFixture(t, home, "cursor", `{
+		"mcpServers": {
+			"github": {
+				"command": "npx",
+				"args": ["-y", "@modelcontextprotocol/server-github"]
+			}
+		}
+	}`)
+	writeGatewayConfig(t, home, `{
+		"mode": "audit",
+		"servers": [{
+			"name": "github",
+			"command": "npx",
+			"args": ["-y", "@modelcontextprotocol/server-github"]
+		}]
+	}`)
+
+	out, stderr, code := run(t, home, "list", "--health")
+	if code != 0 {
+		t.Fatalf("exit %d, stderr: %s", code, stderr)
+	}
+	for _, want := range []string{
+		"Routed servers: 1",
+		"Discovered local config servers: 1",
+		"Seen only: 1",
+		"Run agentkeeper-mcp-gateway configure-ide --dry-run",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("missing %q in output:\n%s", want, out)
+		}
+	}
+}
+
 func TestListHealthJSONForMDMStatus(t *testing.T) {
 	home := t.TempDir()
 	writeFixture(t, home, "claude-code", `{
@@ -101,5 +136,80 @@ func TestListHealthJSONForMDMStatus(t *testing.T) {
 	}
 	if strings.Join(report.NextSteps, "\n") == "" || !strings.Contains(strings.Join(report.NextSteps, "\n"), "configure-ide") {
 		t.Fatalf("missing configure-ide next step: %+v", report.NextSteps)
+	}
+}
+
+func TestListHealthReportsRemoteAuthRequired(t *testing.T) {
+	home := t.TempDir()
+
+	writeGatewayConfig(t, home, `{
+		"mode": "audit",
+		"servers": [{
+			"name": "notion",
+			"transport": "http",
+			"url": "https://mcp.notion.com/mcp"
+		}]
+	}`)
+
+	out, stderr, code := run(t, home, "list", "--health", "--json")
+	if code != 0 {
+		t.Fatalf("exit %d, stderr: %s", code, stderr)
+	}
+	var report struct {
+		ToolManifestStatus string `json:"tool_manifest_status"`
+		BackendToolHealth  []struct {
+			Name   string `json:"name"`
+			Status string `json:"status"`
+			Error  string `json:"error"`
+		} `json:"backend_tool_health"`
+		NextSteps []string `json:"next_steps"`
+	}
+	if err := json.Unmarshal([]byte(out), &report); err != nil {
+		t.Fatalf("parsing json: %v\n%s", err, out)
+	}
+	if report.ToolManifestStatus != "action_required" {
+		t.Fatalf("expected action_required, got %q in %s", report.ToolManifestStatus, out)
+	}
+	if len(report.BackendToolHealth) != 1 || report.BackendToolHealth[0].Name != "notion" || report.BackendToolHealth[0].Status != "auth_required" {
+		t.Fatalf("unexpected backend health: %+v\n%s", report.BackendToolHealth, out)
+	}
+	if !strings.Contains(strings.Join(report.NextSteps, "\n"), "auth_required") {
+		t.Fatalf("missing auth next step: %+v", report.NextSteps)
+	}
+}
+
+func TestListHealthReportsRemoteAuthConfigured(t *testing.T) {
+	home := t.TempDir()
+
+	writeGatewayConfig(t, home, `{
+		"mode": "audit",
+		"servers": [{
+			"name": "notion",
+			"transport": "http",
+			"url": "https://mcp.notion.com/mcp",
+			"headers": {"Authorization": "Bearer test"}
+		}]
+	}`)
+
+	out, stderr, code := run(t, home, "list", "--health", "--json")
+	if code != 0 {
+		t.Fatalf("exit %d, stderr: %s", code, stderr)
+	}
+	var report struct {
+		ToolManifestStatus string `json:"tool_manifest_status"`
+		BackendToolHealth  []struct {
+			Name      string `json:"name"`
+			Status    string `json:"status"`
+			ToolCount int    `json:"tool_count"`
+		} `json:"backend_tool_health"`
+	}
+	if err := json.Unmarshal([]byte(out), &report); err != nil {
+		t.Fatalf("parsing json: %v\n%s", err, out)
+	}
+	if report.ToolManifestStatus != "pending" {
+		t.Fatalf("expected pending until a real tool call observes tools, got %q in %s", report.ToolManifestStatus, out)
+	}
+	if len(report.BackendToolHealth) != 1 || report.BackendToolHealth[0].Status != "auth_configured" || report.BackendToolHealth[0].ToolCount != 0 {
+		t.Fatalf("unexpected backend health: %+v\n%s", report.BackendToolHealth, out)
 	}
 }

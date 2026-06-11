@@ -374,6 +374,129 @@ func MigrateProjectMCP(cwd string, dryRun bool) (MigrationPlan, error) {
 	return MigrateMCPFile(path, ClientClaudeCode, "project", "project_mcp_json", RouteabilityLocalRoutable, dryRun)
 }
 
+// MigrateClaudeJSONUser migrates Claude Code user-scoped MCP servers from
+// ~/.claude.json into the gateway config and rewrites that user config so
+// Claude Code launches the gateway instead of calling those servers directly.
+func MigrateClaudeJSONUser(dryRun bool) (MigrationPlan, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return MigrationPlan{}, err
+	}
+	path := filepath.Join(home, ".claude.json")
+	return MigrateMCPFile(path, ClientClaudeCode, "user", "claude_json_user", RouteabilityLocalRoutable, dryRun)
+}
+
+// MigrateClaudeJSONProjects migrates every project-scoped MCP server nested
+// under ~/.claude.json projects into the gateway config. This closes the gap
+// where enterprise setup discovered project entries only when run from that
+// exact project directory.
+func MigrateClaudeJSONProjects(dryRun bool) (MigrationPlan, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return MigrationPlan{}, err
+	}
+	path := filepath.Join(home, ".claude.json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return MigrationPlan{Client: ClientClaudeCode, Scope: "projects", ConfigPath: path}, nil
+		}
+		return MigrationPlan{}, err
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return MigrationPlan{}, err
+	}
+	var projects map[string]map[string]json.RawMessage
+	if len(raw["projects"]) > 0 && string(raw["projects"]) != "null" {
+		if err := json.Unmarshal(raw["projects"], &projects); err != nil {
+			return MigrationPlan{}, err
+		}
+	}
+
+	plan := MigrationPlan{Client: ClientClaudeCode, Scope: "projects", ConfigPath: path}
+	if len(projects) == 0 {
+		return plan, nil
+	}
+
+	projectKeys := make([]string, 0, len(projects))
+	for project := range projects {
+		projectKeys = append(projectKeys, project)
+	}
+	sort.Strings(projectKeys)
+
+	directByProject := map[string][]DiscoveredServer{}
+	for _, project := range projectKeys {
+		servers := readServersRaw(projects[project]["mcpServers"], path, ClientClaudeCode, "project", "claude_json_project", RouteabilityLocalRoutable)
+		for i := range servers {
+			servers[i].SourceHash = shortHash(filepath.Clean(path) + "|" + project + "|" + servers[i].Name)
+		}
+		plan.Servers = append(plan.Servers, servers...)
+		for _, s := range servers {
+			if s.RouteState == RouteRouted || !s.Routable {
+				continue
+			}
+			directByProject[project] = append(directByProject[project], s)
+		}
+	}
+	if len(directByProject) == 0 {
+		plan.AlreadyRouted = allRouted(plan.Servers)
+		return plan, nil
+	}
+	if dryRun {
+		return plan, nil
+	}
+
+	backup := path + ".agentkeeper-backup-" + fmt.Sprintf("%d", unixNano())
+	if err := os.WriteFile(backup, data, 0o644); err != nil {
+		return plan, err
+	}
+	plan.BackupPath = backup
+
+	for _, project := range projectKeys {
+		direct := directByProject[project]
+		if len(direct) == 0 {
+			continue
+		}
+		for _, s := range direct {
+			entry := s.Entry
+			entry.Name = s.Name
+			if entry.Transport == "" {
+				entry.Transport = normalizeTransport(entry)
+			}
+			gatewayName, err := addServerWithoutClobber(entry, s.SourceHash)
+			if err != nil {
+				return plan, fmt.Errorf("adding %s to gateway config: %w", s.Name, err)
+			}
+			if gatewayName != s.Name {
+				s.GatewayName = gatewayName
+			}
+			plan.Migrated = append(plan.Migrated, s)
+		}
+		encoded, err := json.Marshal(map[string]config.ServerEntry{
+			"agentkeeper-mcp-gateway": gatewayServerEntry(),
+		})
+		if err != nil {
+			return plan, err
+		}
+		projects[project]["mcpServers"] = encoded
+	}
+
+	encodedProjects, err := json.Marshal(projects)
+	if err != nil {
+		return plan, err
+	}
+	raw["projects"] = encodedProjects
+	out, err := json.MarshalIndent(raw, "", "  ")
+	if err != nil {
+		return plan, err
+	}
+	if err := os.WriteFile(path, out, 0o644); err != nil {
+		return plan, err
+	}
+	return plan, nil
+}
+
 // CoworkMigrationResult summarizes Cowork MCP source rewrites.
 type CoworkMigrationResult struct {
 	Plans             []MigrationPlan `json:"plans"`
