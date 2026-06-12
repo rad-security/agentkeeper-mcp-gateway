@@ -125,6 +125,8 @@ func TestScan04_ProjectCWDFlag(t *testing.T) {
 	home := t.TempDir()
 	cwd := t.TempDir()
 	scanWriteFixture(t, filepath.Join(cwd, ".claude", "skills", "proj-skill", "SKILL.md"), "# proj")
+	scanWriteFixture(t, filepath.Join(cwd, ".mcp.json"),
+		`{"mcpServers":{"project-json-mcp":{"command":"npx","args":["-y","@modelcontextprotocol/server-filesystem","."]}}}`)
 	scanWriteFixture(t, filepath.Join(cwd, ".claude", "settings.json"),
 		`{"mcpServers":{"proj-mcp":{"command":"node","args":["server.js"]}}}`)
 
@@ -137,7 +139,11 @@ func TestScan04_ProjectCWDFlag(t *testing.T) {
 	var payload struct {
 		CWD                string `json:"cwd"`
 		InstalledSkills    []any  `json:"installed_skills"`
-		InstalledMCPServer []any  `json:"installed_mcp_servers"`
+		InstalledMCPServer []struct {
+			Name    string `json:"name"`
+			Source  string `json:"source"`
+			Command string `json:"command"`
+		} `json:"installed_mcp_servers"`
 	}
 	if err := json.Unmarshal(out, &payload); err != nil {
 		t.Fatal(err)
@@ -148,8 +154,20 @@ func TestScan04_ProjectCWDFlag(t *testing.T) {
 	if len(payload.InstalledSkills) != 1 {
 		t.Errorf("want 1 project skill, got %d", len(payload.InstalledSkills))
 	}
-	if len(payload.InstalledMCPServer) != 1 {
-		t.Errorf("want 1 project MCP server, got %d", len(payload.InstalledMCPServer))
+	if len(payload.InstalledMCPServer) != 2 {
+		t.Fatalf("want 2 project MCP servers, got %d: %+v", len(payload.InstalledMCPServer), payload.InstalledMCPServer)
+	}
+	names := map[string]bool{}
+	for _, server := range payload.InstalledMCPServer {
+		names[server.Name] = true
+		if server.Source != "project" {
+			t.Errorf("project MCP server %s source=%q, want project", server.Name, server.Source)
+		}
+	}
+	for _, want := range []string{"project-json-mcp", "proj-mcp"} {
+		if !names[want] {
+			t.Errorf("missing project MCP server %s in %+v", want, payload.InstalledMCPServer)
+		}
 	}
 }
 

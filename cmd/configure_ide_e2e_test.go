@@ -52,7 +52,15 @@ func TestMain(m *testing.M) {
 // stable path so the gateway's own config lives in the test's home.
 func run(t *testing.T, home string, args ...string) (string, string, int) {
 	t.Helper()
+	return runInDir(t, home, "", args...)
+}
+
+func runInDir(t *testing.T, home, dir string, args ...string) (string, string, int) {
+	t.Helper()
 	cmd := exec.Command(binary, args...)
+	if dir != "" {
+		cmd.Dir = dir
+	}
 	cmd.Env = []string{
 		"HOME=" + home,
 		"PATH=" + os.Getenv("PATH"),
@@ -176,8 +184,8 @@ func assertGatewayWired(t *testing.T, path string) {
 	if !ok {
 		t.Fatalf("%s: gateway entry missing; keys=%v", path, servers)
 	}
-	if gw.Command != "agentkeeper-mcp-gateway" {
-		t.Errorf("%s: gateway.command = %q, want agentkeeper-mcp-gateway", path, gw.Command)
+	if gw.Command != binary {
+		t.Errorf("%s: gateway.command = %q, want %s", path, gw.Command, binary)
 	}
 	if len(gw.Args) != 1 || gw.Args[0] != "server" {
 		t.Errorf("%s: gateway.args = %v, want [server]", path, gw.Args)
@@ -202,8 +210,8 @@ func assertCoworkGatewayEntrypoint(t *testing.T, path string) {
 	if !ok {
 		t.Fatalf("%s: gateway entry missing; keys=%v", path, servers)
 	}
-	if gw.Command != "/usr/local/bin/agentkeeper-mcp-gateway" {
-		t.Errorf("%s: gateway.command = %q, want /usr/local/bin/agentkeeper-mcp-gateway", path, gw.Command)
+	if gw.Command != binary {
+		t.Errorf("%s: gateway.command = %q, want %s", path, gw.Command, binary)
 	}
 	if len(gw.Args) != 1 || gw.Args[0] != "server" {
 		t.Errorf("%s: gateway.args = %v, want [server]", path, gw.Args)
@@ -517,13 +525,13 @@ func TestE2E16_ConfigPathIsDirectory(t *testing.T) {
 // E2E-17: already-wired + extra unrelated top-level keys → no-op, keys preserved.
 func TestE2E17_AlreadyWiredPreservesExtras(t *testing.T) {
 	home := t.TempDir()
-	body := `{
+	body := fmt.Sprintf(`{
   "mcpServers": {
-    "agentkeeper-mcp-gateway": {"command": "agentkeeper-mcp-gateway", "args": ["server"]}
+    "agentkeeper-mcp-gateway": {"command": %q, "args": ["server"]}
   },
   "editor": {"tabSize": 2},
   "version": 42
-}`
+}`, binary)
 	p := writeFixture(t, home, "cursor", body)
 	statBefore, _ := os.Stat(p)
 	_, _, code := run(t, home, "configure-ide")
@@ -533,6 +541,27 @@ func TestE2E17_AlreadyWiredPreservesExtras(t *testing.T) {
 	statAfter, _ := os.Stat(p)
 	if statAfter.ModTime() != statBefore.ModTime() {
 		t.Error("file was rewritten despite being already wired")
+	}
+}
+
+// E2E-17b: a legacy bare gateway command is not enough on fresh macOS GUI
+// clients; configure-ide must repair it to the actual installed binary path.
+func TestE2E17b_StaleBareGatewayEntryRewritesToInstalledPath(t *testing.T) {
+	home := t.TempDir()
+	body := `{
+  "mcpServers": {
+    "agentkeeper-mcp-gateway": {"command": "agentkeeper-mcp-gateway", "args": ["server"]}
+  },
+  "editor": {"tabSize": 2}
+}`
+	p := writeFixture(t, home, "cursor", body)
+	_, _, code := run(t, home, "configure-ide")
+	if code != 0 {
+		t.Fatalf("exit %d", code)
+	}
+	assertGatewayWired(t, p)
+	if countBackups(t, filepath.Dir(p)) != 1 {
+		t.Fatalf("expected stale bare gateway entry to be backed up and rewritten")
 	}
 }
 
@@ -564,7 +593,7 @@ func TestE2E19_CaseSensitiveBasenameMatch(t *testing.T) {
 	raw := readConfig(t, p)
 	var servers map[string]map[string]any
 	_ = json.Unmarshal(raw["mcpServers"], &servers)
-	if servers["agentkeeper-mcp-gateway"]["command"] != "agentkeeper-mcp-gateway" {
+	if servers["agentkeeper-mcp-gateway"]["command"] != binary {
 		t.Errorf("expected rewire to canonical case; got %v", servers)
 	}
 }
@@ -574,7 +603,7 @@ func TestE2E19_CaseSensitiveBasenameMatch(t *testing.T) {
 // has an extra field like "type":"stdio" that some IDEs add.
 func TestE2E20_ExtraFieldOnGatewayEntry_StillWired(t *testing.T) {
 	home := t.TempDir()
-	body := `{"mcpServers":{"agentkeeper-mcp-gateway":{"command":"agentkeeper-mcp-gateway","args":["server"],"type":"stdio"}}}`
+	body := fmt.Sprintf(`{"mcpServers":{"agentkeeper-mcp-gateway":{"command":%q,"args":["server"],"type":"stdio"}}}`, binary)
 	p := writeFixture(t, home, "cursor", body)
 	// We don't have a getter for the Plan struct here; we can only check via
 	// observable behavior: no backup should be created if we consider this wired.
@@ -689,11 +718,9 @@ func TestE2E24_APIKeyFromEnvIsPersistedByMigration(t *testing.T) {
 	}
 }
 
-// E2E-25: configure-ide run twice with a new server added between runs does NOT
-// pick up the new server (known limitation — documented as out-of-scope in the
-// issue). This is a pinning test — if we ever fix this behavior we want to know.
-// The value of the test: prevents silent behavior change.
-func TestE2E25_KnownLimitation_NewServerBetweenRunsMissed(t *testing.T) {
+// E2E-25: configure-ide run twice with a new server added between runs picks
+// up the new server and keeps the gateway wrapper canonical.
+func TestE2E25_NewServerBetweenRunsMigrated(t *testing.T) {
 	home := t.TempDir()
 	// Start with one server.
 	writeFixture(t, home, "cursor", `{"mcpServers":{"first":{"command":"npx","args":["-y","first"]}}}`)
@@ -701,12 +728,12 @@ func TestE2E25_KnownLimitation_NewServerBetweenRunsMissed(t *testing.T) {
 
 	// Now simulate the user adding a new server via their IDE (writing back
 	// alongside the gateway entry).
-	writeFixture(t, home, "cursor", `{
+	writeFixture(t, home, "cursor", fmt.Sprintf(`{
 		"mcpServers": {
-			"agentkeeper-mcp-gateway": {"command": "agentkeeper-mcp-gateway", "args": ["server"]},
+			"agentkeeper-mcp-gateway": {"command": %q, "args": ["server"]},
 			"second": {"command": "npx", "args": ["-y", "second"]}
 		}
-	}`)
+	}`, binary))
 	_, _, _ = run(t, home, "configure-ide")
 
 	// The second server SHOULD now be in the gateway config (our current
@@ -764,7 +791,7 @@ func TestE2E26_ClaudeCodeProjectMCPJSONMigrated(t *testing.T) {
 	if err := json.Unmarshal(raw["mcpServers"], &servers); err != nil {
 		t.Fatal(err)
 	}
-	if len(servers) != 1 || servers["agentkeeper-mcp-gateway"].Command != "/usr/local/bin/agentkeeper-mcp-gateway" {
+	if len(servers) != 1 || servers["agentkeeper-mcp-gateway"].Command != binary {
 		t.Fatalf("project MCP not wired to gateway: %+v", servers)
 	}
 	if _, ok := raw["other"]; !ok {
@@ -779,6 +806,149 @@ func TestE2E26_ClaudeCodeProjectMCPJSONMigrated(t *testing.T) {
 		if !strings.Contains(string(gw), want) {
 			t.Fatalf("gateway config missing %s:\n%s", want, gw)
 		}
+	}
+}
+
+func TestE2E27_DefaultConfigureIDEMigratesCurrentProjectMCPJSON(t *testing.T) {
+	home := t.TempDir()
+	project := filepath.Join(home, "repo")
+	projectMCP := filepath.Join(project, ".mcp.json")
+	if err := os.MkdirAll(project, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(projectMCP, []byte(`{
+		"mcpServers": {
+			"qa-project-filesystem": {
+				"command": "npx",
+				"args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+			}
+		}
+	}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	out, _, code := runInDir(t, home, project, "configure-ide", "--dry-run")
+	if code != 0 {
+		t.Fatalf("dry-run exit=%d out=%s", code, out)
+	}
+	if !strings.Contains(out, "claude-code:project") || !strings.Contains(out, "qa-project-filesystem") {
+		t.Fatalf("default dry-run did not include current project .mcp.json: %s", out)
+	}
+
+	out, _, code = runInDir(t, home, project, "configure-ide")
+	if code != 0 {
+		t.Fatalf("apply exit=%d out=%s", code, out)
+	}
+	if countBackups(t, project) != 1 {
+		t.Fatalf("expected stale project gateway entry to be backed up and rewritten")
+	}
+	raw := readConfig(t, projectMCP)
+	var servers map[string]struct {
+		Command string   `json:"command"`
+		Args    []string `json:"args"`
+	}
+	if err := json.Unmarshal(raw["mcpServers"], &servers); err != nil {
+		t.Fatal(err)
+	}
+	if len(servers) != 1 || servers["agentkeeper-mcp-gateway"].Command != binary {
+		t.Fatalf("current project .mcp.json was not wired to gateway: %+v", servers)
+	}
+	gw, err := os.ReadFile(filepath.Join(home, ".config", "agentkeeper-mcp-gateway", "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(gw), `"name": "qa-project-filesystem"`) {
+		t.Fatalf("gateway config missing project backend:\n%s", gw)
+	}
+}
+
+func TestE2E27b_DefaultConfigureIDERepairsStaleProjectGatewayEntrypoint(t *testing.T) {
+	home := t.TempDir()
+	project := filepath.Join(home, "repo")
+	projectMCP := filepath.Join(project, ".mcp.json")
+	if err := os.MkdirAll(project, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(projectMCP, []byte(`{
+		"mcpServers": {
+			"agentkeeper-mcp-gateway": {
+				"command": "agentkeeper-mcp-gateway",
+				"args": ["server"]
+			}
+		}
+	}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	out, _, code := runInDir(t, home, project, "configure-ide")
+	if code != 0 {
+		t.Fatalf("apply exit=%d out=%s", code, out)
+	}
+	raw := readConfig(t, projectMCP)
+	var servers map[string]struct {
+		Command string   `json:"command"`
+		Args    []string `json:"args"`
+	}
+	if err := json.Unmarshal(raw["mcpServers"], &servers); err != nil {
+		t.Fatal(err)
+	}
+	if len(servers) != 1 || servers["agentkeeper-mcp-gateway"].Command != binary {
+		t.Fatalf("stale project gateway entry was not rewritten to installed path: %+v", servers)
+	}
+	gw, err := os.ReadFile(filepath.Join(home, ".config", "agentkeeper-mcp-gateway", "config.json"))
+	if err == nil && strings.Contains(string(gw), `"name": "agentkeeper-mcp-gateway"`) {
+		t.Fatalf("stale gateway wrapper was imported as a backend server:\n%s", gw)
+	}
+}
+
+func TestE2E28_DefaultConfigureIDERoutesProjectServerAddedAfterInstall(t *testing.T) {
+	home := t.TempDir()
+	project := filepath.Join(home, "repo")
+	projectMCP := filepath.Join(project, ".mcp.json")
+	if err := os.MkdirAll(project, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	out, _, code := runInDir(t, home, project, "configure-ide")
+	if code != 0 {
+		t.Fatalf("initial configure-ide exit=%d out=%s", code, out)
+	}
+
+	if err := os.WriteFile(projectMCP, []byte(`{
+		"mcpServers": {
+			"qa-post-filesystem": {
+				"command": "npx",
+				"args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+			}
+		}
+	}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	out, _, code = runInDir(t, home, project, "configure-ide")
+	if code != 0 {
+		t.Fatalf("second configure-ide exit=%d out=%s", code, out)
+	}
+	if !strings.Contains(out, "qa-post-filesystem") {
+		t.Fatalf("second configure-ide did not migrate post-install project server: %s", out)
+	}
+	raw := readConfig(t, projectMCP)
+	var servers map[string]struct {
+		Command string   `json:"command"`
+		Args    []string `json:"args"`
+	}
+	if err := json.Unmarshal(raw["mcpServers"], &servers); err != nil {
+		t.Fatal(err)
+	}
+	if len(servers) != 1 || servers["agentkeeper-mcp-gateway"].Command != binary {
+		t.Fatalf("post-install project server was not routed: %+v", servers)
+	}
+	gw, err := os.ReadFile(filepath.Join(home, ".config", "agentkeeper-mcp-gateway", "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(gw), `"name": "qa-post-filesystem"`) {
+		t.Fatalf("gateway config missing post-install project backend:\n%s", gw)
 	}
 }
 
@@ -836,7 +1006,7 @@ func TestE2E30_ClaudeCodeUserClaudeJSONMigrated(t *testing.T) {
 	if err := json.Unmarshal(raw["mcpServers"], &servers); err != nil {
 		t.Fatal(err)
 	}
-	if len(servers) != 1 || servers["agentkeeper-mcp-gateway"].Command != "/usr/local/bin/agentkeeper-mcp-gateway" {
+	if len(servers) != 1 || servers["agentkeeper-mcp-gateway"].Command != binary {
 		t.Fatalf("user-scoped Claude JSON not wired to gateway: %+v", servers)
 	}
 	if _, ok := raw["projects"]; !ok {
@@ -918,7 +1088,7 @@ func TestE2E27_CoworkPluginMCPJSONMigrated(t *testing.T) {
 	if err := json.Unmarshal(raw["mcpServers"], &servers); err != nil {
 		t.Fatal(err)
 	}
-	if len(servers) != 1 || servers["agentkeeper-mcp-gateway"].Command != "/usr/local/bin/agentkeeper-mcp-gateway" {
+	if len(servers) != 1 || servers["agentkeeper-mcp-gateway"].Command != binary {
 		t.Fatalf("cowork plugin MCP not wired to gateway: %+v", servers)
 	}
 	if _, ok := raw["plugin"]; !ok {
@@ -952,14 +1122,14 @@ func TestE2E27_CoworkPluginMCPJSONMigrated(t *testing.T) {
 
 func TestE2E28_CoworkDoctorReportsPartialRouting(t *testing.T) {
 	home := t.TempDir()
-	writeFixture(t, home, "claude-desktop", `{
+	writeFixture(t, home, "claude-desktop", fmt.Sprintf(`{
 		"mcpServers": {
 			"agentkeeper-mcp-gateway": {
-				"command": "agentkeeper-mcp-gateway",
+				"command": %q,
 				"args": ["server"]
 			}
 		}
-	}`)
+	}`, binary))
 
 	pluginMCP := filepath.Join(
 		claudeAppSupportPath(home),
@@ -1123,14 +1293,14 @@ func TestE2E30_CoworkGuardOnceDisablesNewRemoteMCPSource(t *testing.T) {
 
 func TestE2E31_CoworkDoctorCanFailWhenNativeConnectorCoverageIsRequired(t *testing.T) {
 	home := t.TempDir()
-	writeFixture(t, home, "claude-desktop", `{
+	writeFixture(t, home, "claude-desktop", fmt.Sprintf(`{
 		"mcpServers": {
 			"agentkeeper-mcp-gateway": {
-				"command": "agentkeeper-mcp-gateway",
+				"command": %q,
 				"args": ["server"]
 			}
 		}
-	}`)
+	}`, binary))
 	writeGatewayConfig(t, home, `{
 		"mode": "audit",
 		"servers": [{
@@ -1154,14 +1324,14 @@ func TestE2E31_CoworkDoctorCanFailWhenNativeConnectorCoverageIsRequired(t *testi
 
 func TestE2E32_CoworkDoctorStrictFailsWhenGatewayHasNoBackends(t *testing.T) {
 	home := t.TempDir()
-	writeFixture(t, home, "claude-desktop", `{
+	writeFixture(t, home, "claude-desktop", fmt.Sprintf(`{
 		"mcpServers": {
 			"agentkeeper-mcp-gateway": {
-				"command": "agentkeeper-mcp-gateway",
+				"command": %q,
 				"args": ["server"]
 			}
 		}
-	}`)
+	}`, binary))
 
 	out, stderr, code := run(t, home, "cowork", "doctor", "--strict")
 	if code == 0 {
@@ -1222,7 +1392,7 @@ func TestE2E33_ConfigureIDEAlsoRoutesCoworkMCPSourcesByDefault(t *testing.T) {
 	if err := json.Unmarshal(raw["mcpServers"], &servers); err != nil {
 		t.Fatal(err)
 	}
-	if len(servers) != 1 || servers["agentkeeper-mcp-gateway"].Command != "/usr/local/bin/agentkeeper-mcp-gateway" {
+	if len(servers) != 1 || servers["agentkeeper-mcp-gateway"].Command != binary {
 		t.Fatalf("Cowork plugin MCP was not wired by configure-ide: %+v", servers)
 	}
 	assertGatewayWired(t, ideConfigPath(home, "claude-desktop"))
@@ -1294,7 +1464,7 @@ func TestE2E34_ConfigureIDEMigratesAllClaudeJSONProjectServers(t *testing.T) {
 	}
 	for project, value := range doc.Projects {
 		gw := value.MCPServers["agentkeeper-mcp-gateway"]
-		if len(value.MCPServers) != 1 || gw.Command != "/usr/local/bin/agentkeeper-mcp-gateway" || len(gw.Args) != 1 || gw.Args[0] != "server" {
+		if len(value.MCPServers) != 1 || gw.Command != binary || len(gw.Args) != 1 || gw.Args[0] != "server" {
 			t.Fatalf("project %s not wired to gateway: %+v", project, value.MCPServers)
 		}
 	}

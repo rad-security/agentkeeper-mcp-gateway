@@ -219,7 +219,7 @@ func healthNextSteps(cfg config.Config, discovered []discovery.DiscoveredServer,
 		steps = append(steps, "Run agentkeeper-mcp-gateway configure-ide --dry-run to discover supported local MCP client configs.")
 	}
 	if seenOnly > 0 {
-		steps = append(steps, "Run agentkeeper-mcp-gateway configure-ide --dry-run, verify supported config paths, then apply configure-ide.")
+		steps = append(steps, "Run agentkeeper-mcp-gateway configure-ide --dry-run from the project directory, or pass --cwd for project .mcp.json, then apply configure-ide.")
 	}
 	if hasDirectCoworkSource(discovered) {
 		steps = append(steps, "For Cowork sources created after setup, run agentkeeper-mcp-gateway cowork guard --once now and keep cowork guard running from a login item or service.")

@@ -3,6 +3,8 @@ package cmd
 import (
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/config"
@@ -37,7 +39,15 @@ By default every detected IDE is configured. Use --ide to target just one.
 	RunE: func(cmd *cobra.Command, args []string) error {
 		out := cmd.OutOrStdout()
 		if shouldUseProjectMigration() {
-			plan, err := discovery.MigrateProjectMCP(configureIDECWD, configureIDEDryRun)
+			cwd := configureIDECWD
+			if strings.TrimSpace(cwd) == "" {
+				var err error
+				cwd, err = os.Getwd()
+				if err != nil {
+					return err
+				}
+			}
+			plan, err := discovery.MigrateProjectMCP(cwd, configureIDEDryRun)
 			if err != nil {
 				return err
 			}
@@ -111,6 +121,16 @@ By default every detected IDE is configured. Use --ide to target just one.
 				fmt.Fprintf(out, "  %-16s error applying: %v\n", "claude-code:projects", err)
 			} else {
 				printMigrationPlan(out, plan)
+			}
+			if cwd, ok, err := projectMigrationCWD(); err != nil {
+				fmt.Fprintf(out, "  %-16s error applying: %v\n", "claude-code:project", err)
+			} else if ok {
+				plan, err = discovery.MigrateProjectMCP(cwd, configureIDEDryRun)
+				if err != nil {
+					fmt.Fprintf(out, "  %-16s error applying: %v\n", "claude-code:project", err)
+				} else {
+					printMigrationPlan(out, plan)
+				}
 			}
 		}
 
@@ -242,6 +262,28 @@ func configureIDETargetIncludes(target string) bool {
 		}
 	}
 	return false
+}
+
+func projectMigrationCWD() (string, bool, error) {
+	if configureIDEScope != "" && configureIDEScope != "project" {
+		return "", false, nil
+	}
+	if strings.TrimSpace(configureIDECWD) != "" {
+		return configureIDECWD, true, nil
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "", false, err
+	}
+	if configureIDEScope == "project" {
+		return cwd, true, nil
+	}
+	if _, err := os.Stat(filepath.Join(cwd, ".mcp.json")); err == nil {
+		return cwd, true, nil
+	} else if !os.IsNotExist(err) {
+		return "", false, err
+	}
+	return "", false, nil
 }
 
 func printProjectMigrationPlan(out interface {
