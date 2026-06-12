@@ -26,16 +26,14 @@ import (
 	"path/filepath"
 	"runtime"
 	"time"
+
+	"github.com/rad-security/agentkeeper-mcp-gateway/internal/gatewayentry"
 )
 
 // GatewayServerName is the key this package writes under `mcpServers`. It is
 // also how we detect "already wired" idempotency — an IDE config whose only
 // MCP entry has this name and our exact shape is a no-op.
 const GatewayServerName = "agentkeeper-mcp-gateway"
-
-// gatewayCommand is the command we write into the IDE config. Kept short and
-// PATH-relative so it works on every laptop that ran our install script.
-const gatewayCommand = "agentkeeper-mcp-gateway"
 
 // backupSuffix is appended (with a timestamp) to the original path when we
 // back up before rewriting.
@@ -142,18 +140,16 @@ func cursorAdapter() *Adapter {
 // gatewayEntry is the single server entry we write into every IDE config.
 func gatewayEntry() ServerEntry {
 	return ServerEntry{
-		Command: gatewayCommand,
+		Command: gatewayentry.Command(),
 		Args:    []string{"server"},
 	}
 }
 
-// isGatewayEntry reports whether an entry matches our canonical shape. The
-// command must resolve (by basename) to the gateway binary — a developer who
-// installed via `go install` will have a full home-dir path, which is still
-// a correct wiring, so we don't require a bare command name. Args must match
-// exactly to catch half-configured entries.
+// isGatewayEntry reports whether an entry matches our canonical shape. When an
+// installed binary path is known, the command must match that path exactly so a
+// rerun repairs stale /usr/local or bare entries.
 func isGatewayEntry(e ServerEntry) bool {
-	if filepath.Base(e.Command) != gatewayCommand {
+	if !gatewayentry.IsCurrentGatewayCommand(e.Command) {
 		return false
 	}
 	if len(e.Args) != 1 || e.Args[0] != "server" {

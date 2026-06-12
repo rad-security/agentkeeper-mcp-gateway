@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/config"
+	"github.com/rad-security/agentkeeper-mcp-gateway/internal/gatewayentry"
 )
 
 const (
@@ -426,6 +427,7 @@ func MigrateClaudeJSONProjects(dryRun bool) (MigrationPlan, error) {
 	sort.Strings(projectKeys)
 
 	directByProject := map[string][]DiscoveredServer{}
+	rewriteByProject := map[string]bool{}
 	for _, project := range projectKeys {
 		servers := readServersRaw(projects[project]["mcpServers"], path, ClientClaudeCode, "project", "claude_json_project", RouteabilityLocalRoutable)
 		for i := range servers {
@@ -433,13 +435,18 @@ func MigrateClaudeJSONProjects(dryRun bool) (MigrationPlan, error) {
 		}
 		plan.Servers = append(plan.Servers, servers...)
 		for _, s := range servers {
+			if isStaleGatewayEntry(s) {
+				rewriteByProject[project] = true
+				continue
+			}
 			if s.RouteState == RouteRouted || !s.Routable {
 				continue
 			}
 			directByProject[project] = append(directByProject[project], s)
+			rewriteByProject[project] = true
 		}
 	}
-	if len(directByProject) == 0 {
+	if len(rewriteByProject) == 0 {
 		plan.AlreadyRouted = allRouted(plan.Servers)
 		return plan, nil
 	}
@@ -454,10 +461,10 @@ func MigrateClaudeJSONProjects(dryRun bool) (MigrationPlan, error) {
 	plan.BackupPath = backup
 
 	for _, project := range projectKeys {
-		direct := directByProject[project]
-		if len(direct) == 0 {
+		if !rewriteByProject[project] {
 			continue
 		}
+		direct := directByProject[project]
 		for _, s := range direct {
 			entry := s.Entry
 			entry.Name = s.Name
@@ -601,7 +608,7 @@ func ensureCoworkGatewayEntrypoint(home string, dryRun bool) (MigrationPlan, err
 			SourceKind:   "claude_desktop_config",
 			SourcePath:   path,
 			Transport:    "stdio",
-			Command:      "/usr/local/bin/agentkeeper-mcp-gateway",
+			Command:      gatewayentry.Command(),
 			ArgsCount:    1,
 			RouteState:   RouteRouted,
 			Routeability: RouteabilityCoworkLocalDesktop,
@@ -820,15 +827,22 @@ func MigrateMCPFile(path, client, scope, sourceKind, routeability string, dryRun
 		return plan, nil
 	}
 	direct := make([]DiscoveredServer, 0, len(servers))
+	needsRewrite := false
 	for _, s := range servers {
+		if isStaleGatewayEntry(s) {
+			needsRewrite = true
+			continue
+		}
 		if s.RouteState == RouteRouted || !s.Routable {
 			continue
 		}
 		direct = append(direct, s)
 	}
 	if len(direct) == 0 {
-		plan.AlreadyRouted = allRouted(servers)
-		return plan, nil
+		if !needsRewrite {
+			plan.AlreadyRouted = allRouted(servers)
+			return plan, nil
+		}
 	}
 	if dryRun {
 		return plan, nil
@@ -899,7 +913,7 @@ type MigrationPlan struct {
 
 func gatewayServerEntry() config.ServerEntry {
 	return config.ServerEntry{
-		Command: "/usr/local/bin/agentkeeper-mcp-gateway",
+		Command: gatewayentry.Command(),
 		Args:    []string{"server"},
 	}
 }
@@ -1026,7 +1040,17 @@ func sanitizeName(name string) string {
 }
 
 func isGatewayEntry(entry config.ServerEntry) bool {
-	return filepath.Base(entry.Command) == "agentkeeper-mcp-gateway" && len(entry.Args) > 0 && entry.Args[0] == "server"
+	return gatewayentry.IsCurrentGatewayCommand(entry.Command) && len(entry.Args) > 0 && entry.Args[0] == "server"
+}
+
+func isStaleGatewayEntry(server DiscoveredServer) bool {
+	if server.RouteState == RouteRouted {
+		return false
+	}
+	if server.Name != "agentkeeper-mcp-gateway" {
+		return false
+	}
+	return gatewayentry.IsGatewayCommand(server.Entry.Command) && len(server.Entry.Args) > 0 && server.Entry.Args[0] == "server"
 }
 
 func normalizeTransport(entry config.ServerEntry) string {

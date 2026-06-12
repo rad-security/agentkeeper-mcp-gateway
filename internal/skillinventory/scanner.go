@@ -99,6 +99,7 @@ func Scan(opts ScanOptions) (Inventory, error) {
 //  1. ~/.claude/skills/*/SKILL.md                                    (global standalone)
 //  2. <cwd>/.claude/skills/*/SKILL.md                                (project standalone)
 //  3. plugin installs read from installed_plugins.json manifest, then fallback-globbed
+//
 // 3c. ~/.claude/plugins/marketplaces/*/skills/*/SKILL.md             (marketplace-cached, "marketplace" source)
 //  4. <cwd>/.claude/plugins/*/*/skills/*/SKILL.md                    (project-level plugin installs)
 //  5. Cowork (Claude Desktop) persistent skills
@@ -247,6 +248,7 @@ func scanMCPServers(home, cwd string) []MCPServer {
 	}
 	if cwd != "" {
 		sources = append(sources,
+			struct{ scope, path, platform string }{"project", filepath.Join(cwd, ".mcp.json"), PlatformClaudeCode},
 			struct{ scope, path, platform string }{"project", filepath.Join(cwd, ".claude", "settings.json"), PlatformClaudeCode},
 			struct{ scope, path, platform string }{"project", filepath.Join(cwd, ".claude", "settings.local.json"), PlatformClaudeCode},
 		)
