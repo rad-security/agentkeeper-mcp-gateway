@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -88,11 +89,13 @@ type listHealthReport struct {
 }
 
 type backendToolHealth struct {
-	Name      string `json:"name"`
-	Transport string `json:"transport"`
-	Status    string `json:"status"`
-	ToolCount int    `json:"tool_count"`
-	Error     string `json:"error,omitempty"`
+	Name         string `json:"name"`
+	Transport    string `json:"transport"`
+	Status       string `json:"status"`
+	ToolCount    int    `json:"tool_count"`
+	LastToolName string `json:"last_tool_name,omitempty"`
+	LastCallAt   string `json:"last_call_at,omitempty"`
+	Error        string `json:"error,omitempty"`
 }
 
 func buildListHealthReport(cfg config.Config) listHealthReport {
@@ -169,7 +172,7 @@ func printListHealth(out interface{ Write([]byte) (int, error) }, report listHea
 		fmt.Fprintf(out, "%-20s %-10s %-16s %-6s %s\n", "BACKEND", "TRANSPORT", "TOOLS", "COUNT", "DETAIL")
 		fmt.Fprintf(out, "%-20s %-10s %-16s %-6s %s\n", "-------", "---------", "-----", "-----", "------")
 		for _, h := range report.BackendToolHealth {
-			fmt.Fprintf(out, "%-20s %-10s %-16s %-6d %s\n", h.Name, h.Transport, h.Status, h.ToolCount, h.Error)
+			fmt.Fprintf(out, "%-20s %-10s %-16s %-6d %s\n", h.Name, h.Transport, h.Status, h.ToolCount, backendToolHealthDetail(h))
 		}
 	}
 	fmt.Fprintln(out, "")
@@ -227,7 +230,7 @@ func healthNextSteps(cfg config.Config, discovered []discovery.DiscoveredServer,
 	if countBackendStatus(backendHealth, "unreachable") > 0 {
 		steps = append(steps, "Fix remote MCP backend connectivity for unreachable servers, then rerun agentkeeper-mcp-gateway list --health.")
 	}
-	if len(cfg.Servers) > 0 {
+	if countBackendStatus(backendHealth, "pending") > 0 || countBackendStatus(backendHealth, "auth_configured") > 0 {
 		steps = append(steps, "Restart the MCP client and make one real harmless tool call through Gateway.")
 	}
 	if !config.HasUsableAPIKey(cfg.APIKey) {
@@ -250,6 +253,7 @@ func probeBackendToolHealth(cfg config.Config) []backendToolHealth {
 	if len(cfg.Servers) == 0 {
 		return nil
 	}
+	observedCalls := readObservedToolCalls(defaultEventLogPath(cfg))
 	health := make([]backendToolHealth, 0, len(cfg.Servers))
 	for _, s := range cfg.Servers {
 		transport := normalizeListTransport(s)
@@ -266,6 +270,12 @@ func probeBackendToolHealth(cfg config.Config) []backendToolHealth {
 				h.Status = "auth_configured"
 			}
 		}
+		if observed, ok := observedCalls[s.Name]; ok {
+			h.Status = "calls_observed"
+			h.LastCallAt = observed.Timestamp
+			h.LastToolName = observed.ToolName
+			h.Error = ""
+		}
 		health = append(health, h)
 	}
 	return health
@@ -278,7 +288,7 @@ func summarizeToolManifestStatus(servers []config.ServerEntry, health []backendT
 	if countBackendStatus(health, "auth_required") > 0 || countBackendStatus(health, "unreachable") > 0 {
 		return "action_required"
 	}
-	if countBackendStatus(health, "tools_observed") > 0 {
+	if countBackendStatus(health, "tools_observed") > 0 || countBackendStatus(health, "calls_observed") > 0 {
 		return "observed"
 	}
 	return "pending"
@@ -292,6 +302,19 @@ func countBackendStatus(health []backendToolHealth, status string) int {
 		}
 	}
 	return count
+}
+
+func backendToolHealthDetail(h backendToolHealth) string {
+	if h.Error != "" {
+		return h.Error
+	}
+	if h.LastToolName != "" && h.LastCallAt != "" {
+		return fmt.Sprintf("last call %s at %s", h.LastToolName, h.LastCallAt)
+	}
+	if h.LastCallAt != "" {
+		return "last call at " + h.LastCallAt
+	}
+	return ""
 }
 
 func normalizeListTransport(s config.ServerEntry) string {
@@ -323,6 +346,56 @@ func knownOAuthMCPURL(raw string) bool {
 	return strings.Contains(u, "mcp.notion.com") ||
 		strings.Contains(u, "mcp.raindrop.ai") ||
 		strings.Contains(u, "mcp.linear.app")
+}
+
+type observedToolCall struct {
+	Timestamp string
+	ToolName  string
+}
+
+func defaultEventLogPath(cfg config.Config) string {
+	if strings.TrimSpace(cfg.LogPath) != "" {
+		return cfg.LogPath
+	}
+	home, _ := os.UserHomeDir()
+	if home == "" {
+		return ""
+	}
+	return filepath.Join(home, ".config", "agentkeeper-mcp-gateway", "events.jsonl")
+}
+
+func readObservedToolCalls(path string) map[string]observedToolCall {
+	observed := map[string]observedToolCall{}
+	if strings.TrimSpace(path) == "" {
+		return observed
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return observed
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for scanner.Scan() {
+		var event struct {
+			Timestamp  string `json:"timestamp"`
+			EventType  string `json:"event_type"`
+			ServerName string `json:"server_name"`
+			ToolName   string `json:"tool_name"`
+		}
+		if err := json.Unmarshal(scanner.Bytes(), &event); err != nil {
+			continue
+		}
+		if event.EventType != "mcp.tool_call" || event.ServerName == "" {
+			continue
+		}
+		observed[event.ServerName] = observedToolCall{
+			Timestamp: event.Timestamp,
+			ToolName:  event.ToolName,
+		}
+	}
+	return observed
 }
 
 func configPathsChecked(discovered []discovery.DiscoveredServer) []string {

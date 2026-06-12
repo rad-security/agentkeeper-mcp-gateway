@@ -2,6 +2,7 @@ package cmd_test
 
 import (
 	"encoding/json"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -211,5 +212,75 @@ func TestListHealthReportsRemoteAuthConfigured(t *testing.T) {
 	}
 	if len(report.BackendToolHealth) != 1 || report.BackendToolHealth[0].Status != "auth_configured" || report.BackendToolHealth[0].ToolCount != 0 {
 		t.Fatalf("unexpected backend health: %+v\n%s", report.BackendToolHealth, out)
+	}
+}
+
+func TestListHealthReportsObservedToolCalls(t *testing.T) {
+	home := t.TempDir()
+	logPath := filepath.Join(home, ".config", "agentkeeper-mcp-gateway", "events.jsonl")
+
+	writeGatewayConfig(t, home, `{
+		"mode": "audit",
+		"log_path": "`+filepath.ToSlash(logPath)+`",
+		"servers": [
+			{
+				"name": "supabase",
+				"command": "npx",
+				"args": ["-y", "@supabase/mcp-server-supabase"]
+			},
+			{
+				"name": "google-drive",
+				"transport": "http",
+				"url": "https://drivemcp.googleapis.com/mcp/v1"
+			}
+		]
+	}`)
+	if err := os.MkdirAll(filepath.Dir(logPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(logPath, []byte(`{"timestamp":"2026-06-12T00:09:18.571889Z","event_type":"mcp.tool_call","server_name":"supabase","tool_name":"search_docs","verdict":"pass"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	out, stderr, code := run(t, home, "list", "--health", "--json")
+	if code != 0 {
+		t.Fatalf("exit %d, stderr: %s", code, stderr)
+	}
+	var report struct {
+		ToolManifestStatus string `json:"tool_manifest_status"`
+		BackendToolHealth  []struct {
+			Name         string `json:"name"`
+			Status       string `json:"status"`
+			LastToolName string `json:"last_tool_name"`
+			LastCallAt   string `json:"last_call_at"`
+		} `json:"backend_tool_health"`
+		NextSteps []string `json:"next_steps"`
+	}
+	if err := json.Unmarshal([]byte(out), &report); err != nil {
+		t.Fatalf("parsing json: %v\n%s", err, out)
+	}
+	if report.ToolManifestStatus != "observed" {
+		t.Fatalf("expected observed after local tool call evidence, got %q in %s", report.ToolManifestStatus, out)
+	}
+	byName := map[string]struct {
+		Status       string
+		LastToolName string
+		LastCallAt   string
+	}{}
+	for _, h := range report.BackendToolHealth {
+		byName[h.Name] = struct {
+			Status       string
+			LastToolName string
+			LastCallAt   string
+		}{Status: h.Status, LastToolName: h.LastToolName, LastCallAt: h.LastCallAt}
+	}
+	if got := byName["supabase"]; got.Status != "calls_observed" || got.LastToolName != "search_docs" || got.LastCallAt == "" {
+		t.Fatalf("supabase should report observed call evidence, got %+v in %s", got, out)
+	}
+	if got := byName["google-drive"]; got.Status != "pending" {
+		t.Fatalf("google-drive should remain pending until its own call, got %+v in %s", got, out)
+	}
+	if !strings.Contains(strings.Join(report.NextSteps, "\n"), "make one real harmless tool call") {
+		t.Fatalf("missing next step for remaining pending backends: %+v", report.NextSteps)
 	}
 }
