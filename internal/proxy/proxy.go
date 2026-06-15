@@ -9,6 +9,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -21,8 +24,7 @@ import (
 )
 
 const (
-	backendInitAttachDeadline = 3 * time.Second
-	backendToolListDeadline   = 25 * time.Second
+	backendToolListWarmupDeadline = 2 * time.Second
 )
 
 // JSONRPCMessage represents a JSON-RPC 2.0 message.
@@ -57,19 +59,43 @@ type Proxy struct {
 	telemetry *telemetry.Client
 	mu        sync.Mutex
 	// Map from namespaced tool name to server name
-	toolMap   map[string]string
-	toolCache map[string][]interface{}
+	toolMap         map[string]string
+	toolCache       map[string][]interface{}
+	toolStatus      map[string]toolRefreshStatus
+	toolRefreshMu   sync.Mutex
+	toolRefreshDone chan struct{}
+	clientReady     bool
+	writeMu         sync.Mutex
+}
+
+type toolRefreshStatus struct {
+	Status    string
+	LastError string
+	UpdatedAt string
+}
+
+type persistentToolCache struct {
+	Version int                          `json:"version"`
+	Servers map[string]persistentToolSet `json:"servers"`
+}
+
+type persistentToolSet struct {
+	UpdatedAt string        `json:"updated_at"`
+	Tools     []interface{} `json:"tools"`
 }
 
 // NewProxy creates a new MCP proxy.
 func NewProxy(cfg Config, mgr *server.Manager, tc *telemetry.Client) *Proxy {
-	return &Proxy{
-		config:    cfg,
-		manager:   mgr,
-		telemetry: tc,
-		toolMap:   make(map[string]string),
-		toolCache: make(map[string][]interface{}),
+	p := &Proxy{
+		config:     cfg,
+		manager:    mgr,
+		telemetry:  tc,
+		toolMap:    make(map[string]string),
+		toolCache:  make(map[string][]interface{}),
+		toolStatus: make(map[string]toolRefreshStatus),
 	}
+	p.loadPersistentToolCache()
+	return p
 }
 
 // verdictRank maps verdict strings to numeric severity for comparison.
@@ -107,7 +133,7 @@ func (p *Proxy) Run() error {
 		var msg JSONRPCMessage
 		if err := json.Unmarshal([]byte(trimmed), &msg); err != nil {
 			// Not valid JSON-RPC — pass through
-			writer.Write(line)
+			p.writeRaw(writer, line)
 			continue
 		}
 
@@ -123,27 +149,36 @@ func (p *Proxy) Run() error {
 						Message: err.Error(),
 					},
 				}
-				data, _ := json.Marshal(errResp)
-				writer.Write(data)
-				writer.Write([]byte("\n"))
+				p.writeJSONLine(writer, errResp)
 			}
 			continue
 		}
 
 		if response != nil {
-			data, _ := json.Marshal(response)
-			writer.Write(data)
-			writer.Write([]byte("\n"))
+			p.writeJSONLine(writer, response)
 		}
 	}
+}
+
+func (p *Proxy) writeRaw(writer io.Writer, data []byte) {
+	p.writeMu.Lock()
+	defer p.writeMu.Unlock()
+	_, _ = writer.Write(data)
+}
+
+func (p *Proxy) writeJSONLine(writer io.Writer, value interface{}) {
+	data, _ := json.Marshal(value)
+	data = append(data, '\n')
+	p.writeRaw(writer, data)
 }
 
 func (p *Proxy) handleMessage(msg JSONRPCMessage) (*JSONRPCMessage, error) {
 	switch msg.Method {
 	case "initialize":
 		return p.handleInitialize(msg)
-	case "initialized":
+	case "initialized", "notifications/initialized":
 		// Notification — no response needed
+		p.markClientReady()
 		return nil, nil
 	case "tools/list":
 		return p.handleToolsList(msg)
@@ -169,48 +204,16 @@ func (p *Proxy) handleInitialize(msg JSONRPCMessage) (*JSONRPCMessage, error) {
 		return nil, fmt.Errorf("starting servers: %w", err)
 	}
 
-	// Initialize local stdio backends concurrently. Cowork treats Gateway
-	// startup as MCP server attach; one slow customer server must not keep the
-	// gateway itself from attaching.
-	type initResult struct {
-		name string
-		err  error
-	}
-	names := p.manager.ServerNames()
-	results := make(chan initResult, len(names))
-	pending := 0
-	for _, name := range p.manager.ServerNames() {
-		srv := p.manager.Get(name)
-		if srv == nil {
-			continue
-		}
-		if srv.IsHTTP() {
-			continue
-		}
-		pending++
-		go func(name string, srv *server.Server) {
-			results <- initResult{name: name, err: srv.Initialize()}
-		}(name, srv)
-	}
-	deadline := time.After(backendInitAttachDeadline)
-	for pending > 0 {
-		select {
-		case result := <-results:
-			pending--
-			if result.err != nil {
-				p.config.Logger.Warn("failed to initialize server %s: %v", result.name, result.err)
-			}
-		case <-deadline:
-			p.config.Logger.Warn("timed out while initializing %d MCP server(s)", pending)
-			pending = 0
-		}
-	}
+	// Keep the gateway MCP server fast to attach. Backend MCP servers are
+	// refreshed out-of-band so one slow or broken upstream cannot make Claude
+	// Desktop mark the gateway itself as disconnected.
+	p.startToolRefresh()
 
 	// Return gateway's own capabilities
 	result := map[string]interface{}{
 		"protocolVersion": "2024-11-05",
 		"capabilities": map[string]interface{}{
-			"tools":     map[string]interface{}{},
+			"tools":     map[string]interface{}{"listChanged": true},
 			"resources": map[string]interface{}{},
 			"prompts":   map[string]interface{}{},
 		},
@@ -236,102 +239,22 @@ func (p *Proxy) gatewayVersion() string {
 }
 
 func (p *Proxy) handleToolsList(msg JSONRPCMessage) (*JSONRPCMessage, error) {
-	type listResult struct {
-		name  string
-		tools []interface{}
-		err   error
-	}
-	names := p.manager.ServerNames()
-	results := make(chan listResult, len(names))
-	pending := make(map[string]struct{}, len(names))
-	for _, name := range names {
-		pending[name] = struct{}{}
-		go func(name string) {
-			srv := p.manager.Get(name)
-			if srv == nil {
-				results <- listResult{name: name}
-				return
-			}
-			tools, err := srv.ListTools()
-			results <- listResult{name: name, tools: tools, err: err}
-		}(name)
-	}
+	done := p.startToolRefresh()
 
-	var allTools []interface{}
-	nextToolMap := make(map[string]string)
-
-	deadline := time.After(backendToolListDeadline)
-	for remaining := len(names); remaining > 0; {
-		var result listResult
+	cachedTools, nextToolMap := p.cachedNamespacedTools()
+	if len(nextToolMap) == 0 && len(p.manager.ServerNames()) > 0 {
 		select {
-		case result = <-results:
-			remaining--
-			delete(pending, result.name)
-		case <-deadline:
-			p.config.Logger.Warn("timed out while listing tools from %d MCP server(s)", remaining)
-			for name := range pending {
-				if cached := p.cachedTools(name); len(cached) > 0 {
-					p.config.Logger.Warn("using cached tools from %s after tools/list timeout", name)
-					appendNamespacedTools(&allTools, nextToolMap, name, cached)
-				}
-			}
-			remaining = 0
-			continue
+		case <-done:
+			cachedTools, nextToolMap = p.cachedNamespacedTools()
+		case <-time.After(backendToolListWarmupDeadline):
+			p.warn("returning gateway tools while backend tool refresh continues")
 		}
-
-		if result.err != nil {
-			p.config.Logger.Warn("failed to list tools from %s: %v", result.name, result.err)
-			if cached := p.cachedTools(result.name); len(cached) > 0 {
-				p.config.Logger.Warn("using cached tools from %s after tools/list error", result.name)
-				appendNamespacedTools(&allTools, nextToolMap, result.name, cached)
-			}
-			continue
-		}
-		p.setCachedTools(result.name, result.tools)
-
-		// Check for tool poisoning
-		if p.config.DetectionEngine != nil {
-			var descs []detection.ToolDescription
-			for _, t := range result.tools {
-				tm, ok := t.(map[string]interface{})
-				if !ok {
-					continue
-				}
-				desc := detection.ToolDescription{
-					Name:        fmt.Sprintf("%v", tm["name"]),
-					Description: fmt.Sprintf("%v", tm["description"]),
-				}
-				// Extract parameter descriptions
-				if inputSchema, ok := tm["inputSchema"].(map[string]interface{}); ok {
-					if props, ok := inputSchema["properties"].(map[string]interface{}); ok {
-						for pName, pVal := range props {
-							if pm, ok := pVal.(map[string]interface{}); ok {
-								desc.Parameters = append(desc.Parameters, detection.ToolParam{
-									Name:        pName,
-									Description: fmt.Sprintf("%v", pm["description"]),
-								})
-							}
-						}
-					}
-				}
-				descs = append(descs, desc)
-			}
-
-			results := p.config.DetectionEngine.EvaluateToolDescriptions(descs)
-			for _, r := range results {
-				p.config.Logger.LogDetection(result.name, "", r)
-			}
-		}
-
-		appendNamespacedTools(&allTools, nextToolMap, result.name, result.tools)
 	}
-	p.mu.Lock()
-	p.toolMap = nextToolMap
-	p.mu.Unlock()
 
-	// Add built-in gateway tools
-	builtinTools := p.getBuiltinTools()
-	allTools = append(allTools, builtinTools...)
+	p.setToolMap(nextToolMap)
+
+	allTools := p.getBuiltinTools()
+	allTools = append(allTools, cachedTools...)
 
 	result := map[string]interface{}{
 		"tools": allTools,
@@ -344,19 +267,262 @@ func (p *Proxy) handleToolsList(msg JSONRPCMessage) (*JSONRPCMessage, error) {
 	}, nil
 }
 
+func (p *Proxy) startToolRefresh() <-chan struct{} {
+	p.toolRefreshMu.Lock()
+	if p.toolRefreshDone != nil {
+		done := p.toolRefreshDone
+		p.toolRefreshMu.Unlock()
+		return done
+	}
+
+	done := make(chan struct{})
+	p.toolRefreshDone = done
+	p.toolRefreshMu.Unlock()
+
+	go func() {
+		defer close(done)
+		p.refreshTools()
+
+		p.toolRefreshMu.Lock()
+		if p.toolRefreshDone == done {
+			p.toolRefreshDone = nil
+		}
+		p.toolRefreshMu.Unlock()
+	}()
+
+	return done
+}
+
+func (p *Proxy) refreshTools() {
+	type listResult struct {
+		name  string
+		tools []interface{}
+		err   error
+	}
+	names := p.manager.ServerNames()
+	sort.Strings(names)
+	results := make(chan listResult, len(names))
+	for _, name := range names {
+		go func(name string) {
+			srv := p.manager.Get(name)
+			if srv == nil {
+				results <- listResult{name: name}
+				return
+			}
+			tools, err := srv.ListTools()
+			results <- listResult{name: name, tools: tools, err: err}
+		}(name)
+	}
+
+	for remaining := len(names); remaining > 0; remaining-- {
+		result := <-results
+		if result.err != nil {
+			p.warn("failed to list tools from %s: %v", result.name, result.err)
+			p.setToolStatus(result.name, toolRefreshStatus{
+				Status:    "degraded",
+				LastError: result.err.Error(),
+				UpdatedAt: time.Now().UTC().Format(time.RFC3339Nano),
+			})
+			continue
+		}
+		changed := p.setCachedTools(result.name, result.tools)
+		p.setToolStatus(result.name, toolRefreshStatus{
+			Status:    "ready",
+			UpdatedAt: time.Now().UTC().Format(time.RFC3339Nano),
+		})
+		p.logToolDescriptionDetections(result.name, result.tools)
+		p.rebuildToolMapFromCache()
+		if changed {
+			p.emitToolsListChanged()
+		}
+	}
+}
+
+func (p *Proxy) warn(format string, args ...interface{}) {
+	if p.config.Logger == nil {
+		return
+	}
+	p.config.Logger.Warn(format, args...)
+}
+
+func (p *Proxy) logToolDescriptionDetections(serverName string, tools []interface{}) {
+	if p.config.DetectionEngine == nil {
+		return
+	}
+	var descs []detection.ToolDescription
+	for _, t := range tools {
+		tm, ok := t.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		desc := detection.ToolDescription{
+			Name:        fmt.Sprintf("%v", tm["name"]),
+			Description: fmt.Sprintf("%v", tm["description"]),
+		}
+		if inputSchema, ok := tm["inputSchema"].(map[string]interface{}); ok {
+			if props, ok := inputSchema["properties"].(map[string]interface{}); ok {
+				for pName, pVal := range props {
+					if pm, ok := pVal.(map[string]interface{}); ok {
+						desc.Parameters = append(desc.Parameters, detection.ToolParam{
+							Name:        pName,
+							Description: fmt.Sprintf("%v", pm["description"]),
+						})
+					}
+				}
+			}
+		}
+		descs = append(descs, desc)
+	}
+
+	results := p.config.DetectionEngine.EvaluateToolDescriptions(descs)
+	for _, r := range results {
+		p.config.Logger.LogDetection(serverName, "", r)
+	}
+}
+
+func (p *Proxy) cachedNamespacedTools() ([]interface{}, map[string]string) {
+	var allTools []interface{}
+	nextToolMap := make(map[string]string)
+	names := p.manager.ServerNames()
+	sort.Strings(names)
+	for _, name := range names {
+		appendNamespacedTools(&allTools, nextToolMap, name, p.cachedTools(name))
+	}
+	return allTools, nextToolMap
+}
+
+func (p *Proxy) rebuildToolMapFromCache() {
+	_, nextToolMap := p.cachedNamespacedTools()
+	p.setToolMap(nextToolMap)
+}
+
+func (p *Proxy) setToolMap(nextToolMap map[string]string) {
+	p.mu.Lock()
+	p.toolMap = nextToolMap
+	p.mu.Unlock()
+}
+
+func (p *Proxy) setToolStatus(serverName string, status toolRefreshStatus) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.toolStatus == nil {
+		p.toolStatus = make(map[string]toolRefreshStatus)
+	}
+	p.toolStatus[serverName] = status
+}
+
+func (p *Proxy) getToolStatus(serverName string) toolRefreshStatus {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.toolStatus[serverName]
+}
+
+func (p *Proxy) markClientReady() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.clientReady = true
+}
+
+func (p *Proxy) isClientReady() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.clientReady
+}
+
+func (p *Proxy) emitToolsListChanged() {
+	if !p.isClientReady() {
+		return
+	}
+	p.writeJSONLine(os.Stdout, JSONRPCMessage{
+		JSONRPC: "2.0",
+		Method:  "notifications/tools/list_changed",
+	})
+}
+
 func (p *Proxy) cachedTools(serverName string) []interface{} {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return cloneTools(p.toolCache[serverName])
 }
 
-func (p *Proxy) setCachedTools(serverName string, tools []interface{}) {
+func (p *Proxy) setCachedTools(serverName string, tools []interface{}) bool {
 	if len(tools) == 0 {
-		return
+		return false
 	}
+	cloned := cloneTools(tools)
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.toolCache[serverName] = cloneTools(tools)
+	if reflect.DeepEqual(p.toolCache[serverName], cloned) {
+		return false
+	}
+	p.toolCache[serverName] = cloned
+	p.savePersistentToolCacheLocked()
+	return true
+}
+
+func (p *Proxy) loadPersistentToolCache() {
+	path := defaultToolCachePath()
+	if path == "" {
+		return
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	var cache persistentToolCache
+	if err := json.Unmarshal(data, &cache); err != nil {
+		return
+	}
+	if cache.Servers == nil {
+		return
+	}
+	for name, entry := range cache.Servers {
+		if len(entry.Tools) == 0 {
+			continue
+		}
+		p.toolCache[name] = cloneTools(entry.Tools)
+	}
+}
+
+func (p *Proxy) savePersistentToolCacheLocked() {
+	path := defaultToolCachePath()
+	if path == "" {
+		return
+	}
+	cache := persistentToolCache{
+		Version: 1,
+		Servers: make(map[string]persistentToolSet, len(p.toolCache)),
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	for name, tools := range p.toolCache {
+		if len(tools) == 0 {
+			continue
+		}
+		cache.Servers[name] = persistentToolSet{
+			UpdatedAt: now,
+			Tools:     cloneTools(tools),
+		}
+	}
+	data, err := json.MarshalIndent(cache, "", "  ")
+	if err != nil {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return
+	}
+	_ = os.Rename(tmp, path)
+}
+
+func defaultToolCachePath() string {
+	home, err := os.UserHomeDir()
+	if err != nil || strings.TrimSpace(home) == "" {
+		return ""
+	}
+	return filepath.Join(home, ".config", "agentkeeper-mcp-gateway", "tool-cache.json")
 }
 
 func appendNamespacedTools(allTools *[]interface{}, toolMap map[string]string, serverName string, tools []interface{}) {
@@ -517,6 +683,9 @@ func (p *Proxy) handleToolsCall(msg JSONRPCMessage) (*JSONRPCMessage, error) {
 	if srv == nil {
 		return nil, fmt.Errorf("server not available: %s", serverName)
 	}
+	if err := srv.Initialize(); err != nil {
+		return nil, fmt.Errorf("initializing %s: %w", serverName, err)
+	}
 
 	forwardParams := map[string]interface{}{
 		"name":      originalName,
@@ -542,20 +711,8 @@ func (p *Proxy) handleToolsCall(msg JSONRPCMessage) (*JSONRPCMessage, error) {
 }
 
 func (p *Proxy) handleResourcesList(msg JSONRPCMessage) (*JSONRPCMessage, error) {
-	// Aggregate resources from all servers (with namespacing)
-	var allResources []interface{}
-	for _, name := range p.manager.ServerNames() {
-		srv := p.manager.Get(name)
-		if srv == nil {
-			continue
-		}
-		resources, err := srv.ListResources()
-		if err != nil {
-			continue
-		}
-		allResources = append(allResources, resources...)
-	}
-	result := map[string]interface{}{"resources": allResources}
+	p.startToolRefresh()
+	result := map[string]interface{}{"resources": []interface{}{}}
 	resultJSON, _ := json.Marshal(result)
 	return &JSONRPCMessage{JSONRPC: "2.0", ID: msg.ID, Result: resultJSON}, nil
 }
@@ -577,19 +734,8 @@ func (p *Proxy) handleResourcesRead(msg JSONRPCMessage) (*JSONRPCMessage, error)
 }
 
 func (p *Proxy) handlePromptsList(msg JSONRPCMessage) (*JSONRPCMessage, error) {
-	var allPrompts []interface{}
-	for _, name := range p.manager.ServerNames() {
-		srv := p.manager.Get(name)
-		if srv == nil {
-			continue
-		}
-		prompts, err := srv.ListPrompts()
-		if err != nil {
-			continue
-		}
-		allPrompts = append(allPrompts, prompts...)
-	}
-	result := map[string]interface{}{"prompts": allPrompts}
+	p.startToolRefresh()
+	result := map[string]interface{}{"prompts": []interface{}{}}
 	resultJSON, _ := json.Marshal(result)
 	return &JSONRPCMessage{JSONRPC: "2.0", ID: msg.ID, Result: resultJSON}, nil
 }
@@ -638,17 +784,26 @@ func (p *Proxy) handleBuiltinToolCall(id *json.RawMessage, name string, args map
 			mode = "enforce"
 		}
 		servers := p.manager.ServerNames()
-		text = fmt.Sprintf("AgentKeeper MCP Gateway\nMode: %s\nServers: %d connected (%s)\nDetection: active",
-			mode, len(servers), strings.Join(servers, ", "))
+		cachedBackendCount, cachedToolCount, degradedBackendCount := p.cachedToolSummary()
+		text = fmt.Sprintf("AgentKeeper MCP Gateway\nMode: %s\nServers: %d configured (%s)\nTools: %d cached from %d backend(s); %d backend(s) degraded; refreshing in background\nDetection: active",
+			mode, len(servers), strings.Join(servers, ", "), cachedToolCount, cachedBackendCount, degradedBackendCount)
 	case "agentkeeper_audit":
+		p.startToolRefresh()
 		servers := p.manager.ServerNames()
+		sort.Strings(servers)
 		text = fmt.Sprintf("MCP Security Audit\nServers: %d\n", len(servers))
 		for _, s := range servers {
-			srv := p.manager.Get(s)
-			if srv != nil {
-				tools, _ := srv.ListTools()
-				text += fmt.Sprintf("  %s: %d tools\n", s, len(tools))
+			tools := p.cachedTools(s)
+			status := p.getToolStatus(s)
+			state := status.Status
+			if state == "" {
+				state = "refreshing"
 			}
+			if status.LastError != "" {
+				text += fmt.Sprintf("  %s: %d cached tools (%s: %s)\n", s, len(tools), state, status.LastError)
+				continue
+			}
+			text += fmt.Sprintf("  %s: %d cached tools (%s)\n", s, len(tools), state)
 		}
 	default:
 		text = "Unknown built-in tool: " + name
@@ -661,4 +816,22 @@ func (p *Proxy) handleBuiltinToolCall(id *json.RawMessage, name string, args map
 	}
 	resultJSON, _ := json.Marshal(result)
 	return &JSONRPCMessage{JSONRPC: "2.0", ID: id, Result: resultJSON}, nil
+}
+
+func (p *Proxy) cachedToolSummary() (backendCount int, toolCount int, degradedBackendCount int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, tools := range p.toolCache {
+		if len(tools) == 0 {
+			continue
+		}
+		backendCount++
+		toolCount += len(tools)
+	}
+	for _, status := range p.toolStatus {
+		if status.Status == "degraded" {
+			degradedBackendCount++
+		}
+	}
+	return backendCount, toolCount, degradedBackendCount
 }

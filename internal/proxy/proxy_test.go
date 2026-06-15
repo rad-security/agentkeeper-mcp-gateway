@@ -1,6 +1,10 @@
 package proxy
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
 
 func TestToolCacheClonesAndIgnoresEmptyRefresh(t *testing.T) {
 	p := &Proxy{toolCache: make(map[string][]interface{})}
@@ -50,5 +54,39 @@ func TestAppendNamespacedToolsDoesNotMutateOriginalTools(t *testing.T) {
 	}
 	if got := toolMap["ontra__lookup"]; got != "ontra" {
 		t.Fatalf("tool map mismatch: %v", got)
+	}
+}
+
+func TestToolCachePersistsLastKnownGoodManifest(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	p := &Proxy{toolCache: make(map[string][]interface{})}
+	p.setCachedTools("atlas", []interface{}{
+		map[string]interface{}{
+			"name":        "search",
+			"description": "Search accounts",
+			"inputSchema": map[string]interface{}{
+				"type":       "object",
+				"properties": map[string]interface{}{},
+			},
+		},
+	})
+
+	cachePath := filepath.Join(home, ".config", "agentkeeper-mcp-gateway", "tool-cache.json")
+	if info, err := os.Stat(cachePath); err != nil {
+		t.Fatalf("expected persistent tool cache at %s: %v", cachePath, err)
+	} else if info.Mode().Perm() != 0o600 {
+		t.Fatalf("cache file permissions = %o, want 0600", info.Mode().Perm())
+	}
+
+	restored := &Proxy{toolCache: make(map[string][]interface{})}
+	restored.loadPersistentToolCache()
+	tools := restored.cachedTools("atlas")
+	if len(tools) != 1 {
+		t.Fatalf("expected restored cached tool, got %d", len(tools))
+	}
+	if got := tools[0].(map[string]interface{})["name"]; got != "search" {
+		t.Fatalf("restored cached tool name = %v, want search", got)
 	}
 }
