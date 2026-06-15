@@ -82,14 +82,14 @@ func TestE2E33_ServerProxiesConfiguredMCPToolCall(t *testing.T) {
 	}
 }
 
-func TestE2E33b_ServerExposesSlowEnterpriseToolList(t *testing.T) {
+func TestE2E33b_ServerDoesNotBlockToolsListOnSlowEnterpriseBackend(t *testing.T) {
 	home := t.TempDir()
 	backend := filepath.Join(home, "slow-enterprise-mcp.sh")
 	if err := os.WriteFile(backend, []byte(`#!/bin/sh
 while IFS= read -r line; do
   case "$line" in
     *\"method\":\"initialize\"*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"slow-enterprise","version":"test"}}}' ;;
-    *\"method\":\"tools/list\"*) sleep 15; printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"search_accounts","description":"Search enterprise accounts","inputSchema":{"type":"object","properties":{}}}]}}' ;;
+    *\"method\":\"tools/list\"*) sleep 3; printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"search_accounts","description":"Search enterprise accounts","inputSchema":{"type":"object","properties":{}}}]}}' ;;
   esac
 done
 `), 0o755); err != nil {
@@ -134,11 +134,26 @@ done
 	reader := bufio.NewReader(stdout)
 	writeRPC(t, stdin, `{"jsonrpc":"2.0","id":110,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e","version":"test"}}}`)
 	_ = readRPCLine(t, reader)
+	writeRPC(t, stdin, `{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}`)
 
 	writeRPC(t, stdin, `{"jsonrpc":"2.0","id":111,"method":"tools/list","params":{}}`)
-	listResp := readRPCLineWithin(t, reader, 22*time.Second)
-	if !strings.Contains(listResp, `"ontra-enterprise__search_accounts"`) {
-		t.Fatalf("gateway dropped slow enterprise backend tool: %s stderr=%s", listResp, stderr.String())
+	firstListResp := readRPCLineWithin(t, reader, 4*time.Second)
+	if !strings.Contains(firstListResp, `"agentkeeper_status"`) {
+		t.Fatalf("gateway did not return built-in tools while backend refreshed: %s stderr=%s", firstListResp, stderr.String())
+	}
+	if strings.Contains(firstListResp, `"ontra-enterprise__search_accounts"`) {
+		t.Fatalf("slow backend tool should not block first tools/list response: %s stderr=%s", firstListResp, stderr.String())
+	}
+
+	listChanged := readRPCLineWithin(t, reader, 5*time.Second)
+	if !strings.Contains(listChanged, `"method":"notifications/tools/list_changed"`) {
+		t.Fatalf("gateway did not notify client that refreshed tools are available: %s stderr=%s", listChanged, stderr.String())
+	}
+
+	writeRPC(t, stdin, `{"jsonrpc":"2.0","id":112,"method":"tools/list","params":{}}`)
+	secondListResp := readRPCLineWithin(t, reader, 2*time.Second)
+	if !strings.Contains(secondListResp, `"ontra-enterprise__search_accounts"`) {
+		t.Fatalf("gateway did not serve refreshed backend tool from cache: %s stderr=%s", secondListResp, stderr.String())
 	}
 }
 
