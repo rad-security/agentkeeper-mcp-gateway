@@ -82,6 +82,66 @@ func TestE2E33_ServerProxiesConfiguredMCPToolCall(t *testing.T) {
 	}
 }
 
+func TestE2E33b_ServerExposesSlowEnterpriseToolList(t *testing.T) {
+	home := t.TempDir()
+	backend := filepath.Join(home, "slow-enterprise-mcp.sh")
+	if err := os.WriteFile(backend, []byte(`#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *\"method\":\"initialize\"*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"slow-enterprise","version":"test"}}}' ;;
+    *\"method\":\"tools/list\"*) sleep 15; printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"search_accounts","description":"Search enterprise accounts","inputSchema":{"type":"object","properties":{}}}]}}' ;;
+  esac
+done
+`), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	configPath := writeGatewayConfig(t, home, `{
+		"mode": "audit",
+		"servers": [{
+			"name": "ontra-enterprise",
+			"command": "`+backend+`"
+		}]
+	}`)
+
+	cmd := exec.Command(binary, "--config", configPath, "server")
+	cmd.Env = []string{
+		"HOME=" + home,
+		"PATH=" + os.Getenv("PATH"),
+		"AGENTKEEPER_COWORK_GUARD=0",
+	}
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = stdin.Close()
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		_, _ = cmd.Process.Wait()
+	}()
+
+	reader := bufio.NewReader(stdout)
+	writeRPC(t, stdin, `{"jsonrpc":"2.0","id":110,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e","version":"test"}}}`)
+	_ = readRPCLine(t, reader)
+
+	writeRPC(t, stdin, `{"jsonrpc":"2.0","id":111,"method":"tools/list","params":{}}`)
+	listResp := readRPCLineWithin(t, reader, 22*time.Second)
+	if !strings.Contains(listResp, `"ontra-enterprise__search_accounts"`) {
+		t.Fatalf("gateway dropped slow enterprise backend tool: %s stderr=%s", listResp, stderr.String())
+	}
+}
+
 func TestE2E34_ServerReportsProxiedToolCallToAgentKeeperAPI(t *testing.T) {
 	requests := make(chan capturedAPIRequest, 10)
 	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -196,6 +256,10 @@ func writeRPC(t *testing.T, stdin interface {
 }
 
 func readRPCLine(t *testing.T, reader *bufio.Reader) string {
+	return readRPCLineWithin(t, reader, 5*time.Second)
+}
+
+func readRPCLineWithin(t *testing.T, reader *bufio.Reader, timeout time.Duration) string {
 	t.Helper()
 	ch := make(chan string, 1)
 	errCh := make(chan error, 1)
@@ -212,7 +276,7 @@ func readRPCLine(t *testing.T, reader *bufio.Reader) string {
 		return line
 	case err := <-errCh:
 		t.Fatal(err)
-	case <-time.After(5 * time.Second):
+	case <-time.After(timeout):
 		t.Fatal("timed out waiting for gateway JSON-RPC response")
 	}
 	return ""

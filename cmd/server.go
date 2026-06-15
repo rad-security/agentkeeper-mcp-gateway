@@ -98,6 +98,7 @@ are blocked.`,
 
 		// Create server manager
 		mgr := server.NewManager(serverConfigs)
+		defer mgr.StopAll()
 		if coworkAutoGuardEnabled() {
 			interval := coworkAutoGuardInterval()
 			stop := make(chan struct{})
@@ -196,18 +197,26 @@ func coworkAutoGuardEnabled() bool {
 }
 
 func coworkAutoGuardInterval() time.Duration {
+	const minInterval = 30 * time.Second
 	if raw := strings.TrimSpace(os.Getenv("AGENTKEEPER_COWORK_GUARD_INTERVAL")); raw != "" {
 		if parsed, err := time.ParseDuration(raw); err == nil && parsed > 0 {
+			if parsed < minInterval {
+				return minInterval
+			}
 			return parsed
 		}
 	}
 	if raw := strings.TrimSpace(os.Getenv("AGENTKEEPER_COWORK_GUARD_INTERVAL_MS")); raw != "" {
 		var ms int
 		if _, err := fmt.Sscanf(raw, "%d", &ms); err == nil && ms > 0 {
-			return time.Duration(ms) * time.Millisecond
+			parsed := time.Duration(ms) * time.Millisecond
+			if parsed < minInterval {
+				return minInterval
+			}
+			return parsed
 		}
 	}
-	return 250 * time.Millisecond
+	return 60 * time.Second
 }
 
 func discoverTelemetryServers(cwd string) []telemetry.DiscoveredServerInfo {

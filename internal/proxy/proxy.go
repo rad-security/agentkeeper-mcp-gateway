@@ -20,6 +20,11 @@ import (
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/telemetry"
 )
 
+const (
+	backendInitAttachDeadline = 3 * time.Second
+	backendToolListDeadline   = 25 * time.Second
+)
+
 // JSONRPCMessage represents a JSON-RPC 2.0 message.
 type JSONRPCMessage struct {
 	JSONRPC string           `json:"jsonrpc"`
@@ -52,7 +57,8 @@ type Proxy struct {
 	telemetry *telemetry.Client
 	mu        sync.Mutex
 	// Map from namespaced tool name to server name
-	toolMap map[string]string
+	toolMap   map[string]string
+	toolCache map[string][]interface{}
 }
 
 // NewProxy creates a new MCP proxy.
@@ -62,6 +68,7 @@ func NewProxy(cfg Config, mgr *server.Manager, tc *telemetry.Client) *Proxy {
 		manager:   mgr,
 		telemetry: tc,
 		toolMap:   make(map[string]string),
+		toolCache: make(map[string][]interface{}),
 	}
 }
 
@@ -185,7 +192,7 @@ func (p *Proxy) handleInitialize(msg JSONRPCMessage) (*JSONRPCMessage, error) {
 			results <- initResult{name: name, err: srv.Initialize()}
 		}(name, srv)
 	}
-	deadline := time.After(3 * time.Second)
+	deadline := time.After(backendInitAttachDeadline)
 	for pending > 0 {
 		select {
 		case result := <-results:
@@ -236,7 +243,9 @@ func (p *Proxy) handleToolsList(msg JSONRPCMessage) (*JSONRPCMessage, error) {
 	}
 	names := p.manager.ServerNames()
 	results := make(chan listResult, len(names))
+	pending := make(map[string]struct{}, len(names))
 	for _, name := range names {
+		pending[name] = struct{}{}
 		go func(name string) {
 			srv := p.manager.Get(name)
 			if srv == nil {
@@ -248,27 +257,37 @@ func (p *Proxy) handleToolsList(msg JSONRPCMessage) (*JSONRPCMessage, error) {
 		}(name)
 	}
 
-	p.mu.Lock()
 	var allTools []interface{}
-	p.toolMap = make(map[string]string)
-	p.mu.Unlock()
+	nextToolMap := make(map[string]string)
 
-	deadline := time.After(3 * time.Second)
+	deadline := time.After(backendToolListDeadline)
 	for remaining := len(names); remaining > 0; {
 		var result listResult
 		select {
 		case result = <-results:
 			remaining--
+			delete(pending, result.name)
 		case <-deadline:
 			p.config.Logger.Warn("timed out while listing tools from %d MCP server(s)", remaining)
+			for name := range pending {
+				if cached := p.cachedTools(name); len(cached) > 0 {
+					p.config.Logger.Warn("using cached tools from %s after tools/list timeout", name)
+					appendNamespacedTools(&allTools, nextToolMap, name, cached)
+				}
+			}
 			remaining = 0
 			continue
 		}
 
 		if result.err != nil {
 			p.config.Logger.Warn("failed to list tools from %s: %v", result.name, result.err)
+			if cached := p.cachedTools(result.name); len(cached) > 0 {
+				p.config.Logger.Warn("using cached tools from %s after tools/list error", result.name)
+				appendNamespacedTools(&allTools, nextToolMap, result.name, cached)
+			}
 			continue
 		}
+		p.setCachedTools(result.name, result.tools)
 
 		// Check for tool poisoning
 		if p.config.DetectionEngine != nil {
@@ -304,21 +323,11 @@ func (p *Proxy) handleToolsList(msg JSONRPCMessage) (*JSONRPCMessage, error) {
 			}
 		}
 
-		// Namespace tool names and build toolMap
-		for _, t := range result.tools {
-			tm, ok := t.(map[string]interface{})
-			if !ok {
-				continue
-			}
-			originalName := fmt.Sprintf("%v", tm["name"])
-			namespacedName := result.name + "__" + originalName
-			tm["name"] = namespacedName
-			p.mu.Lock()
-			p.toolMap[namespacedName] = result.name
-			p.mu.Unlock()
-			allTools = append(allTools, tm)
-		}
+		appendNamespacedTools(&allTools, nextToolMap, result.name, result.tools)
 	}
+	p.mu.Lock()
+	p.toolMap = nextToolMap
+	p.mu.Unlock()
 
 	// Add built-in gateway tools
 	builtinTools := p.getBuiltinTools()
@@ -333,6 +342,54 @@ func (p *Proxy) handleToolsList(msg JSONRPCMessage) (*JSONRPCMessage, error) {
 		ID:      msg.ID,
 		Result:  resultJSON,
 	}, nil
+}
+
+func (p *Proxy) cachedTools(serverName string) []interface{} {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return cloneTools(p.toolCache[serverName])
+}
+
+func (p *Proxy) setCachedTools(serverName string, tools []interface{}) {
+	if len(tools) == 0 {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.toolCache[serverName] = cloneTools(tools)
+}
+
+func appendNamespacedTools(allTools *[]interface{}, toolMap map[string]string, serverName string, tools []interface{}) {
+	for _, t := range cloneTools(tools) {
+		tm, ok := t.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		originalName := fmt.Sprintf("%v", tm["name"])
+		namespacedName := serverName + "__" + originalName
+		tm["name"] = namespacedName
+		toolMap[namespacedName] = serverName
+		*allTools = append(*allTools, tm)
+	}
+}
+
+func cloneTools(tools []interface{}) []interface{} {
+	if len(tools) == 0 {
+		return nil
+	}
+	out := make([]interface{}, 0, len(tools))
+	for _, tool := range tools {
+		if tm, ok := tool.(map[string]interface{}); ok {
+			copied := make(map[string]interface{}, len(tm))
+			for key, value := range tm {
+				copied[key] = value
+			}
+			out = append(out, copied)
+			continue
+		}
+		out = append(out, tool)
+	}
+	return out
 }
 
 func (p *Proxy) handleToolsCall(msg JSONRPCMessage) (*JSONRPCMessage, error) {

@@ -284,10 +284,22 @@ func TestStdioServerInitializeTimesOut(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected initialize timeout")
 	}
-	if elapsed := time.Since(started); elapsed > 4*time.Second {
+	if elapsed := time.Since(started); elapsed > 22*time.Second {
 		t.Fatalf("initialize took too long to fail: %s", elapsed)
 	}
 	if !strings.Contains(err.Error(), "initialize timed out") {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestDiscoveryTimeoutsTolerateSlowEnterpriseBackends(t *testing.T) {
+	if got := timeoutForMethod("initialize"); got != backendDiscoveryTimeout {
+		t.Fatalf("initialize timeout = %s, want %s", got, backendDiscoveryTimeout)
+	}
+	if got := timeoutForMethod("tools/list"); got != backendDiscoveryTimeout {
+		t.Fatalf("tools/list timeout = %s, want %s", got, backendDiscoveryTimeout)
+	}
+	if backendDiscoveryTimeout < 20*time.Second {
+		t.Fatalf("discovery timeout regressed below enterprise backend floor: %s", backendDiscoveryTimeout)
 	}
 }
