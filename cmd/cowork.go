@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sort"
 	"strings"
 	"syscall"
@@ -271,6 +272,15 @@ type coworkGuardSummary struct {
 }
 
 func runCoworkGuardOnce(sourcePath string, dryRun bool) (coworkGuardSummary, error) {
+	unlock, acquired, err := acquireCoworkGuardLock()
+	if err != nil {
+		return coworkGuardSummary{}, err
+	}
+	if !acquired {
+		return coworkGuardSummary{}, nil
+	}
+	defer unlock()
+
 	result, err := discovery.MigrateCoworkMCP(sourcePath, dryRun)
 	if err != nil {
 		return coworkGuardSummary{}, err
@@ -281,6 +291,28 @@ func runCoworkGuardOnce(sourcePath string, dryRun bool) (coworkGuardSummary, err
 		summary.Disabled += len(plan.NativeDisabled)
 	}
 	return summary, nil
+}
+
+func acquireCoworkGuardLock() (func(), bool, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, false, err
+	}
+	baseDir := filepath.Join(home, ".agentkeeper", "locks")
+	if err := os.MkdirAll(baseDir, 0o700); err != nil {
+		return nil, false, err
+	}
+
+	lockPath := filepath.Join(baseDir, "cowork-guard.lockdir")
+	if err := os.Mkdir(lockPath, 0o700); err != nil {
+		if os.IsExist(err) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	return func() {
+		_ = os.RemoveAll(lockPath)
+	}, true, nil
 }
 
 func coworkGuardChanged(summary coworkGuardSummary) bool {

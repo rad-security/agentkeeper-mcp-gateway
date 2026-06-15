@@ -17,6 +17,13 @@ import (
 	"time"
 )
 
+const (
+	backendDiscoveryTimeout = 20 * time.Second
+	backendCallTimeout      = 60 * time.Second
+	backendDefaultTimeout   = 8 * time.Second
+	backendStopGracePeriod  = 2 * time.Second
+)
+
 // ServerConfig defines a backend MCP server.
 type ServerConfig struct {
 	Name      string            `json:"name"`
@@ -53,6 +60,7 @@ type Manager struct {
 	servers map[string]*Server
 	configs []ServerConfig
 	mu      sync.RWMutex
+	startMu sync.Mutex
 }
 
 // NewManager creates a server manager from configs.
@@ -65,6 +73,9 @@ func NewManager(configs []ServerConfig) *Manager {
 
 // StartAll starts all configured servers.
 func (m *Manager) StartAll() error {
+	m.startMu.Lock()
+	defer m.startMu.Unlock()
+
 	m.mu.RLock()
 	configs := append([]ServerConfig(nil), m.configs...)
 	m.mu.RUnlock()
@@ -183,14 +194,28 @@ func (m *Manager) Get(name string) *Server {
 
 // StopAll stops all servers.
 func (m *Manager) StopAll() {
+	m.startMu.Lock()
+	defer m.startMu.Unlock()
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for _, srv := range m.servers {
 		if srv.cmd != nil && srv.cmd.Process != nil {
-			srv.stdin.Close()
-			srv.cmd.Process.Kill()
+			_ = srv.stdin.Close()
+			done := make(chan struct{})
+			go func(cmd *exec.Cmd) {
+				_ = cmd.Wait()
+				close(done)
+			}(srv.cmd)
+			select {
+			case <-done:
+			case <-time.After(backendStopGracePeriod):
+				_ = srv.cmd.Process.Kill()
+				<-done
+			}
 		}
 	}
+	m.servers = make(map[string]*Server)
 }
 
 // Initialize sends the initialize handshake to a server.
@@ -457,11 +482,11 @@ func (s *Server) postHTTP(msg map[string]interface{}, id int64, expectResult boo
 func timeoutForMethod(method string) time.Duration {
 	switch method {
 	case "initialize", "tools/list", "resources/list", "prompts/list":
-		return 2 * time.Second
+		return backendDiscoveryTimeout
 	case "tools/call":
-		return 60 * time.Second
+		return backendCallTimeout
 	default:
-		return 8 * time.Second
+		return backendDefaultTimeout
 	}
 }
 
