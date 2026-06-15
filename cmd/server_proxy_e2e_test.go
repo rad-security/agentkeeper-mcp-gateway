@@ -157,6 +157,84 @@ done
 	}
 }
 
+func TestE2E33c_ServerIncludesPartialRefreshBeforeToolsListResponse(t *testing.T) {
+	home := t.TempDir()
+	fast := filepath.Join(home, "fast-enterprise-mcp.sh")
+	if err := os.WriteFile(fast, []byte(`#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *\"method\":\"initialize\"*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"fast-enterprise","version":"test"}}}' ;;
+    *\"method\":\"tools/list\"*) sleep 1; printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"lookup_account","description":"Lookup enterprise account","inputSchema":{"type":"object","properties":{}}}]}}' ;;
+  esac
+done
+`), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	hung := filepath.Join(home, "hung-enterprise-mcp.sh")
+	if err := os.WriteFile(hung, []byte(`#!/bin/sh
+sleep 120
+`), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	configPath := writeGatewayConfig(t, home, `{
+		"mode": "audit",
+		"servers": [
+			{"name": "ontra-fast", "command": "`+fast+`"},
+			{"name": "ontra-hung", "command": "`+hung+`"}
+		]
+	}`)
+
+	cmd := exec.Command(binary, "--config", configPath, "server")
+	cmd.Env = []string{
+		"HOME=" + home,
+		"PATH=" + os.Getenv("PATH"),
+		"AGENTKEEPER_COWORK_GUARD=0",
+	}
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = stdin.Close()
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		_, _ = cmd.Process.Wait()
+	}()
+
+	reader := bufio.NewReader(stdout)
+	writeRPC(t, stdin, `{"jsonrpc":"2.0","id":120,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e","version":"test"}}}`)
+	_ = readRPCLine(t, reader)
+	writeRPC(t, stdin, `{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}`)
+
+	writeRPC(t, stdin, `{"jsonrpc":"2.0","id":121,"method":"tools/list","params":{}}`)
+	firstListResp := readRPCLineWithin(t, reader, 3*time.Second)
+	if !strings.Contains(firstListResp, `"agentkeeper_status"`) {
+		t.Fatalf("gateway did not return built-in tools: %s stderr=%s", firstListResp, stderr.String())
+	}
+	if !strings.Contains(firstListResp, `"ontra-fast__lookup_account"`) {
+		t.Fatalf("gateway did not include backend tool refreshed during warmup: %s stderr=%s", firstListResp, stderr.String())
+	}
+	if strings.Contains(firstListResp, `"ontra-hung__`) {
+		t.Fatalf("hung backend leaked into tools/list response: %s stderr=%s", firstListResp, stderr.String())
+	}
+
+	listChanged := readRPCLineWithin(t, reader, 1*time.Second)
+	if !strings.Contains(listChanged, `"method":"notifications/tools/list_changed"`) {
+		t.Fatalf("gateway did not send deferred tools/list_changed notification: %s stderr=%s", listChanged, stderr.String())
+	}
+}
+
 func TestE2E34_ServerReportsProxiedToolCallToAgentKeeperAPI(t *testing.T) {
 	requests := make(chan capturedAPIRequest, 10)
 	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
