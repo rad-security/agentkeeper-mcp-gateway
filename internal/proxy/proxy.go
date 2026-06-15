@@ -65,6 +65,8 @@ type Proxy struct {
 	toolRefreshMu   sync.Mutex
 	toolRefreshDone chan struct{}
 	clientReady     bool
+	activeToolsList int
+	pendingListNote bool
 	writeMu         sync.Mutex
 }
 
@@ -239,17 +241,20 @@ func (p *Proxy) gatewayVersion() string {
 }
 
 func (p *Proxy) handleToolsList(msg JSONRPCMessage) (*JSONRPCMessage, error) {
+	finishToolsList := p.beginToolsList()
+	defer finishToolsList()
+
 	done := p.startToolRefresh()
 
 	cachedTools, nextToolMap := p.cachedNamespacedTools()
 	if len(nextToolMap) == 0 && len(p.manager.ServerNames()) > 0 {
 		select {
 		case <-done:
-			cachedTools, nextToolMap = p.cachedNamespacedTools()
 		case <-time.After(backendToolListWarmupDeadline):
 			p.warn("returning gateway tools while backend tool refresh continues")
 		}
 	}
+	cachedTools, nextToolMap = p.cachedNamespacedTools()
 
 	p.setToolMap(nextToolMap)
 
@@ -429,10 +434,37 @@ func (p *Proxy) isClientReady() bool {
 	return p.clientReady
 }
 
+func (p *Proxy) beginToolsList() func() {
+	p.mu.Lock()
+	p.activeToolsList++
+	p.mu.Unlock()
+	return func() {
+		p.mu.Lock()
+		p.activeToolsList--
+		shouldNotify := p.activeToolsList == 0 && p.pendingListNote
+		if shouldNotify {
+			p.pendingListNote = false
+		}
+		p.mu.Unlock()
+		if shouldNotify {
+			time.AfterFunc(50*time.Millisecond, p.emitToolsListChanged)
+		}
+	}
+}
+
 func (p *Proxy) emitToolsListChanged() {
-	if !p.isClientReady() {
+	p.mu.Lock()
+	if !p.clientReady {
+		p.mu.Unlock()
 		return
 	}
+	if p.activeToolsList > 0 {
+		p.pendingListNote = true
+		p.mu.Unlock()
+		return
+	}
+	p.mu.Unlock()
+
 	p.writeJSONLine(os.Stdout, JSONRPCMessage{
 		JSONRPC: "2.0",
 		Method:  "notifications/tools/list_changed",
