@@ -189,10 +189,10 @@ func telemetryServerInfosFromConfig(cfg config.Config) []telemetry.ServerInfo {
 
 func coworkAutoGuardEnabled() bool {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("AGENTKEEPER_COWORK_GUARD"))) {
-	case "0", "false", "no", "off", "disabled":
-		return false
-	default:
+	case "1", "true", "yes", "on", "enabled":
 		return true
+	default:
+		return false
 	}
 }
 

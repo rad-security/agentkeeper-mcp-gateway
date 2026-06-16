@@ -44,22 +44,27 @@ func NewLogger(logPath string, verbose bool) (*Logger, error) {
 		logPath = filepath.Join(home, ".config", "agentkeeper-mcp-gateway", "events.jsonl")
 	}
 
-	// Ensure directory exists
 	if err := os.MkdirAll(filepath.Dir(logPath), 0755); err != nil {
-		return nil, fmt.Errorf("creating log directory: %w", err)
+		fmt.Fprintf(os.Stderr, "[agentkeeper] local event log disabled: creating log directory: %v\n", err)
+		return newBufferedLogger(nil, logPath, verbose), nil
 	}
 
 	file, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
 	if err != nil {
-		return nil, fmt.Errorf("opening log file: %w", err)
+		fmt.Fprintf(os.Stderr, "[agentkeeper] local event log disabled: opening log file: %v\n", err)
+		return newBufferedLogger(nil, logPath, verbose), nil
 	}
 
+	return newBufferedLogger(file, logPath, verbose), nil
+}
+
+func newBufferedLogger(file *os.File, logPath string, verbose bool) *Logger {
 	return &Logger{
 		file:    file,
 		logPath: logPath,
 		verbose: verbose,
 		buffer:  make([]Event, 0, 100),
-	}, nil
+	}
 }
 
 // LogToolCall logs an MCP tool call event.
@@ -140,6 +145,9 @@ func (l *Logger) FlushBuffer() []Event {
 
 // Close closes the log file.
 func (l *Logger) Close() error {
+	if l.file == nil {
+		return nil
+	}
 	return l.file.Close()
 }
 
@@ -149,11 +157,12 @@ func (l *Logger) writeEvent(event Event) {
 		return
 	}
 
-	// Write to file
-	l.mu.Lock()
-	l.file.Write(data)
-	l.file.Write([]byte("\n"))
-	l.mu.Unlock()
+	if l.file != nil {
+		l.mu.Lock()
+		l.file.Write(data)
+		l.file.Write([]byte("\n"))
+		l.mu.Unlock()
+	}
 
 	// Add to buffer for telemetry
 	l.bufferMu.Lock()
