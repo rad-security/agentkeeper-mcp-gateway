@@ -145,20 +145,26 @@ func readConfig(t *testing.T, path string) map[string]json.RawMessage {
 	return out
 }
 
-// countBackups returns how many *.agentkeeper-backup-* files exist under dir.
-func countBackups(t *testing.T, dir string) int {
+// backupFiles returns *.agentkeeper-backup-* files under dir.
+func backupFiles(t *testing.T, dir string) []string {
 	t.Helper()
-	n := 0
+	var out []string
 	_ = filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
 			return nil
 		}
 		if strings.Contains(d.Name(), ".agentkeeper-backup-") {
-			n++
+			out = append(out, p)
 		}
 		return nil
 	})
-	return n
+	return out
+}
+
+// countBackups returns how many *.agentkeeper-backup-* files exist under dir.
+func countBackups(t *testing.T, dir string) int {
+	t.Helper()
+	return len(backupFiles(t, dir))
 }
 
 // assertGatewayWired parses path and verifies `mcpServers` has exactly the
@@ -497,9 +503,12 @@ func TestE2E15_BackupMatchesOriginalExactly(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("exit %d", code)
 	}
-	matches, _ := filepath.Glob(p + ".agentkeeper-backup-*")
+	if countBackups(t, filepath.Dir(p)) != 0 {
+		t.Fatalf("backup should not be written next to IDE config")
+	}
+	matches := backupFiles(t, home)
 	if len(matches) != 1 {
-		t.Fatalf("want 1 backup, got %d", len(matches))
+		t.Fatalf("want 1 centralized backup, got %d", len(matches))
 	}
 	data, _ := os.ReadFile(matches[0])
 	if string(data) != original {
@@ -560,7 +569,10 @@ func TestE2E17b_StaleBareGatewayEntryRewritesToInstalledPath(t *testing.T) {
 		t.Fatalf("exit %d", code)
 	}
 	assertGatewayWired(t, p)
-	if countBackups(t, filepath.Dir(p)) != 1 {
+	if countBackups(t, filepath.Dir(p)) != 0 {
+		t.Fatalf("backup should not be written next to IDE config")
+	}
+	if countBackups(t, home) != 1 {
 		t.Fatalf("expected stale bare gateway entry to be backed up and rewritten")
 	}
 }
@@ -604,16 +616,15 @@ func TestE2E19_CaseSensitiveBasenameMatch(t *testing.T) {
 func TestE2E20_ExtraFieldOnGatewayEntry_StillWired(t *testing.T) {
 	home := t.TempDir()
 	body := fmt.Sprintf(`{"mcpServers":{"agentkeeper-mcp-gateway":{"command":%q,"args":["server"],"type":"stdio"}}}`, binary)
-	p := writeFixture(t, home, "cursor", body)
+	writeFixture(t, home, "cursor", body)
 	// We don't have a getter for the Plan struct here; we can only check via
 	// observable behavior: no backup should be created if we consider this wired.
 	_, _, code := run(t, home, "configure-ide")
 	if code != 0 {
 		t.Fatalf("exit %d", code)
 	}
-	matches, _ := filepath.Glob(p + ".agentkeeper-backup-*")
-	if len(matches) != 0 {
-		t.Errorf("backup created despite already-wired shape + extra harmless field; backups=%v", matches)
+	if countBackups(t, home) != 0 {
+		t.Errorf("backup created despite already-wired shape + extra harmless field; backups=%v", backupFiles(t, home))
 	}
 }
 
@@ -779,8 +790,11 @@ func TestE2E26_ClaudeCodeProjectMCPJSONMigrated(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("apply exit=%d out=%s", code, out)
 	}
-	if countBackups(t, project) != 1 {
-		t.Fatalf("expected one project backup, got %d", countBackups(t, project))
+	if countBackups(t, project) != 0 {
+		t.Fatalf("backup should not be written next to project .mcp.json")
+	}
+	if countBackups(t, home) != 1 {
+		t.Fatalf("expected one centralized project backup, got %d", countBackups(t, home))
 	}
 
 	raw := readConfig(t, projectMCP)
@@ -839,7 +853,10 @@ func TestE2E27_DefaultConfigureIDEMigratesCurrentProjectMCPJSON(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("apply exit=%d out=%s", code, out)
 	}
-	if countBackups(t, project) != 1 {
+	if countBackups(t, project) != 0 {
+		t.Fatalf("backup should not be written next to project .mcp.json")
+	}
+	if countBackups(t, home) != 1 {
 		t.Fatalf("expected stale project gateway entry to be backed up and rewritten")
 	}
 	raw := readConfig(t, projectMCP)
@@ -1076,8 +1093,11 @@ func TestE2E27_CoworkPluginMCPJSONMigrated(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("apply exit=%d out=%s", code, out)
 	}
-	if countBackups(t, filepath.Dir(pluginMCP)) != 1 {
-		t.Fatalf("expected one cowork backup, got %d", countBackups(t, filepath.Dir(pluginMCP)))
+	if countBackups(t, filepath.Dir(pluginMCP)) != 0 {
+		t.Fatalf("backup should not be written next to Cowork plugin .mcp.json")
+	}
+	if countBackups(t, home) != 1 {
+		t.Fatalf("expected one centralized cowork backup, got %d", countBackups(t, home))
 	}
 
 	raw := readConfig(t, pluginMCP)

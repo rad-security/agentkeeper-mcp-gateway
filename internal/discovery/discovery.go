@@ -13,9 +13,9 @@ import (
 	"runtime"
 	"sort"
 	"strings"
-	"time"
 
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/config"
+	"github.com/rad-security/agentkeeper-mcp-gateway/internal/configbackup"
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/gatewayentry"
 )
 
@@ -454,8 +454,8 @@ func MigrateClaudeJSONProjects(dryRun bool) (MigrationPlan, error) {
 		return plan, nil
 	}
 
-	backup := path + ".agentkeeper-backup-" + fmt.Sprintf("%d", unixNano())
-	if err := os.WriteFile(backup, data, 0o644); err != nil {
+	backup, err := configbackup.Write(path, data)
+	if err != nil {
 		return plan, err
 	}
 	plan.BackupPath = backup
@@ -646,8 +646,8 @@ func ensureCoworkGatewayEntrypoint(home string, dryRun bool) (MigrationPlan, err
 	}
 
 	if exists {
-		backup := path + ".agentkeeper-backup-" + fmt.Sprintf("%d", unixNano())
-		if err := os.WriteFile(backup, data, 0o644); err != nil {
+		backup, err := configbackup.Write(path, data)
+		if err != nil {
 			return plan, err
 		}
 		plan.BackupPath = backup
@@ -797,8 +797,8 @@ func disableCoworkRemoteMCPEntries(path string, direct []DiscoveredServer) (stri
 		}
 	}
 
-	backup := path + ".agentkeeper-backup-" + fmt.Sprintf("%d", unixNano())
-	if err := os.WriteFile(backup, data, 0o644); err != nil {
+	backup, err := configbackup.Write(path, data)
+	if err != nil {
 		return "", nil, err
 	}
 	out, err := json.MarshalIndent(raw, "", "  ")
@@ -856,8 +856,8 @@ func MigrateMCPFile(path, client, scope, sourceKind, routeability string, dryRun
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return plan, err
 	}
-	backup := path + ".agentkeeper-backup-" + fmt.Sprintf("%d", unixNano())
-	if err := os.WriteFile(backup, data, 0o644); err != nil {
+	backup, err := configbackup.Write(path, data)
+	if err != nil {
 		return plan, err
 	}
 	plan.BackupPath = backup
@@ -1209,8 +1209,4 @@ func coworkAppSupportDir(home string) string {
 	default:
 		return filepath.Join(home, ".config", "Claude")
 	}
-}
-
-func unixNano() int64 {
-	return time.Now().UnixNano()
 }
