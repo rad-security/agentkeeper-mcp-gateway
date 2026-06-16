@@ -25,8 +25,8 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"time"
 
+	"github.com/rad-security/agentkeeper-mcp-gateway/internal/configbackup"
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/gatewayentry"
 )
 
@@ -34,10 +34,6 @@ import (
 // also how we detect "already wired" idempotency — an IDE config whose only
 // MCP entry has this name and our exact shape is a no-op.
 const GatewayServerName = "agentkeeper-mcp-gateway"
-
-// backupSuffix is appended (with a timestamp) to the original path when we
-// back up before rewriting.
-const backupSuffix = ".agentkeeper-backup-"
 
 // ServerEntry mirrors the shape each target IDE uses inside its `mcpServers`
 // map. It is a superset — stdio servers use Command/Args/Env; HTTP/SSE-style
@@ -240,8 +236,8 @@ func (a *Adapter) Apply(p *Plan) error {
 		if err := json.Unmarshal(data, &raw); err != nil {
 			return fmt.Errorf("parsing %s: %w", p.ConfigPath, err)
 		}
-		backup := p.ConfigPath + backupSuffix + fmt.Sprintf("%d", time.Now().UnixNano())
-		if err := os.WriteFile(backup, data, 0o644); err != nil {
+		backup, err := configbackup.Write(p.ConfigPath, data)
+		if err != nil {
 			return fmt.Errorf("writing backup %s: %w", backup, err)
 		}
 		p.BackupPath = backup
