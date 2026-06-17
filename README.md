@@ -157,7 +157,7 @@ For Cowork sources created after setup, run `agentkeeper-mcp-gateway cowork guar
 
 Supports **Claude Code** (`~/.claude/settings.json`), **Claude Desktop** (macOS + Linux), and **Cursor** (`~/.cursor/mcp.json`). For each detected IDE it:
 
-1. Backs up the existing config to `*.agentkeeper-backup-<unix-nanos>`
+1. Backs up the existing config under the gateway backup directory, normally `~/.config/agentkeeper-mcp-gateway/backups/`
 2. Migrates any already-registered MCP servers into the gateway's own config (environment variables and all)
 3. Rewrites the IDE's `mcpServers` map to a single entry pointing at the gateway
 4. Preserves every non-MCP top-level key verbatim (`permissions`, `preferences`, etc.)
@@ -212,8 +212,8 @@ agentkeeper-mcp-gateway cowork doctor --strict
 gateway config, ensures Claude Desktop/Cowork has an
 `agentkeeper-mcp-gateway server` MCP entrypoint, rewrites local `.mcp.json`
 files to point at that entrypoint, and disables direct Cowork
-`remoteMcpServersConfig` entries after backing up each touched file to
-`*.agentkeeper-backup-<unix-nanos>`.
+`remoteMcpServersConfig` entries after backing up each touched file under the
+gateway backup directory, not beside project or plugin `.mcp.json` files.
 
 The local MCP success condition is:
 
