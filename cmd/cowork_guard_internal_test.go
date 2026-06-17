@@ -24,6 +24,23 @@ func TestCoworkAutoGuardIntervalDefaultAndMinimum(t *testing.T) {
 	}
 }
 
+func TestCoworkAutoGuardEnabledRequiresExplicitOptIn(t *testing.T) {
+	t.Setenv("AGENTKEEPER_COWORK_GUARD", "")
+	if coworkAutoGuardEnabled() {
+		t.Fatal("cowork auto guard should be disabled by default for long-running server")
+	}
+
+	t.Setenv("AGENTKEEPER_COWORK_GUARD", "1")
+	if !coworkAutoGuardEnabled() {
+		t.Fatal("cowork auto guard should be enabled by explicit opt-in")
+	}
+
+	t.Setenv("AGENTKEEPER_COWORK_GUARD", "off")
+	if coworkAutoGuardEnabled() {
+		t.Fatal("cowork auto guard should respect explicit opt-out")
+	}
+}
+
 func TestCoworkGuardLockIsExclusive(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 
