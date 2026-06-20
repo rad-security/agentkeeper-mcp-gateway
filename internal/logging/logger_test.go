@@ -3,6 +3,7 @@ package logging
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/detection"
@@ -23,6 +24,29 @@ func TestLogToolCallDefaultsEmptyVerdictToPass(t *testing.T) {
 	}
 	if events[0].Verdict != "pass" {
 		t.Fatalf("verdict = %q, want pass", events[0].Verdict)
+	}
+}
+
+func TestLogSessionStartStaysLocalButDoesNotUpload(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "events.jsonl")
+	logger, err := NewLogger(logPath, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer logger.Close()
+
+	logger.LogSessionStart("dev-workstation-01", "darwin", "0.1.13", []string{"qa-stdio"})
+
+	if events := logger.FlushBuffer(); len(events) != 0 {
+		t.Fatalf("expected lifecycle event to stay out of telemetry buffer, got %+v", events)
+	}
+
+	contents, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(contents), `"event_type":"mcp.session_start"`) {
+		t.Fatalf("expected local session_start evidence, got %s", string(contents))
 	}
 }
 

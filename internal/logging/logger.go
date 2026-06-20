@@ -178,10 +178,11 @@ func (l *Logger) writeEvent(event Event) {
 		l.mu.Unlock()
 	}
 
-	// Add to buffer for telemetry
-	l.bufferMu.Lock()
-	l.buffer = append(l.buffer, event)
-	l.bufferMu.Unlock()
+	if remoteIngestable(event) {
+		l.bufferMu.Lock()
+		l.buffer = append(l.buffer, event)
+		l.bufferMu.Unlock()
+	}
 
 	// Print to stderr if verbose
 	if l.verbose {
@@ -191,4 +192,8 @@ func (l *Logger) writeEvent(event Event) {
 				event.EventType, event.ServerName, event.ToolName, verdict, event.PatternName, event.Description)
 		}
 	}
+}
+
+func remoteIngestable(event Event) bool {
+	return event.ServerName != "" && event.ToolName != ""
 }
