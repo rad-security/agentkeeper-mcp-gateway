@@ -202,17 +202,23 @@ By default every detected IDE is configured. Use --ide to target just one.
 func printPlan(out interface {
 	Write(p []byte) (int, error)
 }, ide string, p ideconfig.Plan) {
-	status := "would wire"
+	status := "wire"
 	if configureIDEDryRun {
-		// keep the same verb; it's already hypothetical by flag
+		status = "would wire"
 	}
 	switch {
 	case p.AlreadyWired:
 		status = "already wired"
 	case !p.Exists:
 		status = "create"
+		if configureIDEDryRun {
+			status = "would create"
+		}
 	case len(p.Migrated) > 0:
 		status = fmt.Sprintf("migrate %d + wire", len(p.Migrated))
+		if configureIDEDryRun {
+			status = fmt.Sprintf("would migrate %d + wire", len(p.Migrated))
+		}
 	}
 	fmt.Fprintf(out, "  %-16s %s - %s\n", ide, status, p.ConfigPath)
 	for _, m := range p.Migrated {
