@@ -277,6 +277,9 @@ func (c *Client) discoveredServers() []DiscoveredServerInfo {
 }
 
 func (c *Client) flush() {
+	if c.logger == nil {
+		return
+	}
 	events := c.logger.FlushBuffer()
 	if len(events) == 0 {
 		return
@@ -291,11 +294,13 @@ func (c *Client) flush() {
 
 	data, err := json.Marshal(payload)
 	if err != nil {
+		c.logger.RequeueFront(events)
 		return
 	}
 
 	req, err := http.NewRequest("POST", c.apiURL+"/api/v1/mcp/events", bytes.NewReader(data))
 	if err != nil {
+		c.logger.RequeueFront(events)
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
@@ -304,8 +309,46 @@ func (c *Client) flush() {
 	client := &http.Client{Timeout: 4 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
+		c.logger.RequeueFront(events)
 		fmt.Fprintf(os.Stderr, "[agentkeeper] telemetry upload failed: %v\n", err)
 		return
 	}
-	resp.Body.Close()
+	defer resp.Body.Close()
+
+	var result struct {
+		OK       bool   `json:"ok"`
+		Inserted int    `json:"inserted"`
+		Received *int   `json:"received"`
+		Disabled bool   `json:"disabled"`
+		Error    string `json:"error"`
+	}
+	decodeErr := json.NewDecoder(resp.Body).Decode(&result)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		c.logger.RequeueFront(events)
+		fmt.Fprintf(os.Stderr, "[agentkeeper] telemetry upload error (HTTP %d)\n", resp.StatusCode)
+		return
+	}
+	if decodeErr != nil {
+		c.logger.RequeueFront(events)
+		fmt.Fprintf(os.Stderr, "[agentkeeper] telemetry upload ack invalid: %v\n", decodeErr)
+		return
+	}
+	if result.Disabled {
+		c.logger.Info("telemetry upload skipped: connector disabled")
+		return
+	}
+	if !result.OK || result.Error != "" || (result.Received != nil && *result.Received < len(events)) {
+		c.logger.RequeueFront(events)
+		if result.Error != "" {
+			fmt.Fprintf(os.Stderr, "[agentkeeper] telemetry upload not acknowledged: %s\n", result.Error)
+		} else {
+			fmt.Fprintf(os.Stderr, "[agentkeeper] telemetry upload not acknowledged\n")
+		}
+		return
+	}
+	received := len(events)
+	if result.Received != nil {
+		received = *result.Received
+	}
+	c.logger.Info("telemetry upload acknowledged: sent=%d received=%d inserted=%d", len(events), received, result.Inserted)
 }

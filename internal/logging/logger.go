@@ -143,6 +143,20 @@ func (l *Logger) FlushBuffer() []Event {
 	return events
 }
 
+// RequeueFront puts events back at the front of the telemetry buffer after a
+// failed upload so the gateway does not silently drop local evidence.
+func (l *Logger) RequeueFront(events []Event) {
+	if len(events) == 0 {
+		return
+	}
+	l.bufferMu.Lock()
+	defer l.bufferMu.Unlock()
+	next := make([]Event, 0, len(events)+len(l.buffer))
+	next = append(next, events...)
+	next = append(next, l.buffer...)
+	l.buffer = next
+}
+
 // Close closes the log file.
 func (l *Logger) Close() error {
 	if l.file == nil {

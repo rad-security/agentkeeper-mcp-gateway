@@ -152,6 +152,7 @@ are blocked.`,
 		p := proxy.NewProxy(proxy.Config{
 			EnforceMode:     cfg.Mode == "enforce",
 			GatewayVersion:  version,
+			Detection:       telemetry.DetectionConfig{Threat: cfg.Detection.Threat, SensitiveData: cfg.Detection.SensitiveData},
 			DetectionEngine: engine,
 			Logger:          logger,
 		}, mgr, tc)

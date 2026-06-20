@@ -48,6 +48,7 @@ type JSONRPCError struct {
 type Config struct {
 	EnforceMode     bool
 	GatewayVersion  string
+	Detection       telemetry.DetectionConfig
 	DetectionEngine *detection.Engine
 	Logger          *logging.Logger
 }
@@ -610,7 +611,18 @@ func (p *Proxy) handleToolsCall(msg JSONRPCMessage) (*JSONRPCMessage, error) {
 	serverName, ok := p.toolMap[callParams.Name]
 	p.mu.Unlock()
 	if !ok {
-		return nil, fmt.Errorf("unknown tool: %s", callParams.Name)
+		done := p.startToolRefresh()
+		select {
+		case <-done:
+		case <-time.After(backendToolListWarmupDeadline):
+		}
+		p.rebuildToolMapFromCache()
+		p.mu.Lock()
+		serverName, ok = p.toolMap[callParams.Name]
+		p.mu.Unlock()
+		if !ok {
+			return nil, fmt.Errorf("unknown tool: %s", callParams.Name)
+		}
 	}
 
 	// Strip the namespace prefix to get the original tool name
@@ -619,9 +631,10 @@ func (p *Proxy) handleToolsCall(msg JSONRPCMessage) (*JSONRPCMessage, error) {
 	// --- 1. Policy check ---
 	var finalVerdict string = "pass"
 	var finalResult detection.Result
+	var syncPolicy telemetry.SyncPolicy
 
 	if p.telemetry != nil {
-		syncPolicy := p.telemetry.Policy()
+		syncPolicy = p.telemetry.Policy()
 		policyResult := policy.Evaluate(syncPolicy, serverName, originalName, callParams.Arguments)
 
 		if policyResult.Verdict == "block" {
@@ -671,6 +684,7 @@ func (p *Proxy) handleToolsCall(msg JSONRPCMessage) (*JSONRPCMessage, error) {
 
 	if p.config.DetectionEngine != nil {
 		embeddedResult := p.config.DetectionEngine.EvaluateToolCall(serverName, originalName, callParams.Arguments)
+		embeddedResult = applyDetectionPolicy(embeddedResult, syncPolicy, p.config.Detection)
 		if verdictRank(string(embeddedResult.Verdict)) > verdictRank(finalVerdict) {
 			finalVerdict = string(embeddedResult.Verdict)
 			finalResult = embeddedResult
@@ -734,12 +748,43 @@ func (p *Proxy) handleToolsCall(msg JSONRPCMessage) (*JSONRPCMessage, error) {
 	if p.config.DetectionEngine != nil {
 		respStr := string(response)
 		result := p.config.DetectionEngine.EvaluateToolResponse(serverName, originalName, respStr)
+		result = applyDetectionPolicy(result, syncPolicy, p.config.Detection)
 		if result.Verdict != detection.VerdictPass {
 			p.config.Logger.LogDetection(serverName, originalName, result)
+			if result.Verdict == detection.VerdictBlock && p.config.EnforceMode {
+				errResult := map[string]interface{}{
+					"content": []map[string]interface{}{
+						{
+							"type": "text",
+							"text": fmt.Sprintf("Blocked by AgentKeeper: %s — %s. Upstream response was withheld.", result.PatternName, result.Description),
+						},
+					},
+					"isError": true,
+				}
+				resultJSON, _ := json.Marshal(errResult)
+				return &JSONRPCMessage{JSONRPC: "2.0", ID: msg.ID, Result: resultJSON}, nil
+			}
 		}
 	}
 
 	return &JSONRPCMessage{JSONRPC: "2.0", ID: msg.ID, Result: response}, nil
+}
+
+func applyDetectionPolicy(result detection.Result, p telemetry.SyncPolicy, local telemetry.DetectionConfig) detection.Result {
+	if result.Verdict == detection.VerdictPass || result.Verdict == "" {
+		return result
+	}
+	switch result.Category {
+	case "sensitive_data":
+		if strings.EqualFold(p.Detection.SensitiveData, "block") || strings.EqualFold(local.SensitiveData, "block") {
+			result.Verdict = detection.VerdictBlock
+		}
+	case "threat":
+		if strings.EqualFold(p.Detection.Threat, "block") || strings.EqualFold(local.Threat, "block") {
+			result.Verdict = detection.VerdictBlock
+		}
+	}
+	return result
 }
 
 func (p *Proxy) handleResourcesList(msg JSONRPCMessage) (*JSONRPCMessage, error) {
@@ -853,14 +898,25 @@ func (p *Proxy) handleBuiltinToolCall(id *json.RawMessage, name string, args map
 func (p *Proxy) cachedToolSummary() (backendCount int, toolCount int, degradedBackendCount int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	for _, tools := range p.toolCache {
+	names := []string(nil)
+	if p.manager != nil {
+		names = p.manager.ServerNames()
+	}
+	if len(names) == 0 {
+		for name := range p.toolCache {
+			names = append(names, name)
+		}
+	}
+	for _, name := range names {
+		tools := p.toolCache[name]
 		if len(tools) == 0 {
 			continue
 		}
 		backendCount++
 		toolCount += len(tools)
 	}
-	for _, status := range p.toolStatus {
+	for _, name := range names {
+		status := p.toolStatus[name]
 		if status.Status == "degraded" {
 			degradedBackendCount++
 		}

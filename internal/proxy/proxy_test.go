@@ -4,6 +4,10 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/rad-security/agentkeeper-mcp-gateway/internal/detection"
+	"github.com/rad-security/agentkeeper-mcp-gateway/internal/server"
+	"github.com/rad-security/agentkeeper-mcp-gateway/internal/telemetry"
 )
 
 func TestToolCacheClonesAndIgnoresEmptyRefresh(t *testing.T) {
@@ -88,5 +92,72 @@ func TestToolCachePersistsLastKnownGoodManifest(t *testing.T) {
 	}
 	if got := tools[0].(map[string]interface{})["name"]; got != "search" {
 		t.Fatalf("restored cached tool name = %v, want search", got)
+	}
+}
+
+func TestApplyDetectionPolicyEscalatesConfiguredDetectorBlocks(t *testing.T) {
+	result := detection.Result{
+		Verdict:     detection.VerdictWarn,
+		PatternName: "api_key_aws",
+		Severity:    "critical",
+		Category:    "sensitive_data",
+	}
+
+	escalated := applyDetectionPolicy(result, telemetry.SyncPolicy{
+		Detection: telemetry.DetectionConfig{SensitiveData: "block"},
+	}, telemetry.DetectionConfig{})
+	if escalated.Verdict != detection.VerdictBlock {
+		t.Fatalf("sensitive_data verdict = %s, want block", escalated.Verdict)
+	}
+
+	threatFromDashboard := applyDetectionPolicy(detection.Result{
+		Verdict:  detection.VerdictWarn,
+		Category: "threat",
+	}, telemetry.SyncPolicy{
+		Detection: telemetry.DetectionConfig{Threat: "block"},
+	}, telemetry.DetectionConfig{})
+	if threatFromDashboard.Verdict != detection.VerdictBlock {
+		t.Fatalf("dashboard threat verdict = %s, want block", threatFromDashboard.Verdict)
+	}
+
+	threatFromLocalConfig := applyDetectionPolicy(detection.Result{
+		Verdict:  detection.VerdictWarn,
+		Category: "threat",
+	}, telemetry.SyncPolicy{}, telemetry.DetectionConfig{Threat: "block"})
+	if threatFromLocalConfig.Verdict != detection.VerdictBlock {
+		t.Fatalf("local threat verdict = %s, want block", threatFromLocalConfig.Verdict)
+	}
+}
+
+func TestCachedToolSummaryIgnoresStaleServersOutsideCurrentConfig(t *testing.T) {
+	mgr := server.NewManager([]server.ServerConfig{{
+		Name:      "active",
+		Transport: "http",
+		URL:       "https://example.test/mcp",
+	}})
+	if err := mgr.StartAll(); err != nil {
+		t.Fatal(err)
+	}
+
+	p := &Proxy{
+		manager: mgr,
+		toolCache: map[string][]interface{}{
+			"active": {
+				map[string]interface{}{"name": "lookup"},
+			},
+			"stale": {
+				map[string]interface{}{"name": "old_one"},
+				map[string]interface{}{"name": "old_two"},
+			},
+		},
+		toolStatus: map[string]toolRefreshStatus{
+			"active": {Status: "ready"},
+			"stale":  {Status: "degraded"},
+		},
+	}
+
+	backendCount, toolCount, degradedCount := p.cachedToolSummary()
+	if backendCount != 1 || toolCount != 1 || degradedCount != 0 {
+		t.Fatalf("summary = backends:%d tools:%d degraded:%d, want 1/1/0", backendCount, toolCount, degradedCount)
 	}
 }
