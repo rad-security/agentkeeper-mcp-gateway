@@ -140,3 +140,44 @@ func TestFlushRequeuesWhenDashboardAckIsIncomplete(t *testing.T) {
 		t.Fatalf("expected buffer empty after complete ack, got %+v", remaining)
 	}
 }
+
+func TestFlushUploadsOnlyDashboardIngestableEvents(t *testing.T) {
+	logger, err := logging.NewLogger(filepath.Join(t.TempDir(), "events.jsonl"), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.LogSessionStart("dev-workstation-01", "darwin", "0.1.13", []string{"qa-stdio"})
+	logger.LogToolCall("qa-stdio", "echo", map[string]interface{}{"text": "hello"}, detection.Result{})
+
+	requests := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		var captured struct {
+			Events []logging.Event `json:"events"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&captured); err != nil {
+			t.Fatal(err)
+		}
+		if len(captured.Events) != 1 {
+			t.Fatalf("uploaded events = %+v, want only the tool call", captured.Events)
+		}
+		if captured.Events[0].EventType != "mcp.tool_call" ||
+			captured.Events[0].ServerName != "qa-stdio" ||
+			captured.Events[0].ToolName != "echo" {
+			t.Fatalf("unexpected uploaded event: %+v", captured.Events[0])
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true,"inserted":1,"received":1}`))
+	}))
+	defer srv.Close()
+
+	client := NewClient(srv.URL, "test-key", logger)
+	client.flush()
+
+	if requests != 1 {
+		t.Fatalf("requests = %d, want 1", requests)
+	}
+	if remaining := logger.FlushBuffer(); len(remaining) != 0 {
+		t.Fatalf("expected acknowledged buffer to be empty, got %+v", remaining)
+	}
+}
