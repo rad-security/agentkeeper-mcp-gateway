@@ -1,6 +1,7 @@
 package machineid
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"os"
@@ -8,6 +9,7 @@ import (
 	"regexp"
 	"runtime"
 	"strings"
+	"time"
 )
 
 type Runner func(name string, args ...string) ([]byte, error)
@@ -18,7 +20,9 @@ func Detect() string {
 }
 
 func commandOutput(name string, args ...string) ([]byte, error) {
-	return exec.Command(name, args...).Output()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	return exec.CommandContext(ctx, name, args...).Output()
 }
 
 func DetectWithRunner(goos string, run Runner) string {

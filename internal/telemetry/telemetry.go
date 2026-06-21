@@ -12,6 +12,7 @@ import (
 
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/hostidentity"
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/logging"
+	"github.com/rad-security/agentkeeper-mcp-gateway/internal/machineid"
 )
 
 // ServerInfo describes a connected MCP server for sync registration.
@@ -75,6 +76,7 @@ type Client struct {
 	apiURL         string
 	apiKey         string
 	hostname       string
+	machineID      string
 	mode           string
 	gatewayVersion string
 	servers        []ServerInfo
@@ -97,13 +99,15 @@ func StableHostname() string {
 // NewClient creates a telemetry client.
 func NewClient(apiURL, apiKey string, logger *logging.Logger) *Client {
 	hostname := StableHostname()
+	machineID := machineid.Detect()
 	return &Client{
-		apiURL:   apiURL,
-		apiKey:   apiKey,
-		hostname: hostname,
-		mode:     "audit",
-		logger:   logger,
-		done:     make(chan struct{}),
+		apiURL:    apiURL,
+		apiKey:    apiKey,
+		hostname:  hostname,
+		machineID: machineID,
+		mode:      "audit",
+		logger:    logger,
+		done:      make(chan struct{}),
 	}
 }
 
@@ -179,6 +183,7 @@ func (c *Client) Evaluate(serverName, toolName string, params map[string]interfa
 		"tool_name":   toolName,
 		"params":      params,
 		"hostname":    c.hostname,
+		"machine_id":  c.machineID,
 		"gateway_id":  c.gatewayID,
 		"source":      "agentkeeper-mcp-gateway",
 	}
@@ -219,6 +224,7 @@ func (c *Client) Evaluate(serverName, toolName string, params map[string]interfa
 func (c *Client) sync() {
 	payload := map[string]interface{}{
 		"hostname":           c.hostname,
+		"machine_id":         c.machineID,
 		"os":                 runtime.GOOS,
 		"os_version":         runtime.GOARCH,
 		"gateway_version":    c.gatewayVersion,
@@ -288,6 +294,7 @@ func (c *Client) flush() {
 	payload := map[string]interface{}{
 		"events":     events,
 		"hostname":   c.hostname,
+		"machine_id": c.machineID,
 		"gateway_id": c.gatewayID,
 		"source":     "agentkeeper-mcp-gateway",
 	}

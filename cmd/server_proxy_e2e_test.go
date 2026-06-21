@@ -273,6 +273,7 @@ func TestE2E34_ServerReportsProxiedToolCallToAgentKeeperAPI(t *testing.T) {
 	cmd.Env = []string{
 		"HOME=" + home,
 		"PATH=" + os.Getenv("PATH"),
+		"AGENTKEEPER_MACHINE_ID=machine-e2e-34",
 		"AGENTKEEPER_COWORK_GUARD=0",
 	}
 	stdin, err := cmd.StdinPipe()
@@ -299,6 +300,12 @@ func TestE2E34_ServerReportsProxiedToolCallToAgentKeeperAPI(t *testing.T) {
 	reader := bufio.NewReader(stdout)
 	writeRPC(t, stdin, `{"jsonrpc":"2.0","id":200,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e","version":"test"}}}`)
 	_ = readRPCLine(t, reader)
+
+	sync := waitForAPIPath(t, requests, "/api/v1/mcp/sync", 6*time.Second)
+	if sync["machine_id"] != "machine-e2e-34" {
+		t.Fatalf("sync did not include machine_id: %#v", sync)
+	}
+
 	writeRPC(t, stdin, `{"jsonrpc":"2.0","id":201,"method":"tools/list","params":{}}`)
 	_ = readRPCLine(t, reader)
 	writeRPC(t, stdin, `{"jsonrpc":"2.0","id":202,"method":"tools/call","params":{"name":"atlas__list_accounts","arguments":{"account_id":"acct_test"}}}`)
@@ -314,8 +321,14 @@ func TestE2E34_ServerReportsProxiedToolCallToAgentKeeperAPI(t *testing.T) {
 	if evaluate["gateway_id"] != "gw_e2e" {
 		t.Fatalf("evaluate did not include synced gateway id: %#v", evaluate)
 	}
+	if evaluate["machine_id"] != "machine-e2e-34" {
+		t.Fatalf("evaluate did not include machine_id: %#v", evaluate)
+	}
 
 	events := waitForAPIPath(t, requests, "/api/v1/mcp/events", 7*time.Second)
+	if events["machine_id"] != "machine-e2e-34" {
+		t.Fatalf("events upload did not include machine_id: %#v", events)
+	}
 	rawEvents, ok := events["events"].([]any)
 	if !ok || len(rawEvents) == 0 {
 		t.Fatalf("events upload missing events array: %#v", events)

@@ -12,6 +12,8 @@ import (
 )
 
 func TestSyncPayloadIncludesDiscoveredServers(t *testing.T) {
+	t.Setenv("AGENTKEEPER_MACHINE_ID", "machine-sync-1")
+
 	var captured map[string]any
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/v1/mcp/sync" {
@@ -47,6 +49,10 @@ func TestSyncPayloadIncludesDiscoveredServers(t *testing.T) {
 
 	client.sync()
 
+	if captured["machine_id"] != "machine-sync-1" {
+		t.Fatalf("machine_id = %#v, want machine-sync-1", captured["machine_id"])
+	}
+
 	discovered, ok := captured["discovered_servers"].([]any)
 	if !ok || len(discovered) != 1 {
 		t.Fatalf("discovered_servers missing/wrong: %#v", captured["discovered_servers"])
@@ -63,7 +69,40 @@ func TestSyncPayloadIncludesDiscoveredServers(t *testing.T) {
 	}
 }
 
+func TestEvaluatePayloadIncludesMachineID(t *testing.T) {
+	t.Setenv("AGENTKEEPER_MACHINE_ID", "machine-evaluate-1")
+
+	var captured map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/mcp/evaluate" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&captured); err != nil {
+			t.Fatal(err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"verdict":"pass"}`))
+	}))
+	defer srv.Close()
+
+	client := NewClient(srv.URL, "test-key", nil)
+	client.gatewayID = "gw_test"
+
+	result := client.Evaluate("atlas", "search", map[string]interface{}{"query": "test"})
+	if result == nil || result.Verdict != "pass" {
+		t.Fatalf("unexpected evaluate result: %#v", result)
+	}
+	if captured["machine_id"] != "machine-evaluate-1" {
+		t.Fatalf("machine_id = %#v, want machine-evaluate-1", captured["machine_id"])
+	}
+	if captured["gateway_id"] != "gw_test" {
+		t.Fatalf("gateway_id = %#v, want gw_test", captured["gateway_id"])
+	}
+}
+
 func TestFlushRequeuesEventsUntilDashboardAcknowledges(t *testing.T) {
+	t.Setenv("AGENTKEEPER_MACHINE_ID", "machine-events-retry-1")
+
 	logger, err := logging.NewLogger(filepath.Join(t.TempDir(), "events.jsonl"), false)
 	if err != nil {
 		t.Fatal(err)
@@ -81,10 +120,14 @@ func TestFlushRequeuesEventsUntilDashboardAcknowledges(t *testing.T) {
 			return
 		}
 		var captured struct {
-			Events []logging.Event `json:"events"`
+			Events    []logging.Event `json:"events"`
+			MachineID string          `json:"machine_id"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&captured); err != nil {
 			t.Fatal(err)
+		}
+		if captured.MachineID != "machine-events-retry-1" {
+			t.Fatalf("machine_id = %q, want machine-events-retry-1", captured.MachineID)
 		}
 		if len(captured.Events) != 1 || captured.Events[0].ServerName != "qa-stdio" {
 			t.Fatalf("unexpected retried events: %+v", captured.Events)
@@ -142,6 +185,8 @@ func TestFlushRequeuesWhenDashboardAckIsIncomplete(t *testing.T) {
 }
 
 func TestFlushUploadsOnlyDashboardIngestableEvents(t *testing.T) {
+	t.Setenv("AGENTKEEPER_MACHINE_ID", "machine-events-filter-1")
+
 	logger, err := logging.NewLogger(filepath.Join(t.TempDir(), "events.jsonl"), false)
 	if err != nil {
 		t.Fatal(err)
@@ -153,10 +198,14 @@ func TestFlushUploadsOnlyDashboardIngestableEvents(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests++
 		var captured struct {
-			Events []logging.Event `json:"events"`
+			Events    []logging.Event `json:"events"`
+			MachineID string          `json:"machine_id"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&captured); err != nil {
 			t.Fatal(err)
+		}
+		if captured.MachineID != "machine-events-filter-1" {
+			t.Fatalf("machine_id = %q, want machine-events-filter-1", captured.MachineID)
 		}
 		if len(captured.Events) != 1 {
 			t.Fatalf("uploaded events = %+v, want only the tool call", captured.Events)
