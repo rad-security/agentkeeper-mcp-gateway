@@ -216,13 +216,27 @@ func printPlan(out interface {
 		}
 	case len(p.Migrated) > 0:
 		status = fmt.Sprintf("migrate %d + wire", len(p.Migrated))
+		if len(p.NativeKept) > 0 {
+			status = fmt.Sprintf("migrate %d + keep %d native + wire", len(p.Migrated), len(p.NativeKept))
+		}
 		if configureIDEDryRun {
 			status = fmt.Sprintf("would migrate %d + wire", len(p.Migrated))
+			if len(p.NativeKept) > 0 {
+				status = fmt.Sprintf("would migrate %d + keep %d native + wire", len(p.Migrated), len(p.NativeKept))
+			}
+		}
+	case len(p.NativeKept) > 0:
+		status = fmt.Sprintf("keep %d native + wire", len(p.NativeKept))
+		if configureIDEDryRun {
+			status = fmt.Sprintf("would keep %d native + wire", len(p.NativeKept))
 		}
 	}
 	fmt.Fprintf(out, "  %-16s %s - %s\n", ide, status, p.ConfigPath)
 	for _, m := range p.Migrated {
 		fmt.Fprintf(out, "    -> migrate: %s (%s)\n", m.Name, renderCommand(m.Entry))
+	}
+	for _, kept := range p.NativeKept {
+		fmt.Fprintf(out, "    -> keep native: %s (%s)\n", kept.Name, renderCommand(kept.Entry))
 	}
 }
 
@@ -306,6 +320,9 @@ func printMigrationPlan(out interface {
 		status = "already routed"
 	} else if len(plan.Servers) > 0 {
 		status = fmt.Sprintf("migrate %d + wire", len(plan.Servers))
+		if len(plan.NativeKept) > 0 {
+			status = fmt.Sprintf("migrate %d + keep %d native + wire", len(plan.Servers)-len(plan.NativeKept), len(plan.NativeKept))
+		}
 	}
 	label := plan.Client
 	if plan.Scope != "" && plan.Scope != "global" {
@@ -324,6 +341,13 @@ func printMigrationPlan(out interface {
 			rendered = fmt.Sprintf("%s (%d args)", rendered, s.ArgsCount)
 		}
 		fmt.Fprintf(out, "    -> migrate: %s (%s)\n", s.Name, rendered)
+	}
+	for _, s := range plan.NativeKept {
+		rendered := s.Command
+		if rendered == "" {
+			rendered = s.URL
+		}
+		fmt.Fprintf(out, "    -> keep native: %s (%s)\n", s.Name, rendered)
 	}
 	if plan.BackupPath != "" {
 		fmt.Fprintf(out, "  %-16s backup: %s\n", "", plan.BackupPath)

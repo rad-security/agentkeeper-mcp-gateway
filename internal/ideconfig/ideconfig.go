@@ -25,9 +25,12 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 
+	"github.com/rad-security/agentkeeper-mcp-gateway/internal/config"
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/configbackup"
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/gatewayentry"
+	"github.com/rad-security/agentkeeper-mcp-gateway/internal/nativeauth"
 )
 
 // GatewayServerName is the key this package writes under `mcpServers`. It is
@@ -68,6 +71,7 @@ type Plan struct {
 	Exists       bool          // did the file exist when Plan was built
 	AlreadyWired bool          // gateway is the sole MCP entry already
 	Migrated     []NamedServer // servers we'd move into the gateway's own config
+	NativeKept   []NamedServer // remote OAuth/native-auth servers kept in the IDE config
 	BackupPath   string        // set by Apply when it writes a backup
 }
 
@@ -188,36 +192,43 @@ func (a *Adapter) Plan() (Plan, error) {
 		}
 	}
 
-	// Idempotency: exactly one entry, and it's our gateway.
-	if len(servers) == 1 {
-		if entry, ok := servers[GatewayServerName]; ok && isGatewayEntry(entry) {
-			p.AlreadyWired = true
-			return p, nil
-		}
+	hasCurrentGateway := false
+	if entry, ok := servers[GatewayServerName]; ok && isGatewayEntry(entry) {
+		hasCurrentGateway = true
 	}
 
 	// Collect everything except any existing gateway entry — that one gets
-	// replaced, not migrated (the gateway is not itself an MCP server).
+	// replaced, not migrated (the gateway is not itself an MCP server). Remote
+	// HTTP entries without credential headers are kept native so the MCP client
+	// can own OAuth and refresh tokens.
 	for name, entry := range servers {
 		if name == GatewayServerName {
+			continue
+		}
+		if nativeauth.RequiresNativeClientAuth(entry.Type, entry.URL, entry.Headers) {
+			p.NativeKept = append(p.NativeKept, NamedServer{Name: name, Entry: entry})
 			continue
 		}
 		p.Migrated = append(p.Migrated, NamedServer{Name: name, Entry: entry})
 	}
 
+	p.NativeKept = mergeNamedServers(p.NativeKept, a.recoverNativeClientAuthServers(servers))
+	if hasCurrentGateway && len(p.Migrated) == 0 && len(p.NativeKept) == len(nonGatewayServers(servers)) {
+		p.AlreadyWired = true
+	}
 	return p, nil
 }
 
 // Apply executes a Plan: backs up the existing file (if any), then writes the
-// new IDE config with the gateway as the sole entry under `mcpServers`.
-// Already-wired plans are a no-op. All unknown top-level keys are preserved.
+// new IDE config with the gateway plus any native-auth MCP entries under
+// `mcpServers`. Already-wired plans are a no-op. All unknown top-level keys are
+// preserved.
 //
 // Takes *Plan so the BackupPath side-effect is visible to the caller (the
 // command layer renders it in the summary; tests assert on it).
 //
 // Apply does NOT move migrated servers into the gateway's own config — that is
-// the caller's responsibility, because doing it here would couple this package
-// to internal/config and create a cycle for future tests.
+// the caller's responsibility.
 func (a *Adapter) Apply(p *Plan) error {
 	if p == nil {
 		return errors.New("nil plan")
@@ -247,6 +258,12 @@ func (a *Adapter) Apply(p *Plan) error {
 	}
 
 	newServers := map[string]ServerEntry{GatewayServerName: gatewayEntry()}
+	for _, kept := range p.NativeKept {
+		if kept.Name == "" || kept.Name == GatewayServerName {
+			continue
+		}
+		newServers[kept.Name] = kept.Entry
+	}
 	encoded, err := json.Marshal(newServers)
 	if err != nil {
 		return fmt.Errorf("encoding mcpServers: %w", err)
@@ -263,5 +280,109 @@ func (a *Adapter) Apply(p *Plan) error {
 	if err := os.WriteFile(p.ConfigPath, out, 0o644); err != nil {
 		return fmt.Errorf("writing %s: %w", p.ConfigPath, err)
 	}
+	pruneNativeKeptFromGatewayConfig(p.NativeKept)
 	return nil
+}
+
+func (a *Adapter) recoverNativeClientAuthServers(existing map[string]ServerEntry) []NamedServer {
+	if a.Name != "claude-code" {
+		return nil
+	}
+	cfg, err := config.Load()
+	if err != nil {
+		return nil
+	}
+	seen := map[string]bool{}
+	for name := range existing {
+		seen[name] = true
+	}
+	var recovered []NamedServer
+	for _, server := range cfg.Servers {
+		if server.Name == "" || seen[server.Name] {
+			continue
+		}
+		if !nativeauth.RequiresNativeClientAuth(server.Transport, server.URL, server.Headers) {
+			continue
+		}
+		recovered = append(recovered, NamedServer{
+			Name: server.Name,
+			Entry: ServerEntry{
+				Command: server.Command,
+				Args:    server.Args,
+				Env:     server.Env,
+				Type:    server.Transport,
+				URL:     server.URL,
+				Headers: server.Headers,
+			},
+		})
+		seen[server.Name] = true
+	}
+	sort.Slice(recovered, func(i, j int) bool { return recovered[i].Name < recovered[j].Name })
+	return recovered
+}
+
+func mergeNamedServers(existing, add []NamedServer) []NamedServer {
+	if len(add) == 0 {
+		return existing
+	}
+	seen := map[string]bool{}
+	for _, server := range existing {
+		seen[server.Name] = true
+	}
+	out := append([]NamedServer{}, existing...)
+	for _, server := range add {
+		if seen[server.Name] {
+			continue
+		}
+		out = append(out, server)
+		seen[server.Name] = true
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
+}
+
+func nonGatewayServers(servers map[string]ServerEntry) []NamedServer {
+	out := make([]NamedServer, 0, len(servers))
+	for name, entry := range servers {
+		if name == GatewayServerName {
+			continue
+		}
+		out = append(out, NamedServer{Name: name, Entry: entry})
+	}
+	return out
+}
+
+func pruneNativeKeptFromGatewayConfig(kept []NamedServer) {
+	if len(kept) == 0 {
+		return
+	}
+	cfg, err := config.Load()
+	if err != nil {
+		return
+	}
+	keptByNameURL := map[string]bool{}
+	for _, server := range kept {
+		if server.Name == "" || server.Entry.URL == "" {
+			continue
+		}
+		keptByNameURL[server.Name+"\x00"+server.Entry.URL] = true
+	}
+	if len(keptByNameURL) == 0 {
+		return
+	}
+	filtered := make([]config.ServerEntry, 0, len(cfg.Servers))
+	changed := false
+	for _, server := range cfg.Servers {
+		key := server.Name + "\x00" + server.URL
+		if keptByNameURL[key] && nativeauth.RequiresNativeClientAuth(server.Transport, server.URL, server.Headers) {
+			changed = true
+			continue
+		}
+		filtered = append(filtered, server)
+	}
+	if !changed {
+		return
+	}
+	cfg.Servers = filtered
+	_ = config.Save(cfg)
 }

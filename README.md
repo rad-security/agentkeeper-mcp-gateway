@@ -146,7 +146,7 @@ agentkeeper-mcp-gateway configure-ide [--dry-run] [--ide=claude-code|claude-desk
 
 ## Zero-touch IDE wiring
 
-`configure-ide` rewrites every supported local MCP client config to route through the gateway. One command, all supported clients, fully idempotent. This includes Claude Desktop, Claude Code settings, Claude Code user-scoped and project-scoped `~/.claude.json` servers, Cursor, and current Cowork local/plugin/remote MCP sources.
+`configure-ide` wires every supported local MCP client to the gateway while preserving native OAuth MCP servers that the client must authenticate itself. One command, all supported clients, fully idempotent. This includes Claude Desktop, Claude Code settings, Claude Code user-scoped and project-scoped `~/.claude.json` servers, Cursor, and current Cowork local/plugin/remote MCP sources.
 
 ```bash
 agentkeeper-mcp-gateway configure-ide --dry-run   # preview; writes nothing
@@ -158,9 +158,10 @@ For Cowork sources created after setup, run `agentkeeper-mcp-gateway cowork guar
 Supports **Claude Code** (`~/.claude/settings.json`), **Claude Desktop** (macOS + Linux), and **Cursor** (`~/.cursor/mcp.json`). For each detected IDE it:
 
 1. Backs up the existing config under the gateway backup directory, normally `~/.config/agentkeeper-mcp-gateway/backups/`
-2. Migrates any already-registered MCP servers into the gateway's own config (environment variables and all)
-3. Rewrites the IDE's `mcpServers` map to a single entry pointing at the gateway
-4. Preserves every non-MCP top-level key verbatim (`permissions`, `preferences`, etc.)
+2. Migrates routable local MCP servers and explicit-header HTTP servers into the gateway's own config (environment variables and all)
+3. Keeps headerless remote HTTP/OAuth servers native so Claude/Cursor/Cowork can complete auth and token refresh
+4. Rewrites the IDE's `mcpServers` map to include the gateway plus any native-auth servers that must remain direct
+5. Preserves every non-MCP top-level key verbatim (`permissions`, `preferences`, etc.)
 
 A second invocation is a no-op — the command detects a correctly-wired config and skips the write entirely. Safe to run from a login hook, a postinstall script, or on every Kandji reapply.
 

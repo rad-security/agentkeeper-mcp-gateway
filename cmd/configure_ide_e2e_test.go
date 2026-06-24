@@ -179,6 +179,8 @@ func assertGatewayWired(t *testing.T, path string) {
 	var servers map[string]struct {
 		Command string   `json:"command"`
 		Args    []string `json:"args"`
+		Type    string   `json:"type"`
+		URL     string   `json:"url"`
 	}
 	if err := json.Unmarshal(rawServers, &servers); err != nil {
 		t.Fatalf("%s: parsing mcpServers: %v", path, err)
@@ -208,6 +210,8 @@ func assertCoworkGatewayEntrypoint(t *testing.T, path string) {
 	var servers map[string]struct {
 		Command string   `json:"command"`
 		Args    []string `json:"args"`
+		Type    string   `json:"type"`
+		URL     string   `json:"url"`
 	}
 	if err := json.Unmarshal(rawServers, &servers); err != nil {
 		t.Fatalf("%s: parsing mcpServers: %v", path, err)
@@ -1019,11 +1023,13 @@ func TestE2E30_ClaudeCodeUserClaudeJSONMigrated(t *testing.T) {
 	var servers map[string]struct {
 		Command string   `json:"command"`
 		Args    []string `json:"args"`
+		Type    string   `json:"type"`
+		URL     string   `json:"url"`
 	}
 	if err := json.Unmarshal(raw["mcpServers"], &servers); err != nil {
 		t.Fatal(err)
 	}
-	if len(servers) != 1 || servers["agentkeeper-mcp-gateway"].Command != binary {
+	if len(servers) != 2 || servers["agentkeeper-mcp-gateway"].Command != binary || servers["raindrop"].URL != "https://mcp.raindrop.ai/mcp" {
 		t.Fatalf("user-scoped Claude JSON not wired to gateway: %+v", servers)
 	}
 	if _, ok := raw["projects"]; !ok {
@@ -1041,8 +1047,6 @@ func TestE2E30_ClaudeCodeUserClaudeJSONMigrated(t *testing.T) {
 		`"name": "notion"`,
 		`"url": "https://mcp.notion.com/mcp"`,
 		`"Authorization": "Bearer secret"`,
-		`"name": "raindrop"`,
-		`"url": "https://mcp.raindrop.ai/mcp"`,
 	} {
 		if !strings.Contains(string(gw), want) {
 			t.Fatalf("gateway config missing %s:\n%s", want, gw)
@@ -1198,10 +1202,11 @@ func TestE2E29_CoworkRemoteMCPConfigImportedAndReportedCovered(t *testing.T) {
 	}
 	if err := os.WriteFile(session, []byte(`{
 		"remoteMcpServersConfig": [{
-			"uuid": "0601e193-a1f4-4153-aa4e-850858ce2066",
-			"name": "Google Drive",
-			"url": "https://drivemcp.googleapis.com/mcp/v1"
-		}],
+				"uuid": "0601e193-a1f4-4153-aa4e-850858ce2066",
+				"name": "Google Drive",
+				"url": "https://drivemcp.googleapis.com/mcp/v1",
+				"headers": {"Authorization": "Bearer secret"}
+			}],
 		"enabledMcpTools": {
 			"0601e193-a1f4-4153-aa4e-850858ce2066:search": true
 		}
@@ -1277,10 +1282,11 @@ func TestE2E30_CoworkGuardOnceDisablesNewRemoteMCPSource(t *testing.T) {
 	}
 	if err := os.WriteFile(session, []byte(`{
 		"remoteMcpServersConfig": [{
-			"uuid": "0601e193-a1f4-4153-aa4e-850858ce2066",
-			"name": "Google Drive",
-			"url": "https://drivemcp.googleapis.com/mcp/v1"
-		}]
+				"uuid": "0601e193-a1f4-4153-aa4e-850858ce2066",
+				"name": "Google Drive",
+				"url": "https://drivemcp.googleapis.com/mcp/v1",
+				"headers": {"Authorization": "Bearer secret"}
+			}]
 	}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -1469,6 +1475,8 @@ func TestE2E34_ConfigureIDEMigratesAllClaudeJSONProjectServers(t *testing.T) {
 			MCPServers map[string]struct {
 				Command string   `json:"command"`
 				Args    []string `json:"args"`
+				Type    string   `json:"type"`
+				URL     string   `json:"url"`
 			} `json:"mcpServers"`
 		} `json:"projects"`
 	}
@@ -1484,7 +1492,14 @@ func TestE2E34_ConfigureIDEMigratesAllClaudeJSONProjectServers(t *testing.T) {
 	}
 	for project, value := range doc.Projects {
 		gw := value.MCPServers["agentkeeper-mcp-gateway"]
-		if len(value.MCPServers) != 1 || gw.Command != binary || len(gw.Args) != 1 || gw.Args[0] != "server" {
+		wantLen := 1
+		if project == "/Users/alice/api" {
+			wantLen = 2
+			if value.MCPServers["supabase"].URL != "https://mcp.supabase.com/mcp" {
+				t.Fatalf("project %s did not keep native OAuth MCP: %+v", project, value.MCPServers)
+			}
+		}
+		if len(value.MCPServers) != wantLen || gw.Command != binary || len(gw.Args) != 1 || gw.Args[0] != "server" {
 			t.Fatalf("project %s not wired to gateway: %+v", project, value.MCPServers)
 		}
 	}
@@ -1493,7 +1508,7 @@ func TestE2E34_ConfigureIDEMigratesAllClaudeJSONProjectServers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{`"name": "linear"`, `"name": "supabase"`, `"url": "https://mcp.supabase.com/mcp"`, `"name": "github"`} {
+	for _, want := range []string{`"name": "linear"`, `"name": "github"`} {
 		if !strings.Contains(string(gw), want) {
 			t.Fatalf("gateway config missing %s:\n%s", want, gw)
 		}

@@ -303,20 +303,22 @@ func TestDiscoverAndImportCoworkRemoteMCPConfig(t *testing.T) {
 	session := filepath.Join(testClaudeAppSupportPath(home), "local-agent-mode-sessions", "account", "env", "local_google.json")
 	writeFixture(t, session, `{
 		"remoteMcpServersConfig": [{
-			"uuid": "0601e193-a1f4-4153-aa4e-850858ce2066",
-			"name": "Google Drive",
-			"url": "https://drivemcp.googleapis.com/mcp/v1"
-		}],
+				"uuid": "0601e193-a1f4-4153-aa4e-850858ce2066",
+				"name": "Google Drive",
+				"url": "https://drivemcp.googleapis.com/mcp/v1",
+				"headers": {"Authorization": "Bearer secret"}
+			}],
 		"enabledMcpTools": {
 			"0601e193-a1f4-4153-aa4e-850858ce2066:search": true
 		}
 	}`)
 	writeFixture(t, filepath.Join(testClaudeAppSupportPath(home), "local-agent-mode-sessions", "account", "env", "local_google_old.json"), `{
 		"remoteMcpServersConfig": [{
-			"uuid": "0601e193-a1f4-4153-aa4e-850858ce2066",
-			"name": "Google Drive",
-			"url": "https://drivemcp.googleapis.com/mcp/v1"
-		}]
+				"uuid": "0601e193-a1f4-4153-aa4e-850858ce2066",
+				"name": "Google Drive",
+				"url": "https://drivemcp.googleapis.com/mcp/v1",
+				"headers": {"Authorization": "Bearer secret"}
+			}]
 	}`)
 
 	res, err := Discover(Options{Home: home, Client: ClientCowork})
@@ -371,6 +373,49 @@ func TestDiscoverAndImportCoworkRemoteMCPConfig(t *testing.T) {
 	}
 	if len(res.Servers) != 1 || res.Servers[0].Name != "agentkeeper-mcp-gateway" || res.Servers[0].RouteState != RouteRouted {
 		t.Fatalf("remote direct source should be gone and only gateway entrypoint should remain: %+v", res.Servers)
+	}
+}
+
+func TestCoworkRemoteMCPWithoutCredentialHeaderStaysNative(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("AGENTKEEPER_CONFIG", filepath.Join(home, ".config", "agentkeeper-mcp-gateway", "config.json"))
+	session := filepath.Join(testClaudeAppSupportPath(home), "local-agent-mode-sessions", "account", "env", "local_atlassian.json")
+	writeFixture(t, session, `{
+		"remoteMcpServersConfig": [{
+			"uuid": "f8d082a3-b7d4-4f68-8e7a-f0fb20e6b177",
+			"name": "Atlassian",
+			"url": "https://mcp.atlassian.com/v1/sse"
+		}]
+	}`)
+
+	res, err := Discover(Options{Home: home, Client: ClientCowork})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Servers) != 1 {
+		t.Fatalf("want 1 remote server, got %d: %+v", len(res.Servers), res.Servers)
+	}
+	got := res.Servers[0]
+	if got.Name != "atlassian" || got.Routeability != RouteabilityNativeClientAuth || got.Routable {
+		t.Fatalf("headerless remote MCP should require native client auth: %+v", got)
+	}
+
+	result, err := MigrateCoworkMCPForHome(home, "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Plans) != 0 || result.GatewayEntrypoint != nil {
+		t.Fatalf("native-auth remote should not be routed or disabled: %+v", result)
+	}
+	if _, err := os.Stat(filepath.Join(home, ".config", "agentkeeper-mcp-gateway", "config.json")); !os.IsNotExist(err) {
+		t.Fatalf("gateway config should not be created for native-auth remote, stat err=%v", err)
+	}
+	rewritten, err := os.ReadFile(session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(rewritten), "https://mcp.atlassian.com/v1/sse") {
+		t.Fatalf("native remote source was not preserved: %s", rewritten)
 	}
 }
 
