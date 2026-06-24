@@ -17,6 +17,7 @@ import (
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/config"
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/configbackup"
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/gatewayentry"
+	"github.com/rad-security/agentkeeper-mcp-gateway/internal/nativeauth"
 )
 
 const (
@@ -34,6 +35,7 @@ const (
 	RouteabilityCoworkLocalPlugin     = "cowork_local_plugin_mcp_routable"
 	RouteabilityCoworkRemoteMCP       = "cowork_remote_mcp_routable"
 	RouteabilityRemoteNotLocal        = "cowork_remote_connector_not_local_routable"
+	RouteabilityNativeClientAuth      = "native_client_auth_required"
 	RouteabilityUnknownRequiresReview = "cowork_unknown_requires_review"
 )
 
@@ -211,6 +213,7 @@ func readCoworkRemoteMCPServers(path string) []DiscoveredServer {
 			URL:       remote.URL,
 			Headers:   remote.Headers,
 		}
+		entryRouteability, routable := routeabilityForEntry(entry, RouteabilityCoworkRemoteMCP)
 		covered, gatewayName := gatewayCoverage(entry)
 		out = append(out, DiscoveredServer{
 			Name:           name,
@@ -224,8 +227,8 @@ func readCoworkRemoteMCPServers(path string) []DiscoveredServer {
 			HeaderKeys:     sortedKeys(remote.Headers),
 			RemoteID:       remote.UUID,
 			RouteState:     RouteDirect,
-			Routeability:   RouteabilityCoworkRemoteMCP,
-			Routable:       true,
+			Routeability:   entryRouteability,
+			Routable:       routable,
 			GatewayCovered: covered,
 			GatewayName:    gatewayName,
 			Entry:          entry,
@@ -427,6 +430,7 @@ func MigrateClaudeJSONProjects(dryRun bool) (MigrationPlan, error) {
 	sort.Strings(projectKeys)
 
 	directByProject := map[string][]DiscoveredServer{}
+	preserveByProject := map[string][]DiscoveredServer{}
 	rewriteByProject := map[string]bool{}
 	for _, project := range projectKeys {
 		servers := readServersRaw(projects[project]["mcpServers"], path, ClientClaudeCode, "project", "claude_json_project", RouteabilityLocalRoutable)
@@ -439,15 +443,23 @@ func MigrateClaudeJSONProjects(dryRun bool) (MigrationPlan, error) {
 				rewriteByProject[project] = true
 				continue
 			}
+			if s.Routeability == RouteabilityNativeClientAuth {
+				preserveByProject[project] = append(preserveByProject[project], s)
+				plan.NativeKept = append(plan.NativeKept, s)
+				continue
+			}
 			if s.RouteState == RouteRouted || !s.Routable {
 				continue
 			}
 			directByProject[project] = append(directByProject[project], s)
 			rewriteByProject[project] = true
 		}
+		if len(preserveByProject[project]) > 0 && !hasCurrentGatewayEntry(servers) {
+			rewriteByProject[project] = true
+		}
 	}
 	if len(rewriteByProject) == 0 {
-		plan.AlreadyRouted = allRouted(plan.Servers)
+		plan.AlreadyRouted = allRoutedOrNativeKept(plan.Servers)
 		return plan, nil
 	}
 	if dryRun {
@@ -480,9 +492,15 @@ func MigrateClaudeJSONProjects(dryRun bool) (MigrationPlan, error) {
 			}
 			plan.Migrated = append(plan.Migrated, s)
 		}
-		encoded, err := json.Marshal(map[string]config.ServerEntry{
+		newServers := map[string]config.ServerEntry{
 			"agentkeeper-mcp-gateway": gatewayServerEntry(),
-		})
+		}
+		for _, s := range preserveByProject[project] {
+			entry := s.Entry
+			entry.Name = ""
+			newServers[s.Name] = entry
+		}
+		encoded, err := json.Marshal(newServers)
 		if err != nil {
 			return plan, err
 		}
@@ -501,6 +519,7 @@ func MigrateClaudeJSONProjects(dryRun bool) (MigrationPlan, error) {
 	if err := os.WriteFile(path, out, 0o644); err != nil {
 		return plan, err
 	}
+	pruneNativeKeptFromGatewayConfig(plan.NativeKept)
 	return plan, nil
 }
 
@@ -669,6 +688,7 @@ func ensureCoworkGatewayEntrypoint(home string, dryRun bool) (MigrationPlan, err
 	if err := os.WriteFile(path, out, 0o644); err != nil {
 		return plan, err
 	}
+	pruneNativeKeptFromGatewayConfig(plan.NativeKept)
 	return plan, nil
 }
 
@@ -827,20 +847,30 @@ func MigrateMCPFile(path, client, scope, sourceKind, routeability string, dryRun
 		return plan, nil
 	}
 	direct := make([]DiscoveredServer, 0, len(servers))
+	nativeKept := make([]DiscoveredServer, 0, len(servers))
 	needsRewrite := false
 	for _, s := range servers {
 		if isStaleGatewayEntry(s) {
 			needsRewrite = true
 			continue
 		}
+		if s.Routeability == RouteabilityNativeClientAuth {
+			nativeKept = append(nativeKept, s)
+			continue
+		}
 		if s.RouteState == RouteRouted || !s.Routable {
 			continue
 		}
 		direct = append(direct, s)
+		needsRewrite = true
 	}
+	if len(nativeKept) > 0 && !hasCurrentGatewayEntry(servers) {
+		needsRewrite = true
+	}
+	plan.NativeKept = nativeKept
 	if len(direct) == 0 {
 		if !needsRewrite {
-			plan.AlreadyRouted = allRouted(servers)
+			plan.AlreadyRouted = allRoutedOrNativeKept(servers)
 			return plan, nil
 		}
 	}
@@ -878,9 +908,15 @@ func MigrateMCPFile(path, client, scope, sourceKind, routeability string, dryRun
 		plan.Migrated = append(plan.Migrated, s)
 	}
 
-	encoded, err := json.Marshal(map[string]config.ServerEntry{
+	newServers := map[string]config.ServerEntry{
 		"agentkeeper-mcp-gateway": gatewayServerEntry(),
-	})
+	}
+	for _, s := range nativeKept {
+		entry := s.Entry
+		entry.Name = ""
+		newServers[s.Name] = entry
+	}
+	encoded, err := json.Marshal(newServers)
 	if err != nil {
 		return plan, err
 	}
@@ -907,6 +943,7 @@ type MigrationPlan struct {
 	BackupPath     string             `json:"backup_path,omitempty"`
 	Servers        []DiscoveredServer `json:"servers"`
 	Migrated       []DiscoveredServer `json:"migrated,omitempty"`
+	NativeKept     []DiscoveredServer `json:"native_kept,omitempty"`
 	NativeDisabled []DiscoveredServer `json:"native_disabled,omitempty"`
 	AlreadyRouted  bool               `json:"already_routed,omitempty"`
 }
@@ -973,6 +1010,41 @@ func gatewayCoverage(entry config.ServerEntry) (bool, string) {
 		}
 	}
 	return false, ""
+}
+
+func pruneNativeKeptFromGatewayConfig(kept []DiscoveredServer) {
+	if len(kept) == 0 {
+		return
+	}
+	cfg, err := config.Load()
+	if err != nil {
+		return
+	}
+	keptByNameURL := map[string]bool{}
+	for _, server := range kept {
+		if server.Name == "" || server.URL == "" {
+			continue
+		}
+		keptByNameURL[server.Name+"\x00"+server.URL] = true
+	}
+	if len(keptByNameURL) == 0 {
+		return
+	}
+	filtered := make([]config.ServerEntry, 0, len(cfg.Servers))
+	changed := false
+	for _, server := range cfg.Servers {
+		key := server.Name + "\x00" + server.URL
+		if keptByNameURL[key] && nativeauth.RequiresNativeClientAuth(server.Transport, server.URL, server.Headers) {
+			changed = true
+			continue
+		}
+		filtered = append(filtered, server)
+	}
+	if !changed {
+		return
+	}
+	cfg.Servers = filtered
+	_ = config.Save(cfg)
 }
 
 func remoteMCPServerName(name, url, uuid string) string {
@@ -1076,6 +1148,9 @@ func routeabilityForEntry(entry config.ServerEntry, defaultRouteability string) 
 		if strings.TrimSpace(entry.URL) == "" {
 			return RouteabilityUnknownRequiresReview, false
 		}
+		if nativeauth.RequiresNativeClientAuth(entry.Transport, entry.URL, entry.Headers) {
+			return RouteabilityNativeClientAuth, false
+		}
 		return defaultRouteability, true
 	case "stdio", "local":
 		if strings.TrimSpace(entry.Command) == "" {
@@ -1100,6 +1175,28 @@ func allRouted(servers []DiscoveredServer) bool {
 		}
 	}
 	return true
+}
+
+func allRoutedOrNativeKept(servers []DiscoveredServer) bool {
+	if len(servers) == 0 {
+		return false
+	}
+	for _, s := range servers {
+		if s.RouteState == RouteRouted || s.Routeability == RouteabilityNativeClientAuth {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func hasCurrentGatewayEntry(servers []DiscoveredServer) bool {
+	for _, s := range servers {
+		if s.RouteState == RouteRouted {
+			return true
+		}
+	}
+	return false
 }
 
 func dedupeAndSort(in []DiscoveredServer) []DiscoveredServer {

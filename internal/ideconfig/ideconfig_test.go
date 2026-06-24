@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/rad-security/agentkeeper-mcp-gateway/internal/config"
 )
 
 // writeJSON writes a raw map to path and fails on error. Preserves top-level
@@ -25,6 +27,14 @@ func mkAdapter(t *testing.T, path string) *Adapter {
 	t.Helper()
 	return &Adapter{
 		Name:         "test-ide",
+		PathResolver: func() (string, error) { return path, nil },
+	}
+}
+
+func mkNamedAdapter(t *testing.T, name, path string) *Adapter {
+	t.Helper()
+	return &Adapter{
+		Name:         name,
 		PathResolver: func() (string, error) { return path, nil },
 	}
 }
@@ -190,6 +200,83 @@ func TestPlan_AlreadyWired_FullPathCommand(t *testing.T) {
 	}
 	if !p.AlreadyWired {
 		t.Error("AlreadyWired = false for full-path gateway command; want true")
+	}
+}
+
+func TestPlan_ClaudeCodeRecoversNativeAuthServersFromGatewayConfig(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("AGENTKEEPER_CONFIG", filepath.Join(tmp, "gateway", "config.json"))
+	if err := config.Save(config.Config{
+		Mode: "audit",
+		Servers: []config.ServerEntry{
+			{
+				Name:      "ontra-mcp-server--staging",
+				Transport: "http",
+				URL:       "https://mcp.ontra.example/mcp",
+			},
+			{
+				Name:      "headers-api",
+				Transport: "http",
+				URL:       "https://api.example.test/mcp",
+				Headers:   map[string]string{"Authorization": "Bearer secret"},
+			},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	path := filepath.Join(tmp, "settings.json")
+	writeJSON(t, path, `{
+		"mcpServers": {
+			"agentkeeper-mcp-gateway": {
+				"command": "agentkeeper-mcp-gateway",
+				"args": ["server"]
+			}
+		}
+	}`)
+
+	a := mkNamedAdapter(t, "claude-code", path)
+	p, err := a.Plan()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.AlreadyWired {
+		t.Fatal("AlreadyWired = true, want recovery write for native-auth server")
+	}
+	if len(p.Migrated) != 0 {
+		t.Fatalf("headerless HTTP server should not be migrated: %+v", p.Migrated)
+	}
+	if len(p.NativeKept) != 1 || p.NativeKept[0].Name != "ontra-mcp-server--staging" {
+		t.Fatalf("expected native-auth Ontra server to be recovered, got %+v", p.NativeKept)
+	}
+	if err := a.Apply(&p); err != nil {
+		t.Fatal(err)
+	}
+
+	raw := map[string]json.RawMessage{}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	var servers map[string]ServerEntry
+	if err := json.Unmarshal(raw["mcpServers"], &servers); err != nil {
+		t.Fatal(err)
+	}
+	if len(servers) != 2 || servers["ontra-mcp-server--staging"].URL != "https://mcp.ontra.example/mcp" {
+		t.Fatalf("native-auth server was not restored beside gateway: %+v", servers)
+	}
+	if _, ok := servers["headers-api"]; ok {
+		t.Fatalf("explicit-header remote should stay gateway-routable, not be restored native: %+v", servers)
+	}
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Servers) != 1 || cfg.Servers[0].Name != "headers-api" {
+		t.Fatalf("native-auth server should be pruned from gateway config, got %+v", cfg.Servers)
 	}
 }
 
