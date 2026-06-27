@@ -177,6 +177,26 @@ func TestLoadWithPath_FileWinsOverEnv(t *testing.T) {
 	}
 }
 
+func TestLoadWithPath_StripsUTF8BOM(t *testing.T) {
+	isolateEnv(t)
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "config.json")
+	if err := os.WriteFile(path, []byte("\xef\xbb\xbf{\"api_key\":\"file-key\",\"api_url\":\"https://file.example\"}"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	cfg, err := LoadWithPath(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.APIKey != "file-key" {
+		t.Errorf("APIKey = %q, want %q", cfg.APIKey, "file-key")
+	}
+	if cfg.APIURL != "https://file.example" {
+		t.Errorf("APIURL = %q, want %q", cfg.APIURL, "https://file.example")
+	}
+}
+
 func TestLoadWithPath_EnvFillsBlankField(t *testing.T) {
 	// File exists but leaves api_key blank; env must populate it.
 	// APIURL defaults to https://www.agentkeeper.dev and is treated as "blank"
