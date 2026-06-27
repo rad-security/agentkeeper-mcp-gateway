@@ -201,6 +201,13 @@ func fileExists(path string) bool {
 	return err == nil && !info.IsDir()
 }
 
+func stripUTF8BOM(data []byte) []byte {
+	if len(data) >= 3 && data[0] == 0xef && data[1] == 0xbb && data[2] == 0xbf {
+		return data[3:]
+	}
+	return data
+}
+
 // LoadWithPath reads configuration from path and applies env-var overrides.
 // A missing file is not an error — defaults plus env overrides are returned.
 func LoadWithPath(path string) (Config, error) {
@@ -221,6 +228,7 @@ func LoadWithSource(path string) (LoadResult, error) {
 		data, err := os.ReadFile(path)
 		switch {
 		case err == nil:
+			data = stripUTF8BOM(data)
 			if err := json.Unmarshal(data, &cfg); err != nil {
 				return res, fmt.Errorf("parsing config: %w", err)
 			}
