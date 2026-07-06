@@ -47,7 +47,7 @@ By default every detected IDE is configured. Use --ide to target just one.
 					return err
 				}
 			}
-			plan, err := discovery.MigrateProjectMCP(cwd, configureIDEDryRun)
+			plan, err := discovery.MigrateProjectMCPExplicit(cwd, configureIDEDryRun)
 			if err != nil {
 				return err
 			}
@@ -125,7 +125,14 @@ By default every detected IDE is configured. Use --ide to target just one.
 			if cwd, ok, err := projectMigrationCWD(); err != nil {
 				fmt.Fprintf(out, "  %-16s error applying: %v\n", "claude-code:project", err)
 			} else if ok {
-				plan, err = discovery.MigrateProjectMCP(cwd, configureIDEDryRun)
+				// Auto-detected cwd/.mcp.json is implicit intent, so the
+				// git-worktree guard stays on. Only --cwd/--scope=project
+				// opt into rewriting a project file inside a git repo.
+				migrate := discovery.MigrateProjectMCP
+				if projectMigrationExplicit() {
+					migrate = discovery.MigrateProjectMCPExplicit
+				}
+				plan, err = migrate(cwd, configureIDEDryRun)
 				if err != nil {
 					fmt.Fprintf(out, "  %-16s error applying: %v\n", "claude-code:project", err)
 				} else {
@@ -284,6 +291,13 @@ func configureIDETargetIncludes(target string) bool {
 	return false
 }
 
+// projectMigrationExplicit reports whether the user named the project scope
+// themselves (--cwd or --scope=project) rather than configure-ide picking up
+// cwd/.mcp.json on its own.
+func projectMigrationExplicit() bool {
+	return strings.TrimSpace(configureIDECWD) != "" || configureIDEScope == "project"
+}
+
 func projectMigrationCWD() (string, bool, error) {
 	if configureIDEScope != "" && configureIDEScope != "project" {
 		return "", false, nil
@@ -316,7 +330,9 @@ func printMigrationPlan(out interface {
 	Write(p []byte) (int, error)
 }, plan discovery.MigrationPlan) {
 	status := "no MCP servers discovered"
-	if plan.AlreadyRouted {
+	if plan.SkippedGitWorktree {
+		status = "skipped - inside a git repo (rerun with --cwd or --scope=project to route it explicitly)"
+	} else if plan.AlreadyRouted {
 		status = "already routed"
 	} else if len(plan.Servers) > 0 {
 		status = fmt.Sprintf("migrate %d + wire", len(plan.Servers))
@@ -329,6 +345,9 @@ func printMigrationPlan(out interface {
 		label = fmt.Sprintf("%s:%s", plan.Client, plan.Scope)
 	}
 	fmt.Fprintf(out, "  %-16s %s - %s\n", label, status, plan.ConfigPath)
+	if plan.SkippedGitWorktree {
+		return
+	}
 	for _, s := range plan.Servers {
 		if s.RouteState == discovery.RouteRouted {
 			continue

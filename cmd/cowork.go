@@ -358,7 +358,9 @@ func printCoworkMigrationPlan(out interface {
 		}
 	}
 	status := "no MCP servers discovered"
-	if plan.AlreadyRouted {
+	if plan.SkippedGitWorktree {
+		status = "skipped - inside a git repo (version-controlled files are never rewritten)"
+	} else if plan.AlreadyRouted {
 		status = "already routed"
 	} else if len(plan.Migrated) > 0 {
 		if plan.Scope == "remote" {
@@ -379,6 +381,9 @@ func printCoworkMigrationPlan(out interface {
 		status = "no routable MCP servers"
 	}
 	fmt.Fprintf(out, "  %-16s %s - %s\n", plan.Client, status, plan.ConfigPath)
+	if plan.SkippedGitWorktree {
+		return
+	}
 	for _, s := range plan.Servers {
 		if s.RouteState == discovery.RouteRouted || !s.Routable {
 			continue
