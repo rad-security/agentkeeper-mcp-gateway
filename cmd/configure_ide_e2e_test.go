@@ -1514,3 +1514,152 @@ func TestE2E34_ConfigureIDEMigratesAllClaudeJSONProjectServers(t *testing.T) {
 		}
 	}
 }
+
+// ---- git-worktree guard ----------------------------------------------------
+// Regression tests for the Ontra "agentkeeper adding data to a repo" incidents:
+// MCP config files inside a customer git worktree must never be rewritten
+// unless the user names the project explicitly with --cwd / --scope=project.
+
+func writeGitRepoMCP(t *testing.T, dir, body string) string {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Join(dir, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, ".mcp.json")
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestE2E35_DefaultConfigureIDESkipsProjectMCPJSONInsideGitRepo(t *testing.T) {
+	home := t.TempDir()
+	project := filepath.Join(home, "repo")
+	body := `{
+		"mcpServers": {
+			"example-server": {"command": "node", "args": ["server.js"]}
+		}
+	}`
+	projectMCP := writeGitRepoMCP(t, project, body)
+
+	out, _, code := runInDir(t, home, project, "configure-ide")
+	if code != 0 {
+		t.Fatalf("apply exit=%d out=%s", code, out)
+	}
+	if !strings.Contains(out, "skipped - inside a git repo") {
+		t.Fatalf("expected git-worktree skip to be reported: %s", out)
+	}
+	after, err := os.ReadFile(projectMCP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != body {
+		t.Fatalf("project .mcp.json inside git repo was rewritten:\n%s", after)
+	}
+	if countBackups(t, project) != 0 {
+		t.Fatalf("backup written inside git repo")
+	}
+}
+
+func TestE2E36_ExplicitCwdStillRoutesProjectMCPJSONInsideGitRepo(t *testing.T) {
+	home := t.TempDir()
+	project := filepath.Join(home, "repo")
+	projectMCP := writeGitRepoMCP(t, project, `{
+		"mcpServers": {
+			"fs": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]}
+		}
+	}`)
+
+	out, _, code := run(t, home, "configure-ide", "--ide=claude-code", "--cwd", project, "--scope=project")
+	if code != 0 {
+		t.Fatalf("apply exit=%d out=%s", code, out)
+	}
+	raw := readConfig(t, projectMCP)
+	var servers map[string]struct {
+		Command string   `json:"command"`
+		Args    []string `json:"args"`
+	}
+	if err := json.Unmarshal(raw["mcpServers"], &servers); err != nil {
+		t.Fatal(err)
+	}
+	if len(servers) != 1 || servers["agentkeeper-mcp-gateway"].Command != binary {
+		t.Fatalf("explicit --cwd did not wire project inside git repo: %+v", servers)
+	}
+}
+
+func TestE2E37_CoworkConfigureSkipsPluginMCPJSONInsideGitRepo(t *testing.T) {
+	home := t.TempDir()
+	sessionRepo := filepath.Join(
+		claudeAppSupportPath(home),
+		"local-agent-mode-sessions",
+		"session-1",
+		"workspace",
+		"claude-marche",
+	)
+	body := `{
+		"mcpServers": {
+			"example-server": {"command": "node", "args": ["server.js"]}
+		}
+	}`
+	pluginDir := filepath.Join(sessionRepo, "plugins", "dev-workflow")
+	if err := os.MkdirAll(filepath.Join(sessionRepo, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(pluginDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	pluginMCP := filepath.Join(pluginDir, ".mcp.json")
+	if err := os.WriteFile(pluginMCP, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	out, _, code := run(t, home, "cowork", "configure")
+	if code != 0 {
+		t.Fatalf("apply exit=%d out=%s", code, out)
+	}
+	if !strings.Contains(out, "skipped - inside a git repo") {
+		t.Fatalf("expected git-worktree skip to be reported: %s", out)
+	}
+	after, err := os.ReadFile(pluginMCP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != body {
+		t.Fatalf("cowork session .mcp.json inside git repo was rewritten:\n%s", after)
+	}
+}
+
+func TestE2E38_ConfigureIDEDefaultCoworkPathAlsoSkipsGitRepo(t *testing.T) {
+	home := t.TempDir()
+	sessionRepo := filepath.Join(
+		claudeAppSupportPath(home),
+		"local-agent-mode-sessions",
+		"session-2",
+		"workspace",
+		"repo",
+	)
+	body := `{
+		"mcpServers": {
+			"atlas": {"command": "node", "args": ["server.js"]}
+		}
+	}`
+	if err := os.MkdirAll(filepath.Join(sessionRepo, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sessionMCP := filepath.Join(sessionRepo, ".mcp.json")
+	if err := os.WriteFile(sessionMCP, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	out, _, code := run(t, home, "configure-ide")
+	if code != 0 {
+		t.Fatalf("apply exit=%d out=%s", code, out)
+	}
+	after, err := os.ReadFile(sessionMCP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != body {
+		t.Fatalf("configure-ide cowork path rewrote .mcp.json inside git repo:\n%s\nout=%s", after, out)
+	}
+}
