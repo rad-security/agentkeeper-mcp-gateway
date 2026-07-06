@@ -362,7 +362,20 @@ func readServersRaw(raw json.RawMessage, path, client, scope, sourceKind, routea
 
 // MigrateProjectMCP migrates direct servers from cwd/.mcp.json into the gateway
 // config and rewrites that project file so Claude Code launches the gateway.
+// A project file inside a git worktree is skipped (SkippedGitWorktree); use
+// MigrateProjectMCPExplicit when the user named the project by flag.
 func MigrateProjectMCP(cwd string, dryRun bool) (MigrationPlan, error) {
+	return migrateProjectMCP(cwd, dryRun, false)
+}
+
+// MigrateProjectMCPExplicit is MigrateProjectMCP for explicit user intent
+// (configure-ide --cwd / --scope=project): it rewrites the project .mcp.json
+// even when it lives inside a git worktree.
+func MigrateProjectMCPExplicit(cwd string, dryRun bool) (MigrationPlan, error) {
+	return migrateProjectMCP(cwd, dryRun, true)
+}
+
+func migrateProjectMCP(cwd string, dryRun, allowGitWorktree bool) (MigrationPlan, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return MigrationPlan{}, err
@@ -375,7 +388,7 @@ func MigrateProjectMCP(cwd string, dryRun bool) (MigrationPlan, error) {
 		return MigrationPlan{}, err
 	}
 	path := filepath.Join(abs, ".mcp.json")
-	return MigrateMCPFile(path, ClientClaudeCode, "project", "project_mcp_json", RouteabilityLocalRoutable, dryRun)
+	return migrateMCPFile(path, ClientClaudeCode, "project", "project_mcp_json", RouteabilityLocalRoutable, dryRun, allowGitWorktree)
 }
 
 // MigrateClaudeJSONUser migrates Claude Code user-scoped MCP servers from
@@ -839,8 +852,13 @@ func remoteString(remote map[string]json.RawMessage, key string) string {
 
 // MigrateMCPFile migrates direct MCP servers from path into the gateway config
 // and rewrites path so the local client launches the gateway. Unknown top-level
-// keys in the source file are preserved.
+// keys in the source file are preserved. Files inside a git worktree are never
+// rewritten; the plan comes back with SkippedGitWorktree set instead.
 func MigrateMCPFile(path, client, scope, sourceKind, routeability string, dryRun bool) (MigrationPlan, error) {
+	return migrateMCPFile(path, client, scope, sourceKind, routeability, dryRun, false)
+}
+
+func migrateMCPFile(path, client, scope, sourceKind, routeability string, dryRun, allowGitWorktree bool) (MigrationPlan, error) {
 	servers := readMCPServers(path, client, scope, sourceKind, routeability)
 	plan := MigrationPlan{Client: client, Scope: scope, ConfigPath: path, Servers: servers}
 	if len(servers) == 0 {
@@ -873,6 +891,13 @@ func MigrateMCPFile(path, client, scope, sourceKind, routeability string, dryRun
 			plan.AlreadyRouted = allRoutedOrNativeKept(servers)
 			return plan, nil
 		}
+	}
+	// Everything past this point rewrites the file. Never do that inside a
+	// customer git worktree unless the user named this project explicitly:
+	// the rewrite lands in their commits and PRs.
+	if !allowGitWorktree && insideGitWorktree(path) {
+		plan.SkippedGitWorktree = true
+		return plan, nil
 	}
 	if dryRun {
 		return plan, nil
@@ -946,6 +971,9 @@ type MigrationPlan struct {
 	NativeKept     []DiscoveredServer `json:"native_kept,omitempty"`
 	NativeDisabled []DiscoveredServer `json:"native_disabled,omitempty"`
 	AlreadyRouted  bool               `json:"already_routed,omitempty"`
+	// SkippedGitWorktree is set when the source file needed a rewrite but sits
+	// inside a git worktree, so the migration refused to touch it.
+	SkippedGitWorktree bool `json:"skipped_git_worktree,omitempty"`
 }
 
 func gatewayServerEntry() config.ServerEntry {
