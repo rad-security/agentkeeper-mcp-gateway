@@ -165,6 +165,41 @@ Supports **Claude Code** (`~/.claude/settings.json`), **Claude Desktop** (macOS 
 
 A second invocation is a no-op — the command detects a correctly-wired config and skips the write entirely. Safe to run from a login hook, a postinstall script, or on every Kandji reapply.
 
+## AgentKeeper Linux runtime integration
+
+The signed AgentKeeper Linux RPM uses a separate, machine-verifiable managed
+mode. Operators should enroll with the `agentkeeper` CLI; they should not invoke
+the flags below directly.
+
+```bash
+agentkeeper-mcp-gateway enterprise-capabilities --json
+agentkeeper-mcp-gateway configure-ide \
+  --managed-runtime-config /etc/agentkeeper/mcp-gateway.json \
+  --non-interactive
+```
+
+In managed mode:
+
+- `/etc/agentkeeper/mcp-gateway.json` is a root-owned, credential-free pointer
+  to the local AgentKeeper runtime socket.
+- The gateway never receives the workstation device credential. The machine
+  broker authenticates the calling Linux UID with `SO_PEERCRED`, authorizes the
+  enrolled target user, and adds trusted workstation/user identity.
+- Only MCP client configuration files that already exist are structurally
+  merged. Missing Claude Code, Claude Desktop, or Cursor files are not created.
+- Migrated MCP server definitions remain in the target user's private gateway
+  config. The ownership manifest and gateway config are mode `0600`; backups
+  stay under the private gateway backup directory.
+- Reconciliation is idempotent. Later customer MCP additions are migrated on
+  the next pass, and their later edits are preserved during removal.
+- `--remove-managed-routing` removes only AgentKeeper-owned routing. It is a
+  no-op when nothing was routed and refuses cleanup if an active gateway entry
+  has lost its ownership manifest.
+
+Filesystem presence or a sync heartbeat is not enforcement evidence. A real
+routed MCP tool call must reach the runtime broker before the integration can
+be reported active.
+
 ## Manual fallback/admin registration
 
 Use `add` only when no supported local MCP client config can be migrated, or when an admin intentionally wants a gateway-native server entry.

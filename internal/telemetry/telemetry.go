@@ -2,6 +2,7 @@ package telemetry
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -13,6 +14,7 @@ import (
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/hostidentity"
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/logging"
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/machineid"
+	"github.com/rad-security/agentkeeper-mcp-gateway/internal/runtimebroker"
 )
 
 // ServerInfo describes a connected MCP server for sync registration.
@@ -75,6 +77,7 @@ type EvaluateResult struct {
 type Client struct {
 	apiURL         string
 	apiKey         string
+	runtimeSocket  string
 	hostname       string
 	machineID      string
 	mode           string
@@ -87,6 +90,14 @@ type Client struct {
 	done           chan struct{}
 	cachedPolicy   SyncPolicy
 	policyMu       sync.RWMutex
+}
+
+// NewRuntimeClient uses the local machine broker for all connected telemetry.
+// The gateway never receives or stores the machine device credential.
+func NewRuntimeClient(socketPath string, logger *logging.Logger) *Client {
+	client := NewClient("", "", logger)
+	client.runtimeSocket = socketPath
+	return client
 }
 
 // StableHostname returns a stable machine hostname. On macOS, os.Hostname()
@@ -193,27 +204,12 @@ func (c *Client) Evaluate(serverName, toolName string, params map[string]interfa
 		return nil
 	}
 
-	req, err := http.NewRequest("POST", c.apiURL+"/api/v1/mcp/evaluate", bytes.NewReader(data))
-	if err != nil {
-		return nil
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+c.apiKey)
-
-	client := &http.Client{Timeout: 4 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		c.logger.Warn("connected detection failed: %v", err)
-		return nil
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		return nil
-	}
-
 	var result EvaluateResult
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	status, err := c.postJSON("evaluate", "/api/v1/mcp/evaluate", data, &result)
+	if err != nil || status != http.StatusOK {
+		if err != nil && c.logger != nil {
+			c.logger.Warn("connected detection failed: %v", err)
+		}
 		return nil
 	}
 
@@ -239,28 +235,18 @@ func (c *Client) sync() {
 		return
 	}
 
-	req, err := http.NewRequest("POST", c.apiURL+"/api/v1/mcp/sync", bytes.NewReader(data))
-	if err != nil {
-		return
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+c.apiKey)
-
-	client := &http.Client{Timeout: 4 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "[agentkeeper] sync failed: %v\n", err)
-		return
-	}
-	defer resp.Body.Close()
-
 	var result struct {
 		OK        bool       `json:"ok"`
 		GatewayID string     `json:"gateway_id"`
 		Policy    SyncPolicy `json:"policy"`
 		Error     string     `json:"error"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err == nil {
+	status, err := c.postJSON("sync", "/api/v1/mcp/sync", data, &result)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[agentkeeper] sync failed: %v\n", err)
+		return
+	}
+	if err == nil {
 		if result.GatewayID != "" {
 			c.gatewayID = result.GatewayID
 		}
@@ -270,8 +256,8 @@ func (c *Client) sync() {
 			c.policyMu.Unlock()
 		}
 	}
-	if resp.StatusCode != 200 {
-		fmt.Fprintf(os.Stderr, "[agentkeeper] sync error (HTTP %d): %s\n", resp.StatusCode, result.Error)
+	if status != http.StatusOK {
+		fmt.Fprintf(os.Stderr, "[agentkeeper] sync error (HTTP %d): %s\n", status, result.Error)
 	}
 }
 
@@ -305,23 +291,6 @@ func (c *Client) flush() {
 		return
 	}
 
-	req, err := http.NewRequest("POST", c.apiURL+"/api/v1/mcp/events", bytes.NewReader(data))
-	if err != nil {
-		c.logger.RequeueFront(events)
-		return
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+c.apiKey)
-
-	client := &http.Client{Timeout: 4 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		c.logger.RequeueFront(events)
-		fmt.Fprintf(os.Stderr, "[agentkeeper] telemetry upload failed: %v\n", err)
-		return
-	}
-	defer resp.Body.Close()
-
 	var result struct {
 		OK       bool   `json:"ok"`
 		Inserted int    `json:"inserted"`
@@ -329,15 +298,15 @@ func (c *Client) flush() {
 		Disabled bool   `json:"disabled"`
 		Error    string `json:"error"`
 	}
-	decodeErr := json.NewDecoder(resp.Body).Decode(&result)
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+	status, postErr := c.postJSON("events", "/api/v1/mcp/events", data, &result)
+	if postErr != nil {
 		c.logger.RequeueFront(events)
-		fmt.Fprintf(os.Stderr, "[agentkeeper] telemetry upload error (HTTP %d)\n", resp.StatusCode)
+		fmt.Fprintf(os.Stderr, "[agentkeeper] telemetry upload failed: %v\n", postErr)
 		return
 	}
-	if decodeErr != nil {
+	if status < 200 || status >= 300 {
 		c.logger.RequeueFront(events)
-		fmt.Fprintf(os.Stderr, "[agentkeeper] telemetry upload ack invalid: %v\n", decodeErr)
+		fmt.Fprintf(os.Stderr, "[agentkeeper] telemetry upload error (HTTP %d)\n", status)
 		return
 	}
 	if result.Disabled {
@@ -358,4 +327,34 @@ func (c *Client) flush() {
 		received = *result.Received
 	}
 	c.logger.Info("telemetry upload acknowledged: sent=%d received=%d inserted=%d", len(events), received, result.Inserted)
+}
+
+func (c *Client) postJSON(operation, endpoint string, data []byte, out any) (int, error) {
+	if c.runtimeSocket != "" {
+		var payload any
+		if err := json.Unmarshal(data, &payload); err != nil {
+			return 0, err
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 1900*time.Millisecond)
+		defer cancel()
+		return runtimebroker.Post(ctx, c.runtimeSocket, operation, payload, out)
+	}
+	req, err := http.NewRequest(http.MethodPost, c.apiURL+endpoint, bytes.NewReader(data))
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	client := &http.Client{Timeout: 4 * time.Second}
+	response, err := client.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer response.Body.Close()
+	if out != nil {
+		if err := json.NewDecoder(response.Body).Decode(out); err != nil {
+			return response.StatusCode, err
+		}
+	}
+	return response.StatusCode, nil
 }

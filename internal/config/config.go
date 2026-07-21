@@ -29,6 +29,13 @@ type Config struct {
 	APIKey string `json:"api_key,omitempty" yaml:"api_key,omitempty"`
 	APIURL string `json:"api_url,omitempty" yaml:"api_url,omitempty"`
 
+	// Managed Linux runtime transport. These fields contain no credential; the
+	// machine broker authenticates the gateway process with SO_PEERCRED and owns
+	// the device credential.
+	ManagedRuntimeSocket   string `json:"managed_runtime_socket,omitempty" yaml:"managed_runtime_socket,omitempty"`
+	ManagedRuntimeProtocol string `json:"managed_runtime_protocol,omitempty" yaml:"managed_runtime_protocol,omitempty"`
+	CredentialMode         string `json:"credential_mode,omitempty" yaml:"credential_mode,omitempty"`
+
 	// Dashboard policy (fetched, not configured locally)
 	DashboardPolicy *DashboardPolicy `json:"-" yaml:"-"`
 }
@@ -285,7 +292,32 @@ func Save(cfg Config) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0o644)
+	mode := os.FileMode(0o600)
+	if info, statErr := os.Stat(path); statErr == nil {
+		mode = info.Mode().Perm()
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".agentkeeper-config-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if err := tmp.Chmod(mode); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(append(data, '\n')); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, path)
 }
 
 // SaveAPIKey stores the API key from auth login.

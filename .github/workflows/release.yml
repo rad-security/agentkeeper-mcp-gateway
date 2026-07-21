@@ -9,6 +9,7 @@ permissions:
 jobs:
   goreleaser:
     runs-on: ubuntu-latest
+    environment: gateway-release
     steps:
       - uses: actions/checkout@v4
         with:
@@ -17,6 +18,28 @@ jobs:
         with:
           go-version: "1.23.3"
       - uses: sigstore/cosign-installer@v3
+      - name: Verify immutable release source and enterprise Linux contract
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain --untracked-files=all)"
+          git verify-tag "${GITHUB_REF_NAME}"
+          git fetch origin main --no-tags
+          git merge-base --is-ancestor HEAD origin/main
+          go test -race -timeout 5m ./...
+          go build -trimpath -o "${RUNNER_TEMP}/agentkeeper-mcp-gateway-linux-amd64" .
+          capabilities="$(${RUNNER_TEMP}/agentkeeper-mcp-gateway-linux-amd64 enterprise-capabilities --json)"
+          jq -e '
+            .schema_version == 1 and
+            .runtime_socket_auth.supported == true and
+            .runtime_socket_auth.protocol == "agentkeeper-runtime-gateway-v1" and
+            .runtime_socket_auth.credential_exposure == "none" and
+            .managed_routing.supported == true and
+            .managed_routing.safe_structural_merge == true and
+            .managed_routing.runtime_config_flag == "--managed-runtime-config" and
+            .managed_routing.non_interactive_flag == "--non-interactive" and
+            .managed_routing.remove_managed_flag == "--remove-managed-routing" and
+            .inventory.dry_run == true
+          ' <<<"${capabilities}"
       - uses: goreleaser/goreleaser-action@v6
         with:
           version: "~> v2"
