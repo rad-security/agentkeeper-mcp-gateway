@@ -19,10 +19,23 @@ jobs:
           go-version: "1.23.3"
       - uses: sigstore/cosign-installer@v3
       - name: Verify immutable release source and enterprise Linux contract
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           test -z "$(git status --porcelain --untracked-files=all)"
-          git verify-tag "${GITHUB_REF_NAME}"
+          test "$(git rev-list -n 1 "${GITHUB_REF_NAME}")" = "$(git rev-parse HEAD)"
+          if git verify-tag "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            echo "Verified signed annotated release tag ${GITHUB_REF_NAME}."
+          else
+            # GitHub-created releases use lightweight tags. In that case, bind
+            # the tag to a cryptographically verified GitHub-signed main commit
+            # rather than weakening the source gate or requiring a developer's
+            # personal signing key in the release environment.
+            gh api "repos/${GITHUB_REPOSITORY}/commits/$(git rev-parse HEAD)" \
+              --jq '.commit.verification | select(.verified == true and .reason == "valid") | .verified' \
+              | grep -Fx true
+          fi
           git fetch origin main --no-tags
           git merge-base --is-ancestor HEAD origin/main
           go test -race -timeout 5m ./...
