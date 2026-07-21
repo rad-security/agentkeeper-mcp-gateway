@@ -12,6 +12,7 @@ import (
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/discovery"
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/logging"
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/proxy"
+	"github.com/rad-security/agentkeeper-mcp-gateway/internal/runtimebroker"
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/server"
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/telemetry"
 	"github.com/spf13/cobra"
@@ -71,12 +72,19 @@ are blocked.`,
 		// Start telemetry if connected
 		var tc *telemetry.Client
 		hasAPIKey := config.HasUsableAPIKey(cfg.APIKey)
-		if hasAPIKey {
+		hasRuntimeBroker := cfg.ManagedRuntimeSocket != "" &&
+			cfg.ManagedRuntimeProtocol == runtimebroker.Protocol &&
+			cfg.CredentialMode == runtimebroker.CredentialMode
+		if hasRuntimeBroker {
+			tc = telemetry.NewRuntimeClient(cfg.ManagedRuntimeSocket, logger)
+		} else if hasAPIKey {
 			apiURL := cfg.APIURL
 			if apiURL == "" {
 				apiURL = "https://www.agentkeeper.dev"
 			}
 			tc = telemetry.NewClient(apiURL, cfg.APIKey, logger)
+		}
+		if tc != nil {
 			tc.SetMode(cfg.Mode)
 			tc.SetVersion(version)
 
@@ -142,7 +150,9 @@ are blocked.`,
 		}
 		fmt.Fprintf(os.Stderr, "[agentkeeper] MCP Gateway v%s starting in %s mode\n", version, mode)
 		fmt.Fprintf(os.Stderr, "[agentkeeper] %d servers configured, %d detection patterns loaded\n", len(serverConfigs), 36)
-		if hasAPIKey {
+		if hasRuntimeBroker {
+			fmt.Fprintf(os.Stderr, "[agentkeeper] Connected through credentialless AgentKeeper runtime broker\n")
+		} else if hasAPIKey {
 			fmt.Fprintf(os.Stderr, "[agentkeeper] Connected to dashboard\n")
 		} else {
 			fmt.Fprintf(os.Stderr, "[agentkeeper] Local mode (run 'agentkeeper-mcp-gateway auth login' to connect)\n")

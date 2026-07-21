@@ -10,15 +10,19 @@ import (
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/config"
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/discovery"
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/ideconfig"
+	"github.com/rad-security/agentkeeper-mcp-gateway/internal/managedrouting"
 	"github.com/spf13/cobra"
 )
 
 var (
-	configureIDEDryRun bool
-	configureIDETarget []string
-	configureIDECWD    string
-	configureIDEScope  string
-	configureIDEJSON   bool
+	configureIDEDryRun               bool
+	configureIDETarget               []string
+	configureIDECWD                  string
+	configureIDEScope                string
+	configureIDEJSON                 bool
+	configureIDEManagedRuntimeConfig string
+	configureIDENonInteractive       bool
+	configureIDERemoveManaged        bool
 )
 
 var configureIDECmd = &cobra.Command{
@@ -38,6 +42,29 @@ By default every detected IDE is configured. Use --ide to target just one.
 	Use --dry-run to preview changes without writing anything.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		out := cmd.OutOrStdout()
+		if strings.TrimSpace(configureIDEManagedRuntimeConfig) != "" {
+			if !configureIDENonInteractive {
+				return fmt.Errorf("--managed-runtime-config requires --non-interactive")
+			}
+			report, err := managedrouting.Run(managedrouting.Options{
+				RuntimeConfigPath: configureIDEManagedRuntimeConfig,
+				Remove:            configureIDERemoveManaged,
+				DryRun:            configureIDEDryRun,
+				Targets:           configureIDETarget,
+			})
+			if err != nil {
+				return err
+			}
+			encoded, err := json.MarshalIndent(report, "", "  ")
+			if err != nil {
+				return err
+			}
+			fmt.Fprintln(out, string(encoded))
+			return nil
+		}
+		if configureIDERemoveManaged {
+			return fmt.Errorf("--remove-managed-routing requires --managed-runtime-config")
+		}
 		if shouldUseProjectMigration() {
 			cwd := configureIDECWD
 			if strings.TrimSpace(cwd) == "" {
@@ -379,5 +406,8 @@ func init() {
 	configureIDECmd.Flags().StringVar(&configureIDECWD, "cwd", "", "Project directory for Claude Code project-scoped MCP migration")
 	configureIDECmd.Flags().StringVar(&configureIDEScope, "scope", "", "MCP scope to configure (project for Claude Code .mcp.json)")
 	configureIDECmd.Flags().BoolVar(&configureIDEJSON, "json", false, "Emit JSON for project-scoped migration")
+	configureIDECmd.Flags().StringVar(&configureIDEManagedRuntimeConfig, "managed-runtime-config", "", "Root-owned AgentKeeper runtime broker configuration")
+	configureIDECmd.Flags().BoolVar(&configureIDENonInteractive, "non-interactive", false, "Disable interactive behavior for managed deployment")
+	configureIDECmd.Flags().BoolVar(&configureIDERemoveManaged, "remove-managed-routing", false, "Remove only routing owned by the managed runtime deployment")
 	rootCmd.AddCommand(configureIDECmd)
 }

@@ -69,6 +69,7 @@ type Plan struct {
 	IDE          string
 	ConfigPath   string
 	Exists       bool          // did the file exist when Plan was built
+	HasGateway   bool          // an exact AgentKeeper gateway entry is present
 	AlreadyWired bool          // gateway is the sole MCP entry already
 	Migrated     []NamedServer // servers we'd move into the gateway's own config
 	NativeKept   []NamedServer // remote OAuth/native-auth servers kept in the IDE config
@@ -195,6 +196,7 @@ func (a *Adapter) Plan() (Plan, error) {
 	hasCurrentGateway := false
 	if entry, ok := servers[GatewayServerName]; ok && isGatewayEntry(entry) {
 		hasCurrentGateway = true
+		p.HasGateway = true
 	}
 
 	// Collect everything except any existing gateway entry — that one gets
@@ -230,6 +232,18 @@ func (a *Adapter) Plan() (Plan, error) {
 // Apply does NOT move migrated servers into the gateway's own config — that is
 // the caller's responsibility.
 func (a *Adapter) Apply(p *Plan) error {
+	return a.apply(p, true)
+}
+
+// ApplyManaged performs the same structural write as Apply without mutating
+// the gateway config as a hidden side effect. The enterprise runtime owns the
+// managed gateway-config transaction and must be able to roll it back as one
+// unit if the ownership manifest cannot be persisted.
+func (a *Adapter) ApplyManaged(p *Plan) error {
+	return a.apply(p, false)
+}
+
+func (a *Adapter) apply(p *Plan, pruneNativeGatewayEntries bool) error {
 	if p == nil {
 		return errors.New("nil plan")
 	}
@@ -277,11 +291,42 @@ func (a *Adapter) Apply(p *Plan) error {
 	if err := os.MkdirAll(filepath.Dir(p.ConfigPath), 0o755); err != nil {
 		return fmt.Errorf("mkdir %s: %w", filepath.Dir(p.ConfigPath), err)
 	}
-	if err := os.WriteFile(p.ConfigPath, out, 0o644); err != nil {
+	mode := os.FileMode(0o600)
+	if info, statErr := os.Stat(p.ConfigPath); statErr == nil {
+		mode = info.Mode().Perm()
+	}
+	if err := writeAtomic(p.ConfigPath, append(out, '\n'), mode); err != nil {
 		return fmt.Errorf("writing %s: %w", p.ConfigPath, err)
 	}
-	pruneNativeKeptFromGatewayConfig(p.NativeKept)
+	if pruneNativeGatewayEntries {
+		pruneNativeKeptFromGatewayConfig(p.NativeKept)
+	}
 	return nil
+}
+
+func writeAtomic(path string, data []byte, mode os.FileMode) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".agentkeeper-ide-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if err := tmp.Chmod(mode); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, path)
 }
 
 func (a *Adapter) recoverNativeClientAuthServers(existing map[string]ServerEntry) []NamedServer {
