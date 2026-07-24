@@ -11,6 +11,7 @@ import (
 
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/config"
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/discovery"
+	"github.com/rad-security/agentkeeper-mcp-gateway/internal/runtimebroker"
 	"github.com/spf13/cobra"
 )
 
@@ -77,6 +78,7 @@ var listCmd = &cobra.Command{
 type listHealthReport struct {
 	ConfigPath         string                       `json:"config_path"`
 	DashboardConnected bool                         `json:"dashboard_connected"`
+	ConnectionMode     string                       `json:"connection_mode"`
 	APIURL             string                       `json:"api_url,omitempty"`
 	RoutedServers      []config.ServerEntry         `json:"routed_servers"`
 	BackendToolHealth  []backendToolHealth          `json:"backend_tool_health"`
@@ -105,9 +107,16 @@ func buildListHealthReport(cfg config.Config) listHealthReport {
 	seenOnly := countSeenOnly(discovered, cfg.Servers)
 	backendHealth := probeBackendToolHealth(cfg)
 	nextSteps := healthNextSteps(cfg, discovered, seenOnly, backendHealth)
+	connectionMode := "local_only"
+	if config.HasUsableAPIKey(cfg.APIKey) {
+		connectionMode = "api_key"
+	} else if hasManagedRuntimeBroker(cfg) {
+		connectionMode = "managed_runtime_broker"
+	}
 	report := listHealthReport{
 		ConfigPath:         config.CurrentConfigPath(),
-		DashboardConnected: config.HasUsableAPIKey(cfg.APIKey),
+		DashboardConnected: config.HasUsableAPIKey(cfg.APIKey) || hasManagedRuntimeBroker(cfg),
+		ConnectionMode:     connectionMode,
 		APIURL:             cfg.APIURL,
 		RoutedServers:      cfg.Servers,
 		BackendToolHealth:  backendHealth,
@@ -127,7 +136,13 @@ func printListHealth(out interface{ Write([]byte) (int, error) }, report listHea
 	fmt.Fprintln(out, "MCP Gateway health")
 	fmt.Fprintf(out, "Config: %s\n", report.ConfigPath)
 	if report.DashboardConnected {
-		fmt.Fprintf(out, "Dashboard: connected (%s)\n", report.APIURL)
+		if report.ConnectionMode == "managed_runtime_broker" {
+			fmt.Fprintf(out, "Dashboard: connected (managed runtime broker via %s)\n", report.APIURL)
+		} else if strings.TrimSpace(report.APIURL) != "" {
+			fmt.Fprintf(out, "Dashboard: connected (%s)\n", report.APIURL)
+		} else {
+			fmt.Fprintln(out, "Dashboard: connected (managed runtime broker)")
+		}
 	} else {
 		fmt.Fprintf(out, "Dashboard: local only (%s)\n", report.APIURL)
 	}
@@ -215,11 +230,20 @@ func hasConfiguredTools(servers []config.ServerEntry) bool {
 
 func healthNextSteps(cfg config.Config, discovered []discovery.DiscoveredServer, seenOnly int, backendHealth []backendToolHealth) []string {
 	var steps []string
+	managedRuntime := hasManagedRuntimeBroker(cfg)
 	if len(discovered) == 0 && len(cfg.Servers) == 0 {
-		steps = append(steps, "Run agentkeeper-mcp-gateway configure-ide --dry-run to discover supported local MCP client configs.")
+		if managedRuntime {
+			steps = append(steps, "Add an MCP server in a supported client, then run sudo agentkeeper reconcile --source operator --json.")
+		} else {
+			steps = append(steps, "Run agentkeeper-mcp-gateway configure-ide --dry-run to discover supported local MCP client configs.")
+		}
 	}
 	if seenOnly > 0 {
-		steps = append(steps, "Run agentkeeper-mcp-gateway configure-ide --dry-run from the project directory, or pass --cwd for project .mcp.json, then apply configure-ide. Project files inside a git repo are only rewritten with explicit --cwd or --scope=project.")
+		if managedRuntime {
+			steps = append(steps, "Run sudo agentkeeper reconcile --source operator --json, restart the MCP client, then rerun agentkeeper-mcp-gateway list --health.")
+		} else {
+			steps = append(steps, "Run agentkeeper-mcp-gateway configure-ide --dry-run from the project directory, or pass --cwd for project .mcp.json, then apply configure-ide. Project files inside a git repo are only rewritten with explicit --cwd or --scope=project.")
+		}
 	}
 	if hasDirectCoworkSource(discovered) {
 		steps = append(steps, "For Cowork sources created after setup, run agentkeeper-mcp-gateway cowork guard --once now and keep cowork guard running from a login item or service.")
@@ -233,11 +257,17 @@ func healthNextSteps(cfg config.Config, discovered []discovery.DiscoveredServer,
 	if countBackendStatus(backendHealth, "pending") > 0 || countBackendStatus(backendHealth, "auth_configured") > 0 {
 		steps = append(steps, "Restart the MCP client and make one real harmless tool call through Gateway.")
 	}
-	if !config.HasUsableAPIKey(cfg.APIKey) {
+	if !config.HasUsableAPIKey(cfg.APIKey) && !managedRuntime {
 		steps = append(steps, "Connect to AgentKeeper with auth login or managed config for dashboard sync, central policy, and fleet proof.")
 	}
 	steps = append(steps, "Use manual add only for unsupported config sources or gateway-native admin setup.")
 	return steps
+}
+
+func hasManagedRuntimeBroker(cfg config.Config) bool {
+	return strings.TrimSpace(cfg.ManagedRuntimeSocket) != "" &&
+		cfg.ManagedRuntimeProtocol == runtimebroker.Protocol &&
+		cfg.CredentialMode == runtimebroker.CredentialMode
 }
 
 func hasDirectCoworkSource(discovered []discovery.DiscoveredServer) bool {
