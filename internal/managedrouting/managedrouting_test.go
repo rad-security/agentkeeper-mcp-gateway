@@ -112,6 +112,94 @@ func TestManagedConfigureIsIdempotentAndRemovalPreservesLaterChanges(t *testing.
 	}
 }
 
+func TestManagedConfigureRoutesClaudeUserServerAddedAfterEnrollmentAndRestoresIt(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("AGENTKEEPER_CONFIG", filepath.Join(home, ".config", "agentkeeper-mcp-gateway", "config.json"))
+	t.Setenv(gatewayentry.EnvBinary, "/usr/bin/agentkeeper-mcp-gateway")
+	managed := runtimebroker.ManagedConfig{
+		SchemaVersion: 1, OwnershipID: "agentkeeper.universal.v1",
+		Protocol: runtimebroker.Protocol, CredentialMode: runtimebroker.CredentialMode,
+		RuntimeSocket: "/run/agentkeeper/runtime.sock",
+	}
+	manifestPath := filepath.Join(home, ".config", "agentkeeper-mcp-gateway", "managed-routing.json")
+
+	first, err := configure(managed, "/etc/agentkeeper/mcp-gateway.json", manifestPath, Options{Targets: []string{"claude-code"}})
+	if err != nil || first.Result != "no_supported_client_config" {
+		t.Fatalf("initial managed configure failed: report=%+v err=%v", first, err)
+	}
+
+	claudeJSON := filepath.Join(home, ".claude.json")
+	if err := os.WriteFile(claudeJSON, []byte(`{
+  "theme": "dark",
+  "mcpServers": {
+    "agentkeeper-e2e-everything": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-everything"]
+    }
+  }
+}`), 0o640); err != nil {
+		t.Fatal(err)
+	}
+
+	second, err := configure(managed, "/etc/agentkeeper/mcp-gateway.json", manifestPath, Options{Targets: []string{"claude-code"}})
+	if err != nil || !second.Changed {
+		t.Fatalf("late Claude user server was not routed: report=%+v err=%v", second, err)
+	}
+	raw, err := os.ReadFile(claudeJSON)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var routed struct {
+		Theme      string                     `json:"theme"`
+		MCPServers map[string]json.RawMessage `json:"mcpServers"`
+	}
+	if err := json.Unmarshal(raw, &routed); err != nil {
+		t.Fatal(err)
+	}
+	if routed.Theme != "dark" || routed.MCPServers["agentkeeper-mcp-gateway"] == nil ||
+		routed.MCPServers["agentkeeper-e2e-everything"] != nil {
+		t.Fatalf("Claude user config was not structurally routed: %s", raw)
+	}
+	gatewayConfig, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, server := range gatewayConfig.Servers {
+		if server.Name == "agentkeeper-e2e-everything" &&
+			server.Command == "npx" &&
+			len(server.Args) == 2 &&
+			server.Args[1] == "@modelcontextprotocol/server-everything" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("gateway config did not receive the late Claude user server: %+v", gatewayConfig.Servers)
+	}
+
+	removed, err := remove(managed, manifestPath, false)
+	if err != nil || !removed.Changed {
+		t.Fatalf("managed removal failed: report=%+v err=%v", removed, err)
+	}
+	raw, err = os.ReadFile(claudeJSON)
+	if err != nil {
+		t.Fatal(err)
+	}
+	routed.MCPServers = nil
+	if err := json.Unmarshal(raw, &routed); err != nil {
+		t.Fatal(err)
+	}
+	if routed.MCPServers["agentkeeper-mcp-gateway"] != nil ||
+		routed.MCPServers["agentkeeper-e2e-everything"] == nil {
+		t.Fatalf("managed removal did not restore the customer server: %s", raw)
+	}
+	if info, err := os.Stat(claudeJSON); err != nil || info.Mode().Perm() != 0o640 {
+		t.Fatalf("Claude user config mode changed: info=%v err=%v", info, err)
+	}
+}
+
 func TestRemoveWithoutManifestIsSafeOnlyWhenNoGatewayEntryExists(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
