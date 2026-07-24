@@ -87,8 +87,12 @@ func configure(managed runtimebroker.ManagedConfig, runtimeConfigPath, manifestP
 		plan     ideconfig.Plan
 		snapshot clientSnapshot
 	}
-	for _, adapter := range ideconfig.Adapters() {
-		if len(wanted) > 0 && !wanted[adapter.Name] {
+	adapters, err := managedAdapters()
+	if err != nil {
+		return report, err
+	}
+	for _, adapter := range adapters {
+		if len(wanted) > 0 && !wanted[managedAdapterTarget(adapter.Name)] {
 			continue
 		}
 		plan, err := adapter.Plan()
@@ -217,7 +221,11 @@ func remove(managed runtimebroker.ManagedConfig, manifestPath string, dryRun boo
 	state, err := readManifest(manifestPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			for _, adapter := range ideconfig.Adapters() {
+			adapters, adapterErr := managedAdapters()
+			if adapterErr != nil {
+				return report, adapterErr
+			}
+			for _, adapter := range adapters {
 				plan, planErr := adapter.Plan()
 				if planErr != nil {
 					return report, planErr
@@ -281,6 +289,28 @@ func remove(managed runtimebroker.ManagedConfig, manifestPath string, dryRun boo
 	}
 	report.Changed = true
 	return report, nil
+}
+
+func managedAdapters() ([]*ideconfig.Adapter, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, fmt.Errorf("resolve home for managed MCP routing: %w", err)
+	}
+	adapters := append([]*ideconfig.Adapter(nil), ideconfig.Adapters()...)
+	adapters = append(adapters, &ideconfig.Adapter{
+		Name: "claude-code-user",
+		PathResolver: func() (string, error) {
+			return filepath.Join(home, ".claude.json"), nil
+		},
+	})
+	return adapters, nil
+}
+
+func managedAdapterTarget(name string) string {
+	if name == "claude-code-user" {
+		return "claude-code"
+	}
+	return name
 }
 
 func savePrivateGatewayConfig(value config.Config) error {
