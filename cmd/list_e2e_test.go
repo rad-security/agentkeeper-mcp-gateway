@@ -140,6 +140,47 @@ func TestListHealthJSONForMDMStatus(t *testing.T) {
 	}
 }
 
+func TestListHealthUsesUniversalRPMReconciliationGuidance(t *testing.T) {
+	home := t.TempDir()
+	if err := os.WriteFile(filepath.Join(home, ".claude.json"), []byte(`{
+  "mcpServers": {
+    "agentkeeper-e2e-everything": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-everything"]
+    }
+  }
+}`), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	writeGatewayConfig(t, home, `{
+  "managed_runtime_socket": "/run/agentkeeper/runtime.sock",
+  "managed_runtime_protocol": "agentkeeper-runtime-gateway-v1",
+  "credential_mode": "runtime_broker_only"
+}`)
+
+	out, stderr, code := run(t, home, "list", "--health")
+	if code != 0 {
+		t.Fatalf("exit %d, stderr: %s", code, stderr)
+	}
+	for _, want := range []string{
+		"Dashboard: connected (managed runtime broker via https://www.agentkeeper.dev)",
+		"Seen only: 1",
+		"sudo agentkeeper reconcile --source operator --json",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("missing %q in output:\n%s", want, out)
+		}
+	}
+	for _, forbidden := range []string{
+		"Run agentkeeper-mcp-gateway configure-ide",
+		"Connect to AgentKeeper with auth login",
+	} {
+		if strings.Contains(out, forbidden) {
+			t.Fatalf("managed runtime output contains standalone guidance %q:\n%s", forbidden, out)
+		}
+	}
+}
+
 func TestListHealthReportsRemoteAuthRequired(t *testing.T) {
 	home := t.TempDir()
 
