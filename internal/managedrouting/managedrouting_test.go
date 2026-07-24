@@ -124,9 +124,22 @@ func TestManagedConfigureRoutesClaudeUserServerAddedAfterEnrollmentAndRestoresIt
 		RuntimeSocket: "/run/agentkeeper/runtime.sock",
 	}
 	manifestPath := filepath.Join(home, ".config", "agentkeeper-mcp-gateway", "managed-routing.json")
+	settingsPath := filepath.Join(home, ".claude", "settings.json")
+	if err := os.MkdirAll(filepath.Dir(settingsPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(settingsPath, []byte(`{
+  "mcpServers": {
+    "existing-server": {
+      "command": "existing-mcp"
+    }
+  }
+}`), 0o640); err != nil {
+		t.Fatal(err)
+	}
 
 	first, err := configure(managed, "/etc/agentkeeper/mcp-gateway.json", manifestPath, Options{Targets: []string{"claude-code"}})
-	if err != nil || first.Result != "no_supported_client_config" {
+	if err != nil || !first.Changed {
 		t.Fatalf("initial managed configure failed: report=%+v err=%v", first, err)
 	}
 
@@ -134,6 +147,10 @@ func TestManagedConfigureRoutesClaudeUserServerAddedAfterEnrollmentAndRestoresIt
 	if err := os.WriteFile(claudeJSON, []byte(`{
   "theme": "dark",
   "mcpServers": {
+    "agentkeeper-mcp-gateway": {
+      "command": "/usr/bin/agentkeeper-mcp-gateway",
+      "args": ["server"]
+    },
     "agentkeeper-e2e-everything": {
       "command": "npx",
       "args": ["-y", "@modelcontextprotocol/server-everything"]
@@ -145,7 +162,7 @@ func TestManagedConfigureRoutesClaudeUserServerAddedAfterEnrollmentAndRestoresIt
 
 	second, err := configure(managed, "/etc/agentkeeper/mcp-gateway.json", manifestPath, Options{Targets: []string{"claude-code"}})
 	if err != nil || !second.Changed {
-		t.Fatalf("late Claude user server was not routed: report=%+v err=%v", second, err)
+		t.Fatalf("late Claude user server with a legacy managed entry was not adopted and routed: report=%+v err=%v", second, err)
 	}
 	raw, err := os.ReadFile(claudeJSON)
 	if err != nil {

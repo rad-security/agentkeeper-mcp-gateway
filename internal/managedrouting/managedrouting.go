@@ -74,11 +74,13 @@ func configure(managed runtimebroker.ManagedConfig, runtimeConfigPath, manifestP
 		Version: manifestVersion, OwnershipID: "agentkeeper.universal.v1", RuntimeConfigPath: runtimeConfigPath,
 		Clients: []clientSnapshot{}, MigratedServers: map[string]config.ServerEntry{},
 	}
+	manifestExisted := false
 	if existing, readErr := readManifest(manifestPath); readErr == nil {
 		if existing.Version != manifestVersion || existing.OwnershipID != "agentkeeper.universal.v1" || existing.RuntimeConfigPath != runtimeConfigPath {
 			return report, fmt.Errorf("an incompatible managed routing manifest already exists")
 		}
 		state = existing
+		manifestExisted = true
 	} else if !errors.Is(readErr, os.ErrNotExist) {
 		return report, fmt.Errorf("read existing managed routing manifest: %w", readErr)
 	}
@@ -109,10 +111,18 @@ func configure(managed runtimebroker.ManagedConfig, runtimeConfigPath, manifestP
 		}
 		snapshot, hasSnapshot := findClientSnapshot(state.Clients, adapter.Name, plan.ConfigPath)
 		if !hasSnapshot {
-			if plan.HasGateway {
+			if plan.HasGateway && !manifestExisted {
 				return report, fmt.Errorf("%s is already gateway-routed without an AgentKeeper ownership manifest", adapter.Name)
 			}
-			snapshot = clientSnapshot{Name: adapter.Name, Path: plan.ConfigPath, OriginalServers: currentServers}
+			// An existing valid Universal RPM manifest anchors ownership for an
+			// exact canonical Gateway entry copied into a newly supported client
+			// scope. Adopt that entry while snapshotting every customer server so
+			// removal remains lossless. Without the manifest, refuse adoption.
+			snapshot = clientSnapshot{
+				Name:            adapter.Name,
+				Path:            plan.ConfigPath,
+				OriginalServers: withoutManagedGateway(currentServers),
+			}
 			state.Clients = append(state.Clients, snapshot)
 		} else {
 			for _, server := range plan.Migrated {
@@ -194,6 +204,17 @@ func configure(managed runtimebroker.ManagedConfig, runtimeConfigPath, manifestP
 	report.Changed = report.Changed || manifestChanged
 	report.MigratedServers = sortedServerNames(state.MigratedServers)
 	return report, nil
+}
+
+func withoutManagedGateway(servers map[string]json.RawMessage) map[string]json.RawMessage {
+	result := make(map[string]json.RawMessage, len(servers))
+	for name, raw := range servers {
+		if name == ideconfig.GatewayServerName {
+			continue
+		}
+		result[name] = append(json.RawMessage(nil), raw...)
+	}
+	return result
 }
 
 func replaceClientSnapshot(clients []clientSnapshot, replacement clientSnapshot) []clientSnapshot {
