@@ -153,8 +153,11 @@ func verdictRank(v string) int {
 
 // Run starts the proxy, reading from stdin and writing to stdout.
 func (p *Proxy) Run() error {
-	reader := bufio.NewReader(os.Stdin)
-	writer := os.Stdout
+	return p.run(os.Stdin, os.Stdout)
+}
+
+func (p *Proxy) run(input io.Reader, writer io.Writer) error {
+	reader := bufio.NewReader(input)
 
 	for {
 		line, err := reader.ReadBytes('\n')
@@ -173,8 +176,18 @@ func (p *Proxy) Run() error {
 
 		var msg JSONRPCMessage
 		if err := json.Unmarshal([]byte(trimmed), &msg); err != nil {
-			// Not valid JSON-RPC — pass through
-			p.writeRaw(writer, line)
+			// Never echo malformed bytes onto the protocol stream. Clients expect
+			// every Gateway response to remain valid JSON-RPC and may terminate if
+			// invalid input is reflected back verbatim.
+			nullID := json.RawMessage(`null`)
+			p.writeJSONLine(writer, JSONRPCMessage{
+				JSONRPC: "2.0",
+				ID:      &nullID,
+				Error: &JSONRPCError{
+					Code:    -32700,
+					Message: "Parse error",
+				},
+			})
 			continue
 		}
 

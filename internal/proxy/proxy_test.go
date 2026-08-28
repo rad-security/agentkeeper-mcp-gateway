@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -15,6 +16,37 @@ import (
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/server"
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/telemetry"
 )
+
+func TestMalformedInputReturnsParseErrorAndStreamContinues(t *testing.T) {
+	p := NewProxy(Config{}, server.NewManager(nil), nil)
+	input := strings.NewReader("{malformed-json\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n")
+	var output bytes.Buffer
+	if err := p.run(input, &output); err != nil {
+		t.Fatal(err)
+	}
+
+	lines := strings.Split(strings.TrimSpace(output.String()), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("response lines=%d, want 2: %q", len(lines), output.String())
+	}
+	var parseError struct {
+		ID    json.RawMessage `json:"id"`
+		Error *JSONRPCError   `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(lines[0]), &parseError); err != nil {
+		t.Fatalf("parse-error response is not valid JSON: %v", err)
+	}
+	if string(parseError.ID) != "null" || parseError.Error == nil || parseError.Error.Code != -32700 {
+		t.Fatalf("unexpected parse-error response: %+v", parseError)
+	}
+	var ping JSONRPCMessage
+	if err := json.Unmarshal([]byte(lines[1]), &ping); err != nil {
+		t.Fatalf("post-error response is not valid JSON: %v", err)
+	}
+	if ping.ID == nil || string(*ping.ID) != "1" || string(ping.Result) != "{}" {
+		t.Fatalf("stream did not continue after malformed input: %+v", ping)
+	}
+}
 
 func TestToolCacheClonesAndRequiresConfirmedEmptyRefresh(t *testing.T) {
 	p := &Proxy{toolCache: make(map[string][]interface{})}
