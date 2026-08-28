@@ -474,22 +474,7 @@ func (p *Proxy) logToolDescriptionDetections(serverName string, tools []interfac
 		if !ok {
 			continue
 		}
-		desc := detection.ToolDescription{
-			Name:        fmt.Sprintf("%v", tm["name"]),
-			Description: fmt.Sprintf("%v", tm["description"]),
-		}
-		if inputSchema, ok := tm["inputSchema"].(map[string]interface{}); ok {
-			if props, ok := inputSchema["properties"].(map[string]interface{}); ok {
-				for pName, pVal := range props {
-					if pm, ok := pVal.(map[string]interface{}); ok {
-						desc.Parameters = append(desc.Parameters, detection.ToolParam{
-							Name:        pName,
-							Description: fmt.Sprintf("%v", pm["description"]),
-						})
-					}
-				}
-			}
-		}
+		desc := toolDescriptionFromMap(tm)
 		results := p.config.DetectionEngine.EvaluateToolDescriptions([]detection.ToolDescription{desc})
 		for _, r := range results {
 			found[serverName+"__"+desc.Name] = r
@@ -522,7 +507,15 @@ func (p *Proxy) filterPoisonedTools(tools []interface{}) []interface{} {
 			continue
 		}
 		name, _ := tool["name"].(string)
-		if result, found := p.poisonedTool(name); found {
+		result, found := p.toolDescriptionDetection(tool)
+		if !found {
+			// Retain the asynchronous index as a compatibility fallback when
+			// descriptor inspection is unavailable. Enforcement must not depend
+			// on that index because a freshly refreshed or restored cache can be
+			// visible before the background evidence map is populated.
+			result, found = p.poisonedTool(name)
+		}
+		if found {
 			result = applyDetectionPolicy(result, synced, p.config.Detection)
 			if result.Verdict == detection.VerdictBlock {
 				continue
@@ -531,6 +524,55 @@ func (p *Proxy) filterPoisonedTools(tools []interface{}) []interface{} {
 		filtered = append(filtered, value)
 	}
 	return filtered
+}
+
+func (p *Proxy) toolDescriptionDetection(tool map[string]interface{}) (detection.Result, bool) {
+	if p.config.DetectionEngine == nil {
+		return detection.Result{}, false
+	}
+	desc := toolDescriptionFromMap(tool)
+	results := p.config.DetectionEngine.EvaluateToolDescriptions([]detection.ToolDescription{desc})
+	if len(results) == 0 {
+		return detection.Result{}, false
+	}
+	strongest := results[0]
+	for _, result := range results[1:] {
+		if verdictRank(string(result.Verdict)) > verdictRank(string(strongest.Verdict)) {
+			strongest = result
+		}
+	}
+	return strongest, true
+}
+
+func toolDescriptionFromMap(tool map[string]interface{}) detection.ToolDescription {
+	desc := detection.ToolDescription{
+		Name:        fmt.Sprintf("%v", tool["name"]),
+		Description: fmt.Sprintf("%v", tool["description"]),
+	}
+	if inputSchema, ok := tool["inputSchema"].(map[string]interface{}); ok {
+		if props, ok := inputSchema["properties"].(map[string]interface{}); ok {
+			for paramName, paramValue := range props {
+				if param, ok := paramValue.(map[string]interface{}); ok {
+					desc.Parameters = append(desc.Parameters, detection.ToolParam{
+						Name:        paramName,
+						Description: fmt.Sprintf("%v", param["description"]),
+					})
+				}
+			}
+		}
+	}
+	return desc
+}
+
+func (p *Proxy) cachedToolDescriptionDetection(serverName, originalName string) (detection.Result, bool) {
+	for _, value := range p.cachedTools(serverName) {
+		tool, ok := value.(map[string]interface{})
+		if !ok || fmt.Sprintf("%v", tool["name"]) != originalName {
+			continue
+		}
+		return p.toolDescriptionDetection(tool)
+	}
+	return detection.Result{}, false
 }
 
 func (p *Proxy) poisonedTool(name string) (detection.Result, bool) {
@@ -863,7 +905,11 @@ func (p *Proxy) handleToolsCall(msg JSONRPCMessage) (*JSONRPCMessage, error) {
 		}
 	}
 
-	if poisoned, found := p.poisonedTool(callParams.Name); found {
+	poisoned, found := p.cachedToolDescriptionDetection(serverName, originalName)
+	if !found {
+		poisoned, found = p.poisonedTool(callParams.Name)
+	}
+	if found {
 		poisoned = applyDetectionPolicy(poisoned, syncPolicy, p.config.Detection)
 		if verdictRank(string(poisoned.Verdict)) > verdictRank(finalVerdict) {
 			finalVerdict = string(poisoned.Verdict)
