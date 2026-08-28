@@ -3,6 +3,7 @@ package cmd
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
@@ -10,8 +11,10 @@ import (
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/config"
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/detection"
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/discovery"
+	"github.com/rad-security/agentkeeper-mcp-gateway/internal/gatewayentry"
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/logging"
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/proxy"
+	"github.com/rad-security/agentkeeper-mcp-gateway/internal/receipt"
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/runtimebroker"
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/server"
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/telemetry"
@@ -84,9 +87,25 @@ are blocked.`,
 			}
 			tc = telemetry.NewClient(apiURL, cfg.APIKey, logger)
 		}
+		receiptRoot := filepath.Join(filepath.Dir(config.CurrentConfigPath()), "receipts-v2")
+		if cfg.LogPath != "" {
+			receiptRoot = filepath.Join(filepath.Dir(cfg.LogPath), "receipts-v2")
+		}
+		receiptStore, receiptErr := receipt.NewStore(receiptRoot, version)
+		if receiptErr != nil {
+			logger.Warn("signed application receipts unavailable: %v", receiptErr)
+		}
 		if tc != nil {
 			tc.SetMode(cfg.Mode)
 			tc.SetVersion(version)
+			tc.SetRouteContext(
+				os.Getenv(gatewayentry.EnvClientName),
+				os.Getenv(gatewayentry.EnvConfigSourceHash),
+				os.Getenv(gatewayentry.EnvRouteRevision),
+			)
+			if receiptStore != nil {
+				tc.SetReceiptStore(receiptStore)
+			}
 
 			// Build server info for registration
 			tc.SetServers(telemetryServerInfosFromConfig(cfg))
@@ -94,8 +113,6 @@ are blocked.`,
 			tc.SetDiscoveryProvider(func() []telemetry.DiscoveredServerInfo {
 				return discoverTelemetryServers(cwd)
 			})
-			tc.Start()
-			defer tc.Stop()
 		}
 
 		// Create detection engine
@@ -160,12 +177,23 @@ are blocked.`,
 
 		// Create and run proxy
 		p := proxy.NewProxy(proxy.Config{
-			EnforceMode:     cfg.Mode == "enforce",
-			GatewayVersion:  version,
-			Detection:       telemetry.DetectionConfig{Threat: cfg.Detection.Threat, SensitiveData: cfg.Detection.SensitiveData},
-			DetectionEngine: engine,
-			Logger:          logger,
+			EnforceMode:      cfg.Mode == "enforce",
+			GatewayVersion:   version,
+			Detection:        telemetry.DetectionConfig{Threat: cfg.Detection.Threat, SensitiveData: cfg.Detection.SensitiveData},
+			DetectionEngine:  engine,
+			Logger:           logger,
+			ReceiptStore:     receiptStore,
+			ClientName:       os.Getenv(gatewayentry.EnvClientName),
+			ConfigSourceHash: os.Getenv(gatewayentry.EnvConfigSourceHash),
+			RouteRevision:    os.Getenv(gatewayentry.EnvRouteRevision),
 		}, mgr, tc)
+		if tc != nil {
+			tc.SetModeChangeHandler(func(mode string, _ int64) {
+				p.SetEnforceMode(mode == "enforce")
+			})
+			tc.Start()
+			defer tc.Stop()
+		}
 
 		return p.Run()
 	},

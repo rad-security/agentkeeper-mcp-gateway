@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/config"
+	"github.com/rad-security/agentkeeper-mcp-gateway/internal/gatewayentry"
 )
 
 func writeFixture(t *testing.T, path, body string) {
@@ -234,6 +235,83 @@ func TestMigrateMCPFileDoesNotClobberNameCollisions(t *testing.T) {
 	}
 	if byCommand["python3"] == "" || byCommand["python3"] == "atlas" {
 		t.Fatalf("new colliding server did not get unique name: %+v", cfg.Servers)
+	}
+}
+
+func TestMigrateMCPFileWritesSourceBoundObserveRoute(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("AGENTKEEPER_CONFIG", filepath.Join(home, ".config", "agentkeeper-mcp-gateway", "config.json"))
+	t.Setenv(gatewayentry.EnvBinary, filepath.Join(home, "bin", gatewayentry.BinaryName))
+	source := filepath.Join(home, "project", ".mcp.json")
+	writeFixture(t, source, `{
+		"preferences": {"keepCustomerSetting": true},
+		"mcpServers": {"safe": {"command": "node", "args": ["safe.js"]}}
+	}`)
+
+	plan, err := MigrateMCPFile(source, ClientClaudeCode, "project", "project_mcp_json", RouteabilityLocalRoutable, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(plan.SourceHash, "sha256:") || !strings.HasPrefix(plan.RouteRevision, "route:") {
+		t.Fatalf("missing route identity in plan: %+v", plan)
+	}
+
+	data, err := os.ReadFile(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw struct {
+		Preferences map[string]bool               `json:"preferences"`
+		MCPServers  map[string]config.ServerEntry `json:"mcpServers"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	if !raw.Preferences["keepCustomerSetting"] {
+		t.Fatalf("unrelated client setting was not preserved: %s", data)
+	}
+	gw := raw.MCPServers["agentkeeper-mcp-gateway"]
+	if gw.Command != filepath.Join(home, "bin", gatewayentry.BinaryName) || len(gw.Args) != 1 || gw.Args[0] != "server" {
+		t.Fatalf("unexpected gateway command: %+v", gw)
+	}
+	if gw.Env[gatewayentry.EnvClientName] != ClientClaudeCode ||
+		gw.Env[gatewayentry.EnvConfigSourceHash] != plan.SourceHash ||
+		gw.Env[gatewayentry.EnvRouteRevision] != plan.RouteRevision {
+		t.Fatalf("route identity was not written exactly: plan=%+v entry=%+v", plan, gw)
+	}
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Mode != "audit" {
+		t.Fatalf("new gateway route must remain observe/audit by default, got %q", cfg.Mode)
+	}
+}
+
+func TestMigrateMCPFileRepairsLegacyGatewayWithoutRouteIdentity(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("AGENTKEEPER_CONFIG", filepath.Join(home, ".config", "agentkeeper-mcp-gateway", "config.json"))
+	source := filepath.Join(home, "project", ".mcp.json")
+	writeFixture(t, source, `{
+		"mcpServers": {
+			"agentkeeper-mcp-gateway": {"command": "agentkeeper-mcp-gateway", "args": ["server"]}
+		}
+	}`)
+
+	plan, err := MigrateMCPFile(source, ClientClaudeCode, "project", "project_mcp_json", RouteabilityLocalRoutable, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.AlreadyRouted {
+		t.Fatalf("legacy command-only route must be repaired, got %+v", plan)
+	}
+	data, err := os.ReadFile(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), gatewayentry.EnvRouteRevision) {
+		t.Fatalf("repaired route is still missing identity: %s", data)
 	}
 }
 

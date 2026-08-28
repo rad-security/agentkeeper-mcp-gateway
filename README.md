@@ -1,8 +1,8 @@
 # AgentKeeper MCP Gateway
 
-Open-source MCP gateway with threat detection, warn mode, and fail-open design.
+Open-source MCP gateway with threat detection, observe mode, and explicit enforcement.
 
-Sits between any MCP client (Cursor, Claude Code, Windsurf, Copilot) and your MCP servers. Inspects every tool call for threats, sensitive data, and policy violations. Deploys in 60 seconds.
+When an MCP client is explicitly routed through it, AgentKeeper proxies and inspects that MCP traffic for threats, sensitive data, and policy violations. Installing the binary alone does not route or protect a client.
 
 ## Quick Start
 
@@ -13,7 +13,7 @@ curl -fsSL https://www.agentkeeper.dev/install-gateway.sh | bash
 # Preview supported local MCP client migration
 agentkeeper-mcp-gateway configure-ide --dry-run
 
-# Move supported MCP client configs behind Gateway
+# Explicitly move the previewed supported MCP client configs behind Gateway
 agentkeeper-mcp-gateway configure-ide
 
 # Check discovery, routing, auth, and next steps
@@ -84,13 +84,13 @@ files or disposable dashboard keys.
 
 ## Two Modes
 
-**Audit (default):** Full proxy, full visibility, zero blocking. See every tool call, every threat, every server. Zero developer friction.
+**Observe (default; legacy config value `audit`):** Routed calls are inspected and reported, but a deny decision is recorded as `would block` and the downstream call is still forwarded.
 
 ```bash
 agentkeeper-mcp-gateway server
 ```
 
-**Enforce:** Same proxy. Policies enforced — threats blocked or warned per configuration.
+**Enforce:** On traffic actually routed through the process, denied calls are blocked before dispatch and denied results are withheld before returning to the client.
 
 ```bash
 agentkeeper-mcp-gateway server --enforce
@@ -100,16 +100,16 @@ agentkeeper-mcp-gateway server --enforce
 
 When a threat is detected in warn mode, the warning is returned to the AI client as context. The AI sees the threat and can self-correct — no developer interruption, no retry loops.
 
-This is unique to AgentKeeper. Other gateways either block silently or pass through without feedback.
+Warnings are returned as MCP context where the client supports displaying tool output. Client presentation varies and must be certified per supported client/version.
 
-## Fail-Open Design
+## Failure behavior
 
-The gateway never breaks your tools:
+Observe mode prioritizes continuity, but no software can guarantee that a gateway process will never affect a client. Current behavior is:
 
 - Detection error: tool call proceeds, event logged
 - API timeout: falls back to local detection
-- Gateway crash: watchdog spawns pass-through proxy instantly
-- Network down: uses cached policy, queues events
+- Network down: uses the last in-memory policy and durable signed-receipt queue when available
+- Gateway process exit: the client loses that MCP session until its own process lifecycle restarts the configured stdio command; the standalone binary does not currently provide a proven transparent crash pass-through
 
 ## Connect to Dashboard
 
@@ -144,9 +144,9 @@ agentkeeper-mcp-gateway completion zsh|bash|fish
 agentkeeper-mcp-gateway configure-ide [--dry-run] [--ide=claude-code|claude-desktop|cursor|cowork]
 ```
 
-## Zero-touch IDE wiring
+## Explicit IDE routing
 
-`configure-ide` wires every supported local MCP client to the gateway while preserving native OAuth MCP servers that the client must authenticate itself. One command, all supported clients, fully idempotent. This includes Claude Desktop, Claude Code settings, Claude Code user-scoped and project-scoped `~/.claude.json` servers, Cursor, and current Cowork local/plugin/remote MCP sources.
+`configure-ide` discovers supported local MCP client configurations and can route them to the gateway while preserving native OAuth MCP servers that the client must authenticate itself. Preview first, then invoke the write separately. The command covers the declared config sources for Claude Desktop, Claude Code, Cursor, and locally represented Cowork MCP sources; it does not make cloud-only connectors routable.
 
 ```bash
 agentkeeper-mcp-gateway configure-ide --dry-run   # preview; writes nothing
@@ -163,7 +163,7 @@ Supports **Claude Code** (`~/.claude/settings.json`), **Claude Desktop** (macOS 
 4. Rewrites the IDE's `mcpServers` map to include the gateway plus any native-auth servers that must remain direct
 5. Preserves every non-MCP top-level key verbatim (`permissions`, `preferences`, etc.)
 
-A second invocation is a no-op — the command detects a correctly-wired config and skips the write entirely. Safe to run from a login hook, a postinstall script, or on every Kandji reapply.
+A second invocation is a no-op when the exact current Gateway shape is already present. Every write creates a backup and uses a source-hash compare-and-swap check, so a file edited after planning is left unchanged. Package installation must remain stage-only: do not run the applying form from a postinstall script or broad MDM assignment. Managed routing is a separate, explicitly approved activation step after preview and client-state checks.
 
 ## AgentKeeper Linux runtime integration
 
@@ -209,7 +209,7 @@ agentkeeper-mcp-gateway add github "npx -y @modelcontextprotocol/server-github"
 agentkeeper-mcp-gateway add remote https://api.example.com/mcp --header "Authorization:Bearer tok"
 ```
 
-For enterprise rollout, prefer `configure-ide --dry-run`, `configure-ide`, MCP client restart, a real tool call, and `list --health`.
+For an enterprise canary, stage the optional signed artifact without editing client configuration, export/review the dry-run, explicitly activate Observe for named clients, let the user restart naturally, then require a real routed call and signed application receipt. `list --health`, package presence, or a heartbeat alone is not proof of routing or enforcement.
 
 ## Cowork MCP Gateway Routing
 

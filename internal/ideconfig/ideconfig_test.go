@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/config"
+	"github.com/rad-security/agentkeeper-mcp-gateway/internal/gatewayentry"
 )
 
 // writeJSON writes a raw map to path and fails on error. Preserves top-level
@@ -160,7 +161,12 @@ func TestPlan_AlreadyWired(t *testing.T) {
 		"mcpServers": {
 			"agentkeeper-mcp-gateway": {
 				"command": "agentkeeper-mcp-gateway",
-				"args": ["server"]
+				"args": ["server"],
+				"env": {
+					"AGENTKEEPER_MCP_CLIENT": "test-ide",
+					"AGENTKEEPER_MCP_CONFIG_SOURCE_HASH": "sha256:source",
+					"AGENTKEEPER_MCP_ROUTE_REVISION": "route:revision"
+				}
 			}
 		}
 	}`)
@@ -188,7 +194,12 @@ func TestPlan_AlreadyWired_FullPathCommand(t *testing.T) {
 		"mcpServers": {
 			"agentkeeper-mcp-gateway": {
 				"command": "/Users/someone/go/bin/agentkeeper-mcp-gateway",
-				"args": ["server"]
+				"args": ["server"],
+				"env": {
+					"AGENTKEEPER_MCP_CLIENT": "test-ide",
+					"AGENTKEEPER_MCP_CONFIG_SOURCE_HASH": "sha256:source",
+					"AGENTKEEPER_MCP_ROUTE_REVISION": "route:revision"
+				}
 			}
 		}
 	}`)
@@ -200,6 +211,46 @@ func TestPlan_AlreadyWired_FullPathCommand(t *testing.T) {
 	}
 	if !p.AlreadyWired {
 		t.Error("AlreadyWired = false for full-path gateway command; want true")
+	}
+}
+
+func TestPlan_LegacyGatewayWithoutRouteIdentityNeedsRepair(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cfg.json")
+	writeJSON(t, path, `{
+		"mcpServers": {
+			"agentkeeper-mcp-gateway": {
+				"command": "agentkeeper-mcp-gateway",
+				"args": ["server"]
+			}
+		}
+	}`)
+
+	a := mkAdapter(t, path)
+	p, err := a.Plan()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.AlreadyWired || !p.HasGateway {
+		t.Fatalf("legacy command-only route must be repaired: %+v", p)
+	}
+	if err := a.Apply(&p); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	var servers map[string]ServerEntry
+	if err := json.Unmarshal(raw["mcpServers"], &servers); err != nil {
+		t.Fatal(err)
+	}
+	entry := servers[GatewayServerName]
+	if entry.Env[gatewayentry.EnvClientName] != "test-ide" || entry.Env[gatewayentry.EnvRouteRevision] == "" {
+		t.Fatalf("repair did not add route identity: %+v", entry)
 	}
 }
 
@@ -362,6 +413,9 @@ func TestApply_BacksUpThenWrites(t *testing.T) {
 	if gw.Command != "agentkeeper-mcp-gateway" || len(gw.Args) != 1 || gw.Args[0] != "server" {
 		t.Errorf("gateway entry wrong shape: %+v", gw)
 	}
+	if gw.Env[gatewayentry.EnvClientName] != "test-ide" || gw.Env[gatewayentry.EnvConfigSourceHash] != p.SourceHash || gw.Env[gatewayentry.EnvRouteRevision] != p.RouteRevision {
+		t.Errorf("gateway entry missing route evidence binding: %+v plan=%+v", gw.Env, p)
+	}
 }
 
 func TestApply_AlreadyWired_IsNoop(t *testing.T) {
@@ -371,7 +425,12 @@ func TestApply_AlreadyWired_IsNoop(t *testing.T) {
   "mcpServers": {
     "agentkeeper-mcp-gateway": {
       "command": "agentkeeper-mcp-gateway",
-      "args": ["server"]
+      "args": ["server"],
+      "env": {
+        "AGENTKEEPER_MCP_CLIENT": "test-ide",
+        "AGENTKEEPER_MCP_CONFIG_SOURCE_HASH": "sha256:source",
+        "AGENTKEEPER_MCP_ROUTE_REVISION": "route:revision"
+      }
     }
   }
 }`
@@ -426,6 +485,51 @@ func TestApply_MissingFile_CreatesParent(t *testing.T) {
 	}
 	if _, ok := got["mcpServers"][GatewayServerName]; !ok {
 		t.Errorf("gateway entry not present after creating fresh config: %+v", got)
+	}
+}
+
+func TestApply_RefusesConcurrentConfigEdit(t *testing.T) {
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "cfg.json")
+	writeJSON(t, path, `{"mcpServers":{"github":{"command":"npx"}}}`)
+	a := mkAdapter(t, path)
+	p, err := a.Plan()
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed := `{"mcpServers":{"github":{"command":"npx"},"new-server":{"command":"node"}}}`
+	writeJSON(t, path, changed)
+	if err := a.Apply(&p); err == nil || !strings.Contains(err.Error(), "changed after preview") {
+		t.Fatalf("expected compare-and-swap refusal, got %v", err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != changed {
+		t.Fatalf("concurrent config was changed: %s", got)
+	}
+}
+
+func TestApply_RefusesFileCreatedAfterPreview(t *testing.T) {
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "cfg.json")
+	a := mkAdapter(t, path)
+	p, err := a.Plan()
+	if err != nil {
+		t.Fatal(err)
+	}
+	created := `{"mcpServers":{"customer-server":{"command":"node"}}}`
+	writeJSON(t, path, created)
+	if err := a.Apply(&p); err == nil || !strings.Contains(err.Error(), "appeared after preview") {
+		t.Fatalf("expected compare-and-swap refusal, got %v", err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != created {
+		t.Fatalf("new config was changed: %s", got)
 	}
 }
 

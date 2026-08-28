@@ -9,6 +9,7 @@ import (
 
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/detection"
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/logging"
+	"github.com/rad-security/agentkeeper-mcp-gateway/internal/receipt"
 )
 
 func TestSyncPayloadIncludesDiscoveredServers(t *testing.T) {
@@ -88,7 +89,7 @@ func TestEvaluatePayloadIncludesMachineID(t *testing.T) {
 	client := NewClient(srv.URL, "test-key", nil)
 	client.gatewayID = "gw_test"
 
-	result := client.Evaluate("atlas", "search", map[string]interface{}{"query": "test"})
+	result := client.Evaluate("atlas", "search", map[string]interface{}{"query": "test"}, "call-test-1", "attempt-test-1")
 	if result == nil || result.Verdict != "pass" {
 		t.Fatalf("unexpected evaluate result: %#v", result)
 	}
@@ -97,6 +98,59 @@ func TestEvaluatePayloadIncludesMachineID(t *testing.T) {
 	}
 	if captured["gateway_id"] != "gw_test" {
 		t.Fatalf("gateway_id = %#v, want gw_test", captured["gateway_id"])
+	}
+}
+
+func TestEvaluateV2DoesNotDoubleTimeoutOnServerFailure(t *testing.T) {
+	store, err := receipt.NewStore(filepath.Join(t.TempDir(), "receipts"), "0.2.0-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	requests := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if r.URL.Path != "/api/v2/mcp/evaluate" {
+			t.Fatalf("unexpected legacy retry after v2 server failure: %s", r.URL.Path)
+		}
+		http.Error(w, "temporarily unavailable", http.StatusBadGateway)
+	}))
+	defer srv.Close()
+
+	client := NewClient(srv.URL, "test-key", nil)
+	client.SetReceiptStore(store)
+	if result := client.Evaluate("atlas", "search", nil, "call-test-1", "attempt-test-1"); result != nil {
+		t.Fatalf("failed connected evaluation should return nil for local fallback, got %#v", result)
+	}
+	if requests != 1 {
+		t.Fatalf("server failure should make one request, got %d", requests)
+	}
+}
+
+func TestEvaluateV2FallsBackWhenEndpointIsUnsupported(t *testing.T) {
+	store, err := receipt.NewStore(filepath.Join(t.TempDir(), "receipts"), "0.2.0-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	paths := make([]string, 0, 2)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		if r.URL.Path == "/api/v2/mcp/evaluate" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"verdict":"pass"}`))
+	}))
+	defer srv.Close()
+
+	client := NewClient(srv.URL, "test-key", nil)
+	client.SetReceiptStore(store)
+	result := client.Evaluate("atlas", "search", nil, "call-test-1", "attempt-test-1")
+	if result == nil || result.Verdict != "pass" {
+		t.Fatalf("legacy fallback result = %#v", result)
+	}
+	if len(paths) != 2 || paths[0] != "/api/v2/mcp/evaluate" || paths[1] != "/api/v1/mcp/evaluate" {
+		t.Fatalf("unexpected fallback path sequence: %v", paths)
 	}
 }
 
@@ -228,5 +282,82 @@ func TestFlushUploadsOnlyDashboardIngestableEvents(t *testing.T) {
 	}
 	if remaining := logger.FlushBuffer(); len(remaining) != 0 {
 		t.Fatalf("expected acknowledged buffer to be empty, got %+v", remaining)
+	}
+}
+
+func TestSignedReceiptRegistrationAndPerItemAcknowledgment(t *testing.T) {
+	t.Setenv("AGENTKEEPER_MACHINE_ID", "machine-receipt-1")
+	store, err := receipt.NewStore(t.TempDir(), "0.2.0-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	registered := false
+	uploaded := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/v2/mcp/gateways/register":
+			var payload map[string]interface{}
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				t.Fatal(err)
+			}
+			if payload["effective_mode"] != "observe" || payload["signer_key_id"] != store.SignerKeyID() {
+				t.Fatalf("unexpected registration: %#v", payload)
+			}
+			registered = true
+			_, _ = w.Write([]byte(`{"ok":true,"gateway_id":"11111111-1111-4111-8111-111111111111","route_assignment":{"desired_mode":"enforce","desired_revision":7}}`))
+		case "/api/v1/mcp/sync":
+			_, _ = w.Write([]byte(`{"ok":true,"gateway_id":"11111111-1111-4111-8111-111111111111","policy":{"mode":"audit"}}`))
+		case "/api/v2/mcp/receipts":
+			var payload struct {
+				GatewayID string             `json:"gateway_id"`
+				Receipts  []receipt.Envelope `json:"receipts"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				t.Fatal(err)
+			}
+			if len(payload.Receipts) != 1 || payload.Receipts[0].AppliedDisposition != "result_returned" {
+				t.Fatalf("unexpected receipts: %+v", payload.Receipts)
+			}
+			uploaded = true
+			_, _ = w.Write([]byte(`{"ok":true,"acks":[{"receipt_id":"` + payload.Receipts[0].ReceiptID + `","status":"accepted"}]}`))
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	client := NewClient(srv.URL, "test-key", nil)
+	client.SetVersion("0.2.0-test")
+	client.SetReceiptStore(store)
+	client.SetRouteContext("claude-desktop", "sha256:source", "route:test")
+	appliedMode := ""
+	var appliedRevision int64
+	client.SetModeChangeHandler(func(mode string, revision int64) {
+		appliedMode = mode
+		appliedRevision = revision
+	})
+	client.sync()
+	if appliedMode != "enforce" || appliedRevision != 7 {
+		t.Fatalf("route assignment not applied: mode=%q revision=%d", appliedMode, appliedRevision)
+	}
+	if mode, revision := client.currentMode(); mode != "enforce" || revision != 7 {
+		t.Fatalf("effective assignment not retained: mode=%q revision=%d", mode, revision)
+	}
+	client.RecordReceipt(receipt.Input{
+		CallID: "call-12345678", AttemptID: "attempt-12345678", Phase: "terminal",
+		ServerName: "atlas", ToolName: "search", PolicyDecision: "pass",
+		EvaluationStatus: "evaluated", RequiredDisposition: "forward",
+		AppliedDisposition: "result_returned", EffectiveMode: "observe",
+		Dispatched: true, ResultReceived: true, ResultReturned: true, Terminal: true,
+	})
+	client.flushReceipts()
+
+	if !registered || !uploaded {
+		t.Fatalf("registered=%v uploaded=%v", registered, uploaded)
+	}
+	queued, err := store.Peek(100)
+	if err != nil || len(queued) != 0 {
+		t.Fatalf("queue after ack=%+v err=%v", queued, err)
 	}
 }

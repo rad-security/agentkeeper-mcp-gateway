@@ -25,6 +25,28 @@ type Event struct {
 	Context     map[string]interface{} `json:"context,omitempty"`
 }
 
+// ToolCallOutcome records the policy decision separately from what the
+// gateway actually did. A block decision in Observe mode is still forwarded;
+// callers must never infer enforcement from Verdict alone.
+type ToolCallOutcome struct {
+	CallID              string
+	AttemptID           string
+	DecisionID          string
+	ClientName          string
+	ConfigSourceHash    string
+	RouteRevision       string
+	Mode                string
+	PolicyDecision      string
+	EvaluationStatus    string
+	RequiredDisposition string
+	AppliedDisposition  string
+	Dispatched          bool
+	ResultReceived      bool
+	ResultReturned      bool
+	ResponseWithheld    bool
+	FailureReason       string
+}
+
 // Logger writes structured events to a JSONL file.
 type Logger struct {
 	file    *os.File
@@ -69,9 +91,55 @@ func newBufferedLogger(file *os.File, logPath string, verbose bool) *Logger {
 
 // LogToolCall logs an MCP tool call event.
 func (l *Logger) LogToolCall(serverName, toolName string, params map[string]interface{}, result detection.Result) {
+	l.LogToolCallOutcome(serverName, toolName, params, result, ToolCallOutcome{})
+}
+
+// LogToolCallOutcome logs one terminal, correlation-safe MCP call event.
+func (l *Logger) LogToolCallOutcome(serverName, toolName string, params map[string]interface{}, result detection.Result, outcome ToolCallOutcome) {
 	verdict := result.Verdict
 	if verdict == "" {
 		verdict = detection.VerdictPass
+	}
+	context := map[string]interface{}{}
+	if outcome.CallID != "" {
+		context["tool_call_id"] = outcome.CallID
+	}
+	if outcome.AttemptID != "" {
+		context["attempt_id"] = outcome.AttemptID
+	}
+	if outcome.DecisionID != "" {
+		context["decision_id"] = outcome.DecisionID
+	}
+	if outcome.ClientName != "" {
+		context["client_name"] = outcome.ClientName
+	}
+	if outcome.ConfigSourceHash != "" {
+		context["config_source_hash"] = outcome.ConfigSourceHash
+	}
+	if outcome.RouteRevision != "" {
+		context["route_revision"] = outcome.RouteRevision
+	}
+	if outcome.Mode != "" {
+		context["effective_mode"] = outcome.Mode
+	}
+	if outcome.PolicyDecision != "" {
+		context["policy_decision"] = outcome.PolicyDecision
+	}
+	if outcome.EvaluationStatus != "" {
+		context["evaluation_status"] = outcome.EvaluationStatus
+	}
+	if outcome.RequiredDisposition != "" {
+		context["required_disposition"] = outcome.RequiredDisposition
+	}
+	if outcome.AppliedDisposition != "" {
+		context["applied_disposition"] = outcome.AppliedDisposition
+	}
+	context["dispatched"] = outcome.Dispatched
+	context["result_received"] = outcome.ResultReceived
+	context["result_returned"] = outcome.ResultReturned
+	context["response_withheld"] = outcome.ResponseWithheld
+	if outcome.FailureReason != "" {
+		context["failure_reason"] = outcome.FailureReason
 	}
 	event := Event{
 		Timestamp:   time.Now().UTC().Format(time.RFC3339Nano),
@@ -83,6 +151,7 @@ func (l *Logger) LogToolCall(serverName, toolName string, params map[string]inte
 		PatternName: result.PatternName,
 		Category:    result.Category,
 		Description: result.Description,
+		Context:     context,
 	}
 
 	l.writeEvent(event)

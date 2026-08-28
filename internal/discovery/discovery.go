@@ -431,7 +431,11 @@ func MigrateClaudeJSONProjects(dryRun bool) (MigrationPlan, error) {
 		}
 	}
 
-	plan := MigrationPlan{Client: ClientClaudeCode, Scope: "projects", ConfigPath: path}
+	sourceHash, routeRevision := gatewayentry.RouteIdentity(ClientClaudeCode, data)
+	plan := MigrationPlan{
+		Client: ClientClaudeCode, Scope: "projects", ConfigPath: path,
+		SourceHash: sourceHash, RouteRevision: routeRevision,
+	}
 	if len(projects) == 0 {
 		return plan, nil
 	}
@@ -478,6 +482,9 @@ func MigrateClaudeJSONProjects(dryRun bool) (MigrationPlan, error) {
 	if dryRun {
 		return plan, nil
 	}
+	if err := verifySourceUnchanged(path, sourceHash); err != nil {
+		return plan, err
+	}
 
 	backup, err := configbackup.Write(path, data)
 	if err != nil {
@@ -506,7 +513,7 @@ func MigrateClaudeJSONProjects(dryRun bool) (MigrationPlan, error) {
 			plan.Migrated = append(plan.Migrated, s)
 		}
 		newServers := map[string]config.ServerEntry{
-			"agentkeeper-mcp-gateway": gatewayServerEntry(),
+			"agentkeeper-mcp-gateway": gatewayServerEntry(plan),
 		}
 		for _, s := range preserveByProject[project] {
 			entry := s.Entry
@@ -655,6 +662,11 @@ func ensureCoworkGatewayEntrypoint(home string, dryRun bool) (MigrationPlan, err
 
 	raw := map[string]json.RawMessage{}
 	exists := err == nil
+	identitySource := data
+	if !exists {
+		identitySource = []byte("absent")
+	}
+	plan.SourceHash, plan.RouteRevision = gatewayentry.RouteIdentity(ClientCowork, identitySource)
 	if exists && len(data) > 0 {
 		if err := json.Unmarshal(data, &raw); err != nil {
 			return plan, err
@@ -676,6 +688,15 @@ func ensureCoworkGatewayEntrypoint(home string, dryRun bool) (MigrationPlan, err
 	if dryRun {
 		return plan, nil
 	}
+	if exists {
+		if err := verifySourceUnchanged(path, plan.SourceHash); err != nil {
+			return plan, err
+		}
+	} else if _, err := os.Stat(path); err == nil {
+		return plan, fmt.Errorf("configuration appeared after preview for %s; refusing to write", path)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return plan, fmt.Errorf("checking %s before apply: %w", path, err)
+	}
 
 	if exists {
 		backup, err := configbackup.Write(path, data)
@@ -685,7 +706,7 @@ func ensureCoworkGatewayEntrypoint(home string, dryRun bool) (MigrationPlan, err
 		plan.BackupPath = backup
 	}
 
-	servers["agentkeeper-mcp-gateway"] = gatewayServerEntry()
+	servers["agentkeeper-mcp-gateway"] = gatewayServerEntry(plan)
 	encoded, err := json.Marshal(servers)
 	if err != nil {
 		return plan, err
@@ -861,6 +882,10 @@ func MigrateMCPFile(path, client, scope, sourceKind, routeability string, dryRun
 func migrateMCPFile(path, client, scope, sourceKind, routeability string, dryRun, allowGitWorktree bool) (MigrationPlan, error) {
 	servers := readMCPServers(path, client, scope, sourceKind, routeability)
 	plan := MigrationPlan{Client: client, Scope: scope, ConfigPath: path, Servers: servers}
+	data, readErr := os.ReadFile(path)
+	if readErr == nil {
+		plan.SourceHash, plan.RouteRevision = gatewayentry.RouteIdentity(client, data)
+	}
 	if len(servers) == 0 {
 		return plan, nil
 	}
@@ -903,8 +928,10 @@ func migrateMCPFile(path, client, scope, sourceKind, routeability string, dryRun
 		return plan, nil
 	}
 
-	data, err := os.ReadFile(path)
-	if err != nil {
+	if readErr != nil {
+		return plan, readErr
+	}
+	if err := verifySourceUnchanged(path, plan.SourceHash); err != nil {
 		return plan, err
 	}
 	var raw map[string]json.RawMessage
@@ -934,7 +961,7 @@ func migrateMCPFile(path, client, scope, sourceKind, routeability string, dryRun
 	}
 
 	newServers := map[string]config.ServerEntry{
-		"agentkeeper-mcp-gateway": gatewayServerEntry(),
+		"agentkeeper-mcp-gateway": gatewayServerEntry(plan),
 	}
 	for _, s := range nativeKept {
 		entry := s.Entry
@@ -971,16 +998,35 @@ type MigrationPlan struct {
 	NativeKept     []DiscoveredServer `json:"native_kept,omitempty"`
 	NativeDisabled []DiscoveredServer `json:"native_disabled,omitempty"`
 	AlreadyRouted  bool               `json:"already_routed,omitempty"`
+	SourceHash     string             `json:"source_hash,omitempty"`
+	RouteRevision  string             `json:"route_revision,omitempty"`
 	// SkippedGitWorktree is set when the source file needed a rewrite but sits
 	// inside a git worktree, so the migration refused to touch it.
 	SkippedGitWorktree bool `json:"skipped_git_worktree,omitempty"`
 }
 
-func gatewayServerEntry() config.ServerEntry {
+func gatewayServerEntry(plan MigrationPlan) config.ServerEntry {
 	return config.ServerEntry{
 		Command: gatewayentry.Command(),
 		Args:    []string{"server"},
+		Env: map[string]string{
+			gatewayentry.EnvClientName:       plan.Client,
+			gatewayentry.EnvConfigSourceHash: plan.SourceHash,
+			gatewayentry.EnvRouteRevision:    plan.RouteRevision,
+		},
 	}
+}
+
+func verifySourceUnchanged(path, expectedHash string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("re-reading %s for apply: %w", path, err)
+	}
+	actualHash, _ := gatewayentry.RouteIdentity("", data)
+	if expectedHash == "" || actualHash != expectedHash {
+		return fmt.Errorf("configuration changed after preview for %s; refusing to write (expected %s, observed %s)", path, expectedHash, actualHash)
+	}
+	return nil
 }
 
 func addServerWithoutClobber(entry config.ServerEntry, sourceKey string) (string, error) {
@@ -1140,7 +1186,10 @@ func sanitizeName(name string) string {
 }
 
 func isGatewayEntry(entry config.ServerEntry) bool {
-	return gatewayentry.IsCurrentGatewayCommand(entry.Command) && len(entry.Args) > 0 && entry.Args[0] == "server"
+	return gatewayentry.IsCurrentGatewayCommand(entry.Command) && len(entry.Args) == 1 && entry.Args[0] == "server" &&
+		strings.TrimSpace(entry.Env[gatewayentry.EnvClientName]) != "" &&
+		strings.TrimSpace(entry.Env[gatewayentry.EnvConfigSourceHash]) != "" &&
+		strings.TrimSpace(entry.Env[gatewayentry.EnvRouteRevision]) != ""
 }
 
 func isStaleGatewayEntry(server DiscoveredServer) bool {
