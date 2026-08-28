@@ -107,3 +107,50 @@ func TestNewLoggerFailsOpenWhenLocalPathIsUnwritable(t *testing.T) {
 		t.Fatalf("unexpected buffered event: %+v", events[0])
 	}
 }
+
+func TestNewLoggerCreatesAndRepairsOwnerOnlyEventLog(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "events.jsonl")
+	if err := os.WriteFile(logPath, []byte("existing\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	logger, err := NewLogger(logPath, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer logger.Close()
+	info, err := os.Stat(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("event log mode = %04o, want 0600", got)
+	}
+}
+
+func TestNewLoggerRefusesSymlinkLogPath(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target.jsonl")
+	if err := os.WriteFile(target, []byte("sentinel\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "events.jsonl")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	logger, err := NewLogger(link, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer logger.Close()
+	logger.LogToolCall("mock", "echo", nil, detection.Result{})
+	contents, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(contents) != "sentinel\n" {
+		t.Fatalf("symlink target was modified: %q", contents)
+	}
+	if len(logger.FlushBuffer()) != 1 {
+		t.Fatal("remote telemetry buffer should remain available when local symlink is refused")
+	}
+}

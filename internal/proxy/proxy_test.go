@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/detection"
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/logging"
@@ -134,13 +135,13 @@ func TestLocalObservePersistsSignedRouteReceiptWithoutTelemetry(t *testing.T) {
 }
 
 func TestProtocolNegotiationSupportsCurrentAndLegacyVersions(t *testing.T) {
-	for _, version := range []string{"2024-11-05", "2025-03-26", "2025-06-18"} {
+	for _, version := range []string{"2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"} {
 		params, _ := json.Marshal(map[string]interface{}{"protocolVersion": version})
 		if got := negotiateProtocolVersion(params); got != version {
 			t.Fatalf("version %s negotiated as %s", version, got)
 		}
 	}
-	if got := negotiateProtocolVersion(json.RawMessage(`{"protocolVersion":"future"}`)); got != "2024-11-05" {
+	if got := negotiateProtocolVersion(json.RawMessage(`{"protocolVersion":"future"}`)); got != "2025-11-25" {
 		t.Fatalf("unknown version fallback = %s", got)
 	}
 }
@@ -161,12 +162,14 @@ func TestResourcesAndPromptsAreAggregatedAndRoutedThroughGateway(t *testing.T) {
 		var result interface{} = map[string]interface{}{}
 		switch rpc.Method {
 		case "initialize":
-			result = map[string]interface{}{"protocolVersion": "2024-11-05", "capabilities": map[string]interface{}{}}
+			result = map[string]interface{}{"protocolVersion": "2025-11-25", "capabilities": map[string]interface{}{"resources": map[string]interface{}{}, "prompts": map[string]interface{}{}}}
 		case "resources/list":
 			result = map[string]interface{}{"resources": []interface{}{map[string]interface{}{"uri": "file:///safe/readme.md", "name": "README"}}}
 		case "resources/read":
 			resourceReadURI, _ = rpc.Params["uri"].(string)
 			result = map[string]interface{}{"contents": []interface{}{map[string]interface{}{"uri": resourceReadURI, "text": "safe"}}}
+		case "resources/templates/list":
+			result = map[string]interface{}{"resourceTemplates": []interface{}{map[string]interface{}{"name": "record", "uriTemplate": "qa://records/{id}"}}}
 		case "prompts/list":
 			result = map[string]interface{}{"prompts": []interface{}{map[string]interface{}{"name": "summarize", "description": "Summarize"}}}
 		case "prompts/get":
@@ -202,6 +205,27 @@ func TestResourcesAndPromptsAreAggregatedAndRoutedThroughGateway(t *testing.T) {
 		t.Fatalf("resource routed with uri=%q", resourceReadURI)
 	}
 
+	templatesResponse, err := p.handleResourceTemplatesList(JSONRPCMessage{JSONRPC: "2.0", ID: &id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var templates struct {
+		ResourceTemplates []map[string]interface{} `json:"resourceTemplates"`
+	}
+	if err := json.Unmarshal(templatesResponse.Result, &templates); err != nil || len(templates.ResourceTemplates) != 1 {
+		t.Fatalf("resource templates=%+v err=%v", templates.ResourceTemplates, err)
+	}
+	if templates.ResourceTemplates[0]["name"] != "atlas__record" || templates.ResourceTemplates[0]["uriTemplate"] != "qa://records/{id}" {
+		t.Fatalf("unexpected namespaced resource template: %+v", templates.ResourceTemplates[0])
+	}
+	templateReadParams, _ := json.Marshal(map[string]interface{}{"uri": "qa://records/42"})
+	if _, err := p.handleResourcesRead(JSONRPCMessage{JSONRPC: "2.0", ID: &id, Params: templateReadParams}); err != nil {
+		t.Fatal(err)
+	}
+	if resourceReadURI != "qa://records/42" {
+		t.Fatalf("templated resource routed with uri=%q", resourceReadURI)
+	}
+
 	promptsResponse, err := p.handlePromptsList(JSONRPCMessage{JSONRPC: "2.0", ID: &id})
 	if err != nil {
 		t.Fatal(err)
@@ -221,6 +245,102 @@ func TestResourcesAndPromptsAreAggregatedAndRoutedThroughGateway(t *testing.T) {
 	}
 	if promptGetName != "summarize" {
 		t.Fatalf("prompt routed with name=%q", promptGetName)
+	}
+}
+
+func TestCapabilityMismatchReturnsEmptyContentListsWithoutCallingBackendMethod(t *testing.T) {
+	var methods []string
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var rpc struct {
+			ID     int64  `json:"id"`
+			Method string `json:"method"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&rpc); err != nil {
+			t.Fatal(err)
+		}
+		methods = append(methods, rpc.Method)
+		switch rpc.Method {
+		case "initialize":
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"jsonrpc": "2.0", "id": rpc.ID, "result": map[string]interface{}{
+				"protocolVersion": "2025-11-25",
+				"capabilities":    map[string]interface{}{"tools": map[string]interface{}{}},
+			}})
+		case "notifications/initialized":
+			w.WriteHeader(http.StatusAccepted)
+		default:
+			t.Fatalf("capability-mismatched backend received %s", rpc.Method)
+		}
+	}))
+	defer backend.Close()
+	mgr := server.NewManager([]server.ServerConfig{{Name: "tools-only", Transport: "http", URL: backend.URL}})
+	if err := mgr.StartAll(); err != nil {
+		t.Fatal(err)
+	}
+	p := NewProxy(Config{}, mgr, nil)
+	defer p.Close()
+	id := json.RawMessage(`1`)
+	started := time.Now()
+	resources, err := p.handleResourcesList(JSONRPCMessage{JSONRPC: "2.0", ID: &id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if time.Since(started) > time.Second || !strings.Contains(string(resources.Result), `"resources":[]`) {
+		t.Fatalf("resources mismatch did not return immediately: result=%s elapsed=%s", resources.Result, time.Since(started))
+	}
+	if _, err := p.handlePromptsList(JSONRPCMessage{JSONRPC: "2.0", ID: &id}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.handleResourceTemplatesList(JSONRPCMessage{JSONRPC: "2.0", ID: &id}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(methods, ",") != "initialize,notifications/initialized" {
+		t.Fatalf("unsupported content method was invoked: %v", methods)
+	}
+}
+
+func TestProxyCloseCancelsBackgroundToolRefresh(t *testing.T) {
+	backend := filepath.Join(t.TempDir(), "hung-tools.sh")
+	if err := os.WriteFile(backend, []byte(`#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *\"method\":\"initialize\"*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}}}}' ;;
+    *\"method\":\"tools/list\"*) sleep 30 ;;
+  esac
+done
+`), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	mgr := server.NewManager([]server.ServerConfig{{Name: "hung", Command: backend}})
+	p := NewProxy(Config{}, mgr, nil)
+	id := json.RawMessage(`1`)
+	params := json.RawMessage(`{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"qa","version":"1"}}`)
+	if _, err := p.handleInitialize(JSONRPCMessage{JSONRPC: "2.0", ID: &id, Params: params}); err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	p.Close()
+	if time.Since(started) > time.Second {
+		t.Fatalf("proxy shutdown waited for backend discovery timeout: %s", time.Since(started))
+	}
+	mgr.StopAll()
+}
+
+func TestResourceTemplateRoutingSupportsSimpleVariablesWithoutGuessing(t *testing.T) {
+	matcher := compileResourceTemplate("qa://records/{id}")
+	if matcher == nil || !matcher.MatchString("qa://records/42") || matcher.MatchString("qa://records/42/child") {
+		t.Fatalf("unexpected simple resource-template matcher: %v", matcher)
+	}
+	for _, unsupported := range []string{"qa://records/{?id}", "qa://records/{id,name}", "qa://records/{id"} {
+		if compileResourceTemplate(unsupported) != nil {
+			t.Fatalf("unsupported template %q was accepted", unsupported)
+		}
+	}
+	routes := []resourceTemplateRoute{
+		{ServerName: "one", Matcher: matcher},
+		{ServerName: "two", Matcher: matcher},
+	}
+	if _, ok := resolveResourceTemplateRoute("qa://records/42", routes); ok {
+		t.Fatal("ambiguous resource template route should not select a backend")
 	}
 }
 

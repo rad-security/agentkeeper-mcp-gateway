@@ -1,14 +1,50 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestStartServerPreservesExecutablePathContainingSpaces(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "MCP Server With Spaces")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	backend := filepath.Join(dir, "harmless backend")
+	if err := os.WriteFile(backend, []byte("#!/bin/sh\nwhile IFS= read -r line; do :; done\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	mgr := NewManager([]ServerConfig{{Name: "space-path", Command: backend}})
+	if err := mgr.StartAll(); err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.StopAll()
+	srv := mgr.Get("space-path")
+	if srv == nil || srv.cmd == nil {
+		t.Fatal("server with a valid executable path containing spaces was not started")
+	}
+	if srv.cmd.Path != backend {
+		t.Fatalf("command path = %q, want exact %q", srv.cmd.Path, backend)
+	}
+}
+
+func TestResolveCommandRetainsLegacyPATHCommandString(t *testing.T) {
+	command, args, err := resolveCommand(ServerConfig{Name: "legacy", Command: "sh -c", Args: []string{"exit 0"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if command != "sh" || strings.Join(args, "|") != "-c|exit 0" {
+		t.Fatalf("legacy command resolved as command=%q args=%v", command, args)
+	}
+}
 
 func TestStartAllSkipsInvalidServersAndKeepsHealthyHTTP(t *testing.T) {
 	mgr := NewManager([]ServerConfig{
@@ -31,6 +67,7 @@ func TestStartAllSkipsInvalidServersAndKeepsHealthyHTTP(t *testing.T) {
 func TestHTTPServerInitializeAndListTools(t *testing.T) {
 	var sawAuth bool
 	var sawSession bool
+	var sawProtocol bool
 	httpSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") == "Bearer test" {
 			sawAuth = true
@@ -48,13 +85,16 @@ func TestHTTPServerInitializeAndListTools(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"jsonrpc": "2.0",
 				"id":      req.ID,
-				"result":  map[string]any{"capabilities": map[string]any{}},
+				"result":  map[string]any{"protocolVersion": latestProtocolVersion, "capabilities": map[string]any{"tools": map[string]any{}}},
 			})
 		case "notifications/initialized":
 			w.WriteHeader(http.StatusAccepted)
 		case "tools/list":
 			if r.Header.Get("Mcp-Session-Id") == "session-1" {
 				sawSession = true
+			}
+			if r.Header.Get("MCP-Protocol-Version") == latestProtocolVersion {
+				sawProtocol = true
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"jsonrpc": "2.0",
@@ -101,6 +141,9 @@ func TestHTTPServerInitializeAndListTools(t *testing.T) {
 	if !sawSession {
 		t.Fatal("MCP session header from initialize was not reused")
 	}
+	if !sawProtocol {
+		t.Fatal("negotiated MCP protocol header was not sent after initialize")
+	}
 }
 
 func TestHTTPServerListToolsLazyInitializes(t *testing.T) {
@@ -120,7 +163,7 @@ func TestHTTPServerListToolsLazyInitializes(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"jsonrpc": "2.0",
 				"id":      req.ID,
-				"result":  map[string]any{"capabilities": map[string]any{}},
+				"result":  map[string]any{"protocolVersion": latestProtocolVersion, "capabilities": map[string]any{"tools": map[string]any{}}},
 			})
 		case "notifications/initialized":
 			if req.ID != 0 {
@@ -177,7 +220,7 @@ func TestHTTPServerParsesSSEToolList(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"jsonrpc": "2.0",
 				"id":      req.ID,
-				"result":  map[string]any{"capabilities": map[string]any{}},
+				"result":  map[string]any{"protocolVersion": latestProtocolVersion, "capabilities": map[string]any{"tools": map[string]any{}}},
 			})
 			return
 		case "notifications/initialized":
@@ -225,7 +268,7 @@ func TestHTTPServerReturnsJSONRPCResultOnHTTPUnauthorized(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"jsonrpc": "2.0",
 				"id":      req.ID,
-				"result":  map[string]any{"capabilities": map[string]any{}},
+				"result":  map[string]any{"protocolVersion": latestProtocolVersion, "capabilities": map[string]any{"tools": map[string]any{}}},
 			})
 		case "notifications/initialized":
 			w.WriteHeader(http.StatusAccepted)
@@ -301,5 +344,108 @@ func TestDiscoveryTimeoutsTolerateSlowEnterpriseBackends(t *testing.T) {
 	}
 	if backendDiscoveryTimeout < 20*time.Second {
 		t.Fatalf("discovery timeout regressed below enterprise backend floor: %s", backendDiscoveryTimeout)
+	}
+}
+
+func TestExplicitCapabilitiesSkipUnsupportedResourceMethod(t *testing.T) {
+	var methods []string
+	httpSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			ID     int64  `json:"id"`
+			Method string `json:"method"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatal(err)
+		}
+		methods = append(methods, req.Method)
+		switch req.Method {
+		case "initialize":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"jsonrpc": "2.0",
+				"id":      req.ID,
+				"result": map[string]any{
+					"protocolVersion": latestProtocolVersion,
+					"capabilities":    map[string]any{"tools": map[string]any{}},
+				},
+			})
+		case "notifications/initialized":
+			w.WriteHeader(http.StatusAccepted)
+		default:
+			t.Fatalf("unsupported method was called: %s", req.Method)
+		}
+	}))
+	defer httpSrv.Close()
+
+	mgr := NewManager([]ServerConfig{{Name: "tools-only", Transport: "http", URL: httpSrv.URL}})
+	if err := mgr.StartAll(); err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	resources, err := mgr.Get("tools-only").ListResources()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resources) != 0 || time.Since(started) > time.Second {
+		t.Fatalf("unsupported resource list did not return immediately: resources=%v elapsed=%s", resources, time.Since(started))
+	}
+	if strings.Join(methods, ",") != "initialize,notifications/initialized" {
+		t.Fatalf("methods = %v", methods)
+	}
+}
+
+func TestResourceTemplatesUseDeclaredResourceCapability(t *testing.T) {
+	httpSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			ID     int64  `json:"id"`
+			Method string `json:"method"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatal(err)
+		}
+		switch req.Method {
+		case "initialize":
+			_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": req.ID, "result": map[string]any{
+				"protocolVersion": latestProtocolVersion,
+				"capabilities":    map[string]any{"resources": map[string]any{}},
+			}})
+		case "notifications/initialized":
+			w.WriteHeader(http.StatusAccepted)
+		case "resources/templates/list":
+			_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": req.ID, "result": map[string]any{
+				"resourceTemplates": []map[string]any{{"name": "record", "uriTemplate": "qa://records/{id}"}},
+			}})
+		default:
+			t.Fatalf("unexpected method %s", req.Method)
+		}
+	}))
+	defer httpSrv.Close()
+	mgr := NewManager([]ServerConfig{{Name: "resources", Transport: "http", URL: httpSrv.URL}})
+	if err := mgr.StartAll(); err != nil {
+		t.Fatal(err)
+	}
+	templates, err := mgr.Get("resources").ListResourceTemplates()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(templates) != 1 {
+		t.Fatalf("templates = %+v", templates)
+	}
+}
+
+func TestContextCancellationStopsPendingDiscovery(t *testing.T) {
+	mgr := NewManager([]ServerConfig{{Name: "hung", Command: "sh", Args: []string{"-c", `while IFS= read -r line; do case "$line" in *\"method\":\"initialize\"*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{"resources":{}}}}' ;; *\"method\":\"resources/list\"*) sleep 30 ;; esac; done`}}})
+	if err := mgr.StartAll(); err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.StopAll()
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	_, err := mgr.Get("hung").ListResourcesContext(ctx)
+	if err == nil || !strings.Contains(err.Error(), "deadline exceeded") {
+		t.Fatalf("expected context deadline, got %v", err)
+	}
+	if time.Since(started) > time.Second {
+		t.Fatalf("cancellation took too long: %s", time.Since(started))
 	}
 }

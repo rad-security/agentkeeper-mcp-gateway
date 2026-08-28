@@ -5,12 +5,14 @@ package server
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -18,6 +20,7 @@ import (
 )
 
 const (
+	latestProtocolVersion   = "2025-11-25"
 	backendDiscoveryTimeout = 20 * time.Second
 	backendCallTimeout      = 60 * time.Second
 	backendDefaultTimeout   = 8 * time.Second
@@ -37,17 +40,21 @@ type ServerConfig struct {
 
 // Server represents a running MCP server process.
 type Server struct {
-	config      ServerConfig
-	cmd         *exec.Cmd
-	stdin       io.WriteCloser
-	stdout      *bufio.Reader
-	mu          sync.Mutex
-	initMu      sync.Mutex
-	initialized bool
-	sessionID   string
-	nextID      atomic.Int64
-	pending     map[int64]chan rpcResponse
-	pendMu      sync.Mutex
+	config          ServerConfig
+	cmd             *exec.Cmd
+	stdin           io.WriteCloser
+	stdout          *bufio.Reader
+	mu              sync.Mutex
+	initMu          sync.Mutex
+	initialized     bool
+	capMu           sync.RWMutex
+	capKnown        bool
+	capabilities    map[string]bool
+	protocolVersion string
+	sessionID       string
+	nextID          atomic.Int64
+	pending         map[int64]chan rpcResponse
+	pendMu          sync.Mutex
 }
 
 type rpcResponse struct {
@@ -125,14 +132,11 @@ func (m *Manager) UpdateConfigs(configs []ServerConfig) {
 }
 
 func (m *Manager) startServer(cfg ServerConfig) error {
-	// Parse command — could be "npx -y @modelcontextprotocol/server-github"
-	parts := strings.Fields(cfg.Command)
-	if len(parts) == 0 {
-		return fmt.Errorf("empty command for server %s", cfg.Name)
+	command, args, err := resolveCommand(cfg)
+	if err != nil {
+		return err
 	}
-
-	args := append(parts[1:], cfg.Args...)
-	cmd := exec.Command(parts[0], args...)
+	cmd := exec.Command(command, args...)
 
 	// Set environment
 	if len(cfg.Env) > 0 {
@@ -172,6 +176,42 @@ func (m *Manager) startServer(cfg ServerConfig) error {
 	m.mu.Unlock()
 
 	return nil
+}
+
+// resolveCommand treats command and args as structured fields. Existing
+// executable paths are always used byte-for-byte, including paths containing
+// spaces. A narrow compatibility fallback retains historical command strings
+// such as "npx -y package" only when their first token resolves on PATH.
+func resolveCommand(cfg ServerConfig) (string, []string, error) {
+	command := strings.TrimSpace(cfg.Command)
+	if command == "" {
+		return "", nil, fmt.Errorf("empty command for server %s", cfg.Name)
+	}
+	args := append([]string(nil), cfg.Args...)
+	if info, err := os.Stat(command); err == nil && !info.IsDir() {
+		return command, args, nil
+	}
+	if _, err := exec.LookPath(command); err == nil {
+		return command, args, nil
+	}
+	parts := strings.Fields(command)
+	if len(parts) > 1 {
+		firstIsExecutable := false
+		if info, err := os.Stat(parts[0]); err == nil && !info.IsDir() {
+			firstIsExecutable = true
+		} else if _, err := exec.LookPath(parts[0]); err == nil {
+			firstIsExecutable = true
+		}
+		if firstIsExecutable {
+			return parts[0], append(parts[1:], args...), nil
+		}
+	}
+	// Paths must remain atomic even when they do not exist so the resulting
+	// error names the real configured path instead of a truncated first token.
+	if filepath.IsAbs(command) || strings.ContainsAny(command, `/\\`) {
+		return command, args, nil
+	}
+	return command, args, nil
 }
 
 // ServerNames returns the names of all configured servers.
@@ -220,8 +260,13 @@ func (m *Manager) StopAll() {
 
 // Initialize sends the initialize handshake to a server.
 func (s *Server) Initialize() error {
+	return s.InitializeContext(context.Background())
+}
+
+// InitializeContext performs the MCP handshake with cancellation support.
+func (s *Server) InitializeContext(ctx context.Context) error {
 	if s.IsHTTP() {
-		return s.ensureHTTPInitialized()
+		return s.ensureHTTPInitializedContext(ctx)
 	}
 
 	s.initMu.Lock()
@@ -231,7 +276,7 @@ func (s *Server) Initialize() error {
 	}
 
 	params := map[string]interface{}{
-		"protocolVersion": "2024-11-05",
+		"protocolVersion": latestProtocolVersion,
 		"capabilities":    map[string]interface{}{},
 		"clientInfo": map[string]interface{}{
 			"name":    "agentkeeper-mcp-gateway",
@@ -239,8 +284,11 @@ func (s *Server) Initialize() error {
 		},
 	}
 	paramsJSON, _ := json.Marshal(params)
-	_, err := s.Call("initialize", paramsJSON)
+	result, err := s.CallContext(ctx, "initialize", paramsJSON)
 	if err != nil {
+		return err
+	}
+	if err := s.recordInitializeResult(result); err != nil {
 		return err
 	}
 	// Send initialized notification
@@ -251,10 +299,17 @@ func (s *Server) Initialize() error {
 
 // ListTools calls tools/list on the server.
 func (s *Server) ListTools() ([]interface{}, error) {
-	if err := s.Initialize(); err != nil {
+	return s.ListToolsContext(context.Background())
+}
+
+func (s *Server) ListToolsContext(ctx context.Context) ([]interface{}, error) {
+	if err := s.InitializeContext(ctx); err != nil {
 		return nil, err
 	}
-	resp, err := s.Call("tools/list", nil)
+	if !s.SupportsCapability("tools") {
+		return []interface{}{}, nil
+	}
+	resp, err := s.CallContext(ctx, "tools/list", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -269,10 +324,17 @@ func (s *Server) ListTools() ([]interface{}, error) {
 
 // ListResources calls resources/list on the server.
 func (s *Server) ListResources() ([]interface{}, error) {
-	if err := s.Initialize(); err != nil {
+	return s.ListResourcesContext(context.Background())
+}
+
+func (s *Server) ListResourcesContext(ctx context.Context) ([]interface{}, error) {
+	if err := s.InitializeContext(ctx); err != nil {
 		return nil, err
 	}
-	resp, err := s.Call("resources/list", nil)
+	if !s.SupportsCapability("resources") {
+		return []interface{}{}, nil
+	}
+	resp, err := s.CallContext(ctx, "resources/list", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -285,12 +347,45 @@ func (s *Server) ListResources() ([]interface{}, error) {
 	return result.Resources, nil
 }
 
-// ListPrompts calls prompts/list on the server.
-func (s *Server) ListPrompts() ([]interface{}, error) {
-	if err := s.Initialize(); err != nil {
+// ListResourceTemplates calls resources/templates/list only for backends that
+// declared the resources capability during initialization.
+func (s *Server) ListResourceTemplates() ([]interface{}, error) {
+	return s.ListResourceTemplatesContext(context.Background())
+}
+
+func (s *Server) ListResourceTemplatesContext(ctx context.Context) ([]interface{}, error) {
+	if err := s.InitializeContext(ctx); err != nil {
 		return nil, err
 	}
-	resp, err := s.Call("prompts/list", nil)
+	if !s.SupportsCapability("resources") {
+		return []interface{}{}, nil
+	}
+	resp, err := s.CallContext(ctx, "resources/templates/list", nil)
+	if err != nil {
+		return nil, err
+	}
+	var result struct {
+		ResourceTemplates []interface{} `json:"resourceTemplates"`
+	}
+	if err := json.Unmarshal(resp, &result); err != nil {
+		return nil, err
+	}
+	return result.ResourceTemplates, nil
+}
+
+// ListPrompts calls prompts/list on the server.
+func (s *Server) ListPrompts() ([]interface{}, error) {
+	return s.ListPromptsContext(context.Background())
+}
+
+func (s *Server) ListPromptsContext(ctx context.Context) ([]interface{}, error) {
+	if err := s.InitializeContext(ctx); err != nil {
+		return nil, err
+	}
+	if !s.SupportsCapability("prompts") {
+		return []interface{}{}, nil
+	}
+	resp, err := s.CallContext(ctx, "prompts/list", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -305,13 +400,19 @@ func (s *Server) ListPrompts() ([]interface{}, error) {
 
 // Call sends a JSON-RPC request and waits for the response.
 func (s *Server) Call(method string, params json.RawMessage) (json.RawMessage, error) {
+	return s.CallContext(context.Background(), method, params)
+}
+
+// CallContext sends a JSON-RPC request and lets proxy shutdown cancel pending
+// discovery work instead of racing a closed backend pipe.
+func (s *Server) CallContext(ctx context.Context, method string, params json.RawMessage) (json.RawMessage, error) {
 	if s.IsHTTP() {
 		if method != "initialize" && !strings.HasPrefix(method, "notifications/") {
-			if err := s.ensureHTTPInitialized(); err != nil {
+			if err := s.ensureHTTPInitializedContext(ctx); err != nil {
 				return nil, err
 			}
 		}
-		return s.callHTTP(method, params)
+		return s.callHTTPContext(ctx, method, params)
 	}
 
 	s.mu.Lock()
@@ -343,13 +444,20 @@ func (s *Server) Call(method string, params json.RawMessage) (json.RawMessage, e
 		return nil, err
 	}
 
+	timer := time.NewTimer(timeoutForMethod(method))
+	defer timer.Stop()
 	select {
 	case resp := <-ch:
 		if resp.err != nil {
 			return nil, resp.err
 		}
 		return resp.result, nil
-	case <-time.After(timeoutForMethod(method)):
+	case <-ctx.Done():
+		s.pendMu.Lock()
+		delete(s.pending, id)
+		s.pendMu.Unlock()
+		return nil, ctx.Err()
+	case <-timer.C:
 		s.pendMu.Lock()
 		delete(s.pending, id)
 		s.pendMu.Unlock()
@@ -387,13 +495,17 @@ func (s *Server) IsHTTP() bool {
 }
 
 func (s *Server) ensureHTTPInitialized() error {
+	return s.ensureHTTPInitializedContext(context.Background())
+}
+
+func (s *Server) ensureHTTPInitializedContext(ctx context.Context) error {
 	s.initMu.Lock()
 	defer s.initMu.Unlock()
 	if s.initialized {
 		return nil
 	}
 	params := map[string]interface{}{
-		"protocolVersion": "2024-11-05",
+		"protocolVersion": latestProtocolVersion,
 		"capabilities":    map[string]interface{}{},
 		"clientInfo": map[string]interface{}{
 			"name":    "agentkeeper-mcp-gateway",
@@ -401,7 +513,11 @@ func (s *Server) ensureHTTPInitialized() error {
 		},
 	}
 	paramsJSON, _ := json.Marshal(params)
-	if _, err := s.callHTTP("initialize", paramsJSON); err != nil {
+	result, err := s.callHTTPContext(ctx, "initialize", paramsJSON)
+	if err != nil {
+		return err
+	}
+	if err := s.recordInitializeResult(result); err != nil {
 		return err
 	}
 	s.sendHTTPNotification("notifications/initialized", nil)
@@ -410,6 +526,10 @@ func (s *Server) ensureHTTPInitialized() error {
 }
 
 func (s *Server) callHTTP(method string, params json.RawMessage) (json.RawMessage, error) {
+	return s.callHTTPContext(context.Background(), method, params)
+}
+
+func (s *Server) callHTTPContext(ctx context.Context, method string, params json.RawMessage) (json.RawMessage, error) {
 	id := s.nextID.Add(1)
 	msg := map[string]interface{}{
 		"jsonrpc": "2.0",
@@ -420,7 +540,7 @@ func (s *Server) callHTTP(method string, params json.RawMessage) (json.RawMessag
 		msg["params"] = json.RawMessage(params)
 	}
 
-	return s.postHTTP(msg, id, true, timeoutForMethod(method))
+	return s.postHTTPContext(ctx, msg, id, true, timeoutForMethod(method))
 }
 
 func (s *Server) sendHTTPNotification(method string, params json.RawMessage) {
@@ -435,11 +555,15 @@ func (s *Server) sendHTTPNotification(method string, params json.RawMessage) {
 }
 
 func (s *Server) postHTTP(msg map[string]interface{}, id int64, expectResult bool, timeout time.Duration) (json.RawMessage, error) {
+	return s.postHTTPContext(context.Background(), msg, id, expectResult, timeout)
+}
+
+func (s *Server) postHTTPContext(ctx context.Context, msg map[string]interface{}, id int64, expectResult bool, timeout time.Duration) (json.RawMessage, error) {
 	data, err := json.Marshal(msg)
 	if err != nil {
 		return nil, err
 	}
-	req, err := http.NewRequest(http.MethodPost, s.config.URL, bytes.NewReader(data))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.config.URL, bytes.NewReader(data))
 	if err != nil {
 		return nil, err
 	}
@@ -450,6 +574,9 @@ func (s *Server) postHTTP(msg map[string]interface{}, id int64, expectResult boo
 	}
 	if s.sessionID != "" {
 		req.Header.Set("Mcp-Session-Id", s.sessionID)
+	}
+	if protocolVersion := s.negotiatedProtocolVersion(); protocolVersion != "" {
+		req.Header.Set("MCP-Protocol-Version", protocolVersion)
 	}
 
 	client := &http.Client{Timeout: timeout}
@@ -482,6 +609,49 @@ func (s *Server) postHTTP(msg map[string]interface{}, id int64, expectResult boo
 		return readSSEResult(resp.Body, id)
 	}
 	return readJSONRPCResult(resp.Body, id)
+}
+
+// SupportsCapability reports the upstream capability observed during the
+// initialize handshake. Missing capability metadata remains compatible with
+// legacy backends; an explicit capabilities object is authoritative.
+func (s *Server) SupportsCapability(name string) bool {
+	s.capMu.RLock()
+	defer s.capMu.RUnlock()
+	if !s.capKnown {
+		return true
+	}
+	return s.capabilities[name]
+}
+
+func (s *Server) negotiatedProtocolVersion() string {
+	s.capMu.RLock()
+	defer s.capMu.RUnlock()
+	return s.protocolVersion
+}
+
+func (s *Server) recordInitializeResult(result json.RawMessage) error {
+	var initialized struct {
+		ProtocolVersion string                      `json:"protocolVersion"`
+		Capabilities    *map[string]json.RawMessage `json:"capabilities"`
+	}
+	if err := json.Unmarshal(result, &initialized); err != nil {
+		return fmt.Errorf("decoding initialize result: %w", err)
+	}
+	capabilities := make(map[string]bool)
+	known := initialized.Capabilities != nil
+	if initialized.Capabilities != nil {
+		for name, raw := range *initialized.Capabilities {
+			if len(bytes.TrimSpace(raw)) > 0 && string(bytes.TrimSpace(raw)) != "null" {
+				capabilities[name] = true
+			}
+		}
+	}
+	s.capMu.Lock()
+	s.capKnown = known
+	s.capabilities = capabilities
+	s.protocolVersion = strings.TrimSpace(initialized.ProtocolVersion)
+	s.capMu.Unlock()
+	return nil
 }
 
 func timeoutForMethod(method string) time.Duration {
@@ -568,6 +738,7 @@ func normalizeTransport(cfg ServerConfig) string {
 }
 
 func (s *Server) readResponses() {
+	defer s.failPending(io.EOF)
 	for {
 		line, err := s.stdout.ReadBytes('\n')
 		if err != nil {
@@ -608,5 +779,15 @@ func (s *Server) readResponses() {
 				ch <- rpcResponse{result: msg.Result}
 			}
 		}
+	}
+}
+
+func (s *Server) failPending(err error) {
+	s.pendMu.Lock()
+	pending := s.pending
+	s.pending = make(map[int64]chan rpcResponse)
+	s.pendMu.Unlock()
+	for _, ch := range pending {
+		ch <- rpcResponse{err: err}
 	}
 }
