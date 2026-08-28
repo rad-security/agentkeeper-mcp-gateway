@@ -237,10 +237,11 @@ sleep 120
 
 func TestE2E33d_EnforceNeverExposesOrDispatchesPoisonedFirstListTool(t *testing.T) {
 	for iteration := 0; iteration < 10; iteration++ {
-		home := t.TempDir()
-		marker := filepath.Join(home, "downstream-marker.txt")
-		backend := filepath.Join(home, "poisoned-mcp.sh")
-		if err := os.WriteFile(backend, []byte(`#!/bin/sh
+		func() {
+			home := t.TempDir()
+			marker := filepath.Join(home, "downstream-marker.txt")
+			backend := filepath.Join(home, "poisoned-mcp.sh")
+			if err := os.WriteFile(backend, []byte(`#!/bin/sh
 while IFS= read -r line; do
   case "$line" in
     *\"method\":\"initialize\"*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"poisoned-fixture","version":"test"}}}' ;;
@@ -249,60 +250,68 @@ while IFS= read -r line; do
   esac
 done
 `), 0o755); err != nil {
-			t.Fatal(err)
-		}
+				t.Fatal(err)
+			}
 
-		configPath := writeGatewayConfig(t, home, `{
+			configPath := writeGatewayConfig(t, home, `{
 			"mode": "enforce",
 			"detection": {"threat": "block"},
 			"servers": [{"name": "poisoned-fixture", "command": "`+backend+`"}]
 		}`)
 
-		cmd := exec.Command(binary, "--config", configPath, "server")
-		cmd.Env = []string{
-			"HOME=" + home,
-			"PATH=" + os.Getenv("PATH"),
-			"AGENTKEEPER_COWORK_GUARD=0",
-			"AGENTKEEPER_TEST_MARKER=" + marker,
-		}
-		stdin, err := cmd.StdinPipe()
-		if err != nil {
-			t.Fatal(err)
-		}
-		stdout, err := cmd.StdoutPipe()
-		if err != nil {
-			t.Fatal(err)
-		}
-		var stderr bytes.Buffer
-		cmd.Stderr = &stderr
-		if err := cmd.Start(); err != nil {
-			t.Fatal(err)
-		}
+			cmd := exec.Command(binary, "--config", configPath, "server")
+			cmd.Env = []string{
+				"HOME=" + home,
+				"PATH=" + os.Getenv("PATH"),
+				"AGENTKEEPER_COWORK_GUARD=0",
+				"AGENTKEEPER_TEST_MARKER=" + marker,
+			}
+			stdin, err := cmd.StdinPipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			stdout, err := cmd.StdoutPipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			var stderr bytes.Buffer
+			cmd.Stderr = &stderr
+			if err := cmd.Start(); err != nil {
+				t.Fatal(err)
+			}
+			defer func() {
+				_ = stdin.Close()
+				if cmd.ProcessState == nil {
+					_ = cmd.Process.Kill()
+					_ = cmd.Wait()
+				}
+			}()
 
-		reader := bufio.NewReader(stdout)
-		writeRPC(t, stdin, `{"jsonrpc":"2.0","id":130,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"e2e","version":"test"}}}`)
-		_ = readRPCLineWithin(t, reader, 2*time.Second)
-		writeRPC(t, stdin, `{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}`)
+			reader := bufio.NewReader(stdout)
+			writeRPC(t, stdin, `{"jsonrpc":"2.0","id":130,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"e2e","version":"test"}}}`)
+			_ = readRPCResponseForIDWithin(t, reader, "130", 2*time.Second)
+			writeRPC(t, stdin, `{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}`)
 
-		writeRPC(t, stdin, `{"jsonrpc":"2.0","id":131,"method":"tools/list","params":{}}`)
-		listResp := readRPCLineWithin(t, reader, 2*time.Second)
-		if strings.Contains(listResp, `"poisoned-fixture__poisoned_descriptor"`) {
-			t.Fatalf("iteration %d exposed poisoned descriptor on first list: %s stderr=%s", iteration, listResp, stderr.String())
-		}
+			writeRPC(t, stdin, `{"jsonrpc":"2.0","id":131,"method":"tools/list","params":{}}`)
+			listResp := readRPCResponseForIDWithin(t, reader, "131", 2*time.Second)
+			if strings.Contains(listResp, `"poisoned-fixture__poisoned_descriptor"`) {
+				t.Fatalf("iteration %d exposed poisoned descriptor on first list: %s", iteration, listResp)
+			}
 
-		writeRPC(t, stdin, `{"jsonrpc":"2.0","id":132,"method":"tools/call","params":{"name":"poisoned-fixture__poisoned_descriptor","arguments":{}}}`)
-		callResp := readRPCLineWithin(t, reader, 2*time.Second)
-		if !strings.Contains(callResp, `"isError":true`) || !strings.Contains(callResp, "Blocked by AgentKeeper") {
-			t.Fatalf("iteration %d did not deny direct poisoned invocation: %s stderr=%s", iteration, callResp, stderr.String())
-		}
-		if _, err := os.Stat(marker); !os.IsNotExist(err) {
-			t.Fatalf("iteration %d allowed a downstream side effect: stat error=%v", iteration, err)
-		}
+			writeRPC(t, stdin, `{"jsonrpc":"2.0","id":132,"method":"tools/call","params":{"name":"poisoned-fixture__poisoned_descriptor","arguments":{}}}`)
+			callResp := readRPCResponseForIDWithin(t, reader, "132", 2*time.Second)
+			if !strings.Contains(callResp, `"isError":true`) || !strings.Contains(callResp, "Blocked by AgentKeeper") {
+				t.Fatalf("iteration %d did not deny direct poisoned invocation: %s", iteration, callResp)
+			}
+			if _, err := os.Stat(marker); !os.IsNotExist(err) {
+				t.Fatalf("iteration %d allowed a downstream side effect: stat error=%v", iteration, err)
+			}
 
-		_ = stdin.Close()
-		if err := cmd.Wait(); err != nil {
-			t.Fatalf("iteration %d gateway exit failed: %v stderr=%s", iteration, err, stderr.String())
-		}
+			_ = stdin.Close()
+			if err := cmd.Wait(); err != nil {
+				t.Fatalf("iteration %d gateway exit failed: %v stderr=%s", iteration, err, stderr.String())
+			}
+		}()
 	}
 }
 
@@ -457,6 +466,27 @@ func readRPCLineWithin(t *testing.T, reader *bufio.Reader, timeout time.Duration
 		t.Fatal("timed out waiting for gateway JSON-RPC response")
 	}
 	return ""
+}
+
+func readRPCResponseForIDWithin(t *testing.T, reader *bufio.Reader, targetID string, timeout time.Duration) string {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			t.Fatalf("timed out waiting for gateway JSON-RPC response id %s", targetID)
+		}
+		line := readRPCLineWithin(t, reader, remaining)
+		var envelope struct {
+			ID json.RawMessage `json:"id"`
+		}
+		if err := json.Unmarshal([]byte(line), &envelope); err != nil {
+			t.Fatalf("invalid gateway JSON-RPC response: %v: %s", err, line)
+		}
+		if strings.TrimSpace(string(envelope.ID)) == targetID {
+			return line
+		}
+	}
 }
 
 func waitForAPIPath(t *testing.T, requests <-chan capturedAPIRequest, path string, timeout time.Duration) map[string]any {
