@@ -5,6 +5,10 @@ package proxy
 
 import (
 	"bufio"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -19,6 +23,7 @@ import (
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/detection"
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/logging"
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/policy"
+	"github.com/rad-security/agentkeeper-mcp-gateway/internal/receipt"
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/server"
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/telemetry"
 )
@@ -46,11 +51,15 @@ type JSONRPCError struct {
 
 // Config holds proxy configuration.
 type Config struct {
-	EnforceMode     bool
-	GatewayVersion  string
-	Detection       telemetry.DetectionConfig
-	DetectionEngine *detection.Engine
-	Logger          *logging.Logger
+	EnforceMode      bool
+	GatewayVersion   string
+	Detection        telemetry.DetectionConfig
+	DetectionEngine  *detection.Engine
+	Logger           *logging.Logger
+	ReceiptStore     *receipt.Store
+	ClientName       string
+	ConfigSourceHash string
+	RouteRevision    string
 }
 
 // Proxy manages the MCP protocol proxy.
@@ -59,9 +68,14 @@ type Proxy struct {
 	manager   *server.Manager
 	telemetry *telemetry.Client
 	mu        sync.Mutex
+	modeMu    sync.RWMutex
 	// Map from namespaced tool name to server name
 	toolMap         map[string]string
+	poisonedTools   map[string]detection.Result
+	resourceMap     map[string]resourceRoute
+	promptMap       map[string]string
 	toolCache       map[string][]interface{}
+	emptyToolLists  map[string]int
 	toolStatus      map[string]toolRefreshStatus
 	toolRefreshMu   sync.Mutex
 	toolRefreshDone chan struct{}
@@ -77,6 +91,11 @@ type toolRefreshStatus struct {
 	UpdatedAt string
 }
 
+type resourceRoute struct {
+	ServerName  string
+	OriginalURI string
+}
+
 type persistentToolCache struct {
 	Version int                          `json:"version"`
 	Servers map[string]persistentToolSet `json:"servers"`
@@ -90,15 +109,34 @@ type persistentToolSet struct {
 // NewProxy creates a new MCP proxy.
 func NewProxy(cfg Config, mgr *server.Manager, tc *telemetry.Client) *Proxy {
 	p := &Proxy{
-		config:     cfg,
-		manager:    mgr,
-		telemetry:  tc,
-		toolMap:    make(map[string]string),
-		toolCache:  make(map[string][]interface{}),
-		toolStatus: make(map[string]toolRefreshStatus),
+		config:         cfg,
+		manager:        mgr,
+		telemetry:      tc,
+		toolMap:        make(map[string]string),
+		poisonedTools:  make(map[string]detection.Result),
+		resourceMap:    make(map[string]resourceRoute),
+		promptMap:      make(map[string]string),
+		toolCache:      make(map[string][]interface{}),
+		emptyToolLists: make(map[string]int),
+		toolStatus:     make(map[string]toolRefreshStatus),
 	}
 	p.loadPersistentToolCache()
 	return p
+}
+
+// SetEnforceMode changes the live data-plane mode after an acknowledged
+// per-route control-plane assignment. New processes still begin from their
+// local config, whose default is Observe.
+func (p *Proxy) SetEnforceMode(enforce bool) {
+	p.modeMu.Lock()
+	p.config.EnforceMode = enforce
+	p.modeMu.Unlock()
+}
+
+func (p *Proxy) enforceMode() bool {
+	p.modeMu.RLock()
+	defer p.modeMu.RUnlock()
+	return p.config.EnforceMode
 }
 
 // verdictRank maps verdict strings to numeric severity for comparison.
@@ -195,9 +233,27 @@ func (p *Proxy) handleMessage(msg JSONRPCMessage) (*JSONRPCMessage, error) {
 		return p.handlePromptsList(msg)
 	case "prompts/get":
 		return p.handlePromptsGet(msg)
+	case "ping":
+		resultJSON := json.RawMessage(`{}`)
+		return &JSONRPCMessage{JSONRPC: "2.0", ID: msg.ID, Result: resultJSON}, nil
 	default:
-		// Unknown method — could be a notification or custom method
-		return nil, nil
+		if msg.ID == nil {
+			p.forwardNotification(msg.Method, msg.Params)
+			return nil, nil
+		}
+		return &JSONRPCMessage{
+			JSONRPC: "2.0",
+			ID:      msg.ID,
+			Error:   &JSONRPCError{Code: -32601, Message: "method not supported by AgentKeeper MCP Gateway"},
+		}, nil
+	}
+}
+
+func (p *Proxy) forwardNotification(method string, params json.RawMessage) {
+	for _, name := range p.manager.ServerNames() {
+		if srv := p.manager.Get(name); srv != nil {
+			srv.Notify(method, params)
+		}
 	}
 }
 
@@ -212,9 +268,10 @@ func (p *Proxy) handleInitialize(msg JSONRPCMessage) (*JSONRPCMessage, error) {
 	// Desktop mark the gateway itself as disconnected.
 	p.startToolRefresh()
 
+	protocolVersion := negotiateProtocolVersion(msg.Params)
 	// Return gateway's own capabilities
 	result := map[string]interface{}{
-		"protocolVersion": "2024-11-05",
+		"protocolVersion": protocolVersion,
 		"capabilities": map[string]interface{}{
 			"tools":     map[string]interface{}{"listChanged": true},
 			"resources": map[string]interface{}{},
@@ -232,6 +289,22 @@ func (p *Proxy) handleInitialize(msg JSONRPCMessage) (*JSONRPCMessage, error) {
 		ID:      msg.ID,
 		Result:  resultJSON,
 	}, nil
+}
+
+func negotiateProtocolVersion(params json.RawMessage) string {
+	const fallback = "2024-11-05"
+	var request struct {
+		ProtocolVersion string `json:"protocolVersion"`
+	}
+	if err := json.Unmarshal(params, &request); err != nil {
+		return fallback
+	}
+	switch request.ProtocolVersion {
+	case "2024-11-05", "2025-03-26", "2025-06-18":
+		return request.ProtocolVersion
+	default:
+		return fallback
+	}
 }
 
 func (p *Proxy) gatewayVersion() string {
@@ -258,6 +331,12 @@ func (p *Proxy) handleToolsList(msg JSONRPCMessage) (*JSONRPCMessage, error) {
 	cachedTools, nextToolMap = p.cachedNamespacedTools()
 
 	p.setToolMap(nextToolMap)
+	if p.enforceMode() && p.telemetry != nil {
+		cachedTools = filterToolsForPolicy(cachedTools, nextToolMap, p.telemetry.Policy())
+	}
+	if p.enforceMode() {
+		cachedTools = p.filterPoisonedTools(cachedTools)
+	}
 
 	allTools := p.getBuiltinTools()
 	allTools = append(allTools, cachedTools...)
@@ -271,6 +350,27 @@ func (p *Proxy) handleToolsList(msg JSONRPCMessage) (*JSONRPCMessage, error) {
 		ID:      msg.ID,
 		Result:  resultJSON,
 	}, nil
+}
+
+// filterToolsForPolicy enforces list/call parity without mutating the raw
+// manifest cache. Observe mode deliberately skips this function so users see
+// their normal tool catalog while the dashboard reports would-block impact.
+func filterToolsForPolicy(tools []interface{}, toolMap map[string]string, synced telemetry.SyncPolicy) []interface{} {
+	filtered := make([]interface{}, 0, len(tools))
+	for _, tool := range tools {
+		tm, ok := tool.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		namespacedName, _ := tm["name"].(string)
+		serverName := toolMap[namespacedName]
+		originalName := strings.TrimPrefix(namespacedName, serverName+"__")
+		if policy.Evaluate(synced, serverName, originalName, nil).Verdict == "block" {
+			continue
+		}
+		filtered = append(filtered, tool)
+	}
+	return filtered
 }
 
 func (p *Proxy) startToolRefresh() <-chan struct{} {
@@ -355,7 +455,7 @@ func (p *Proxy) logToolDescriptionDetections(serverName string, tools []interfac
 	if p.config.DetectionEngine == nil {
 		return
 	}
-	var descs []detection.ToolDescription
+	found := make(map[string]detection.Result)
 	for _, t := range tools {
 		tm, ok := t.(map[string]interface{})
 		if !ok {
@@ -377,13 +477,54 @@ func (p *Proxy) logToolDescriptionDetections(serverName string, tools []interfac
 				}
 			}
 		}
-		descs = append(descs, desc)
+		results := p.config.DetectionEngine.EvaluateToolDescriptions([]detection.ToolDescription{desc})
+		for _, r := range results {
+			found[serverName+"__"+desc.Name] = r
+			if p.config.Logger != nil {
+				p.config.Logger.LogDetection(serverName, desc.Name, r)
+			}
+		}
 	}
+	p.mu.Lock()
+	for name := range p.poisonedTools {
+		if strings.HasPrefix(name, serverName+"__") {
+			delete(p.poisonedTools, name)
+		}
+	}
+	for name, result := range found {
+		p.poisonedTools[name] = result
+	}
+	p.mu.Unlock()
+}
 
-	results := p.config.DetectionEngine.EvaluateToolDescriptions(descs)
-	for _, r := range results {
-		p.config.Logger.LogDetection(serverName, "", r)
+func (p *Proxy) filterPoisonedTools(tools []interface{}) []interface{} {
+	var synced telemetry.SyncPolicy
+	if p.telemetry != nil {
+		synced = p.telemetry.Policy()
 	}
+	filtered := make([]interface{}, 0, len(tools))
+	for _, value := range tools {
+		tool, ok := value.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		name, _ := tool["name"].(string)
+		if result, found := p.poisonedTool(name); found {
+			result = applyDetectionPolicy(result, synced, p.config.Detection)
+			if result.Verdict == detection.VerdictBlock {
+				continue
+			}
+		}
+		filtered = append(filtered, value)
+	}
+	return filtered
+}
+
+func (p *Proxy) poisonedTool(name string) (detection.Result, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	result, ok := p.poisonedTools[name]
+	return result, ok
 }
 
 func (p *Proxy) cachedNamespacedTools() ([]interface{}, map[string]string) {
@@ -479,12 +620,27 @@ func (p *Proxy) cachedTools(serverName string) []interface{} {
 }
 
 func (p *Proxy) setCachedTools(serverName string, tools []interface{}) bool {
-	if len(tools) == 0 {
-		return false
-	}
 	cloned := cloneTools(tools)
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.emptyToolLists == nil {
+		p.emptyToolLists = make(map[string]int)
+	}
+	if len(cloned) == 0 {
+		p.emptyToolLists[serverName]++
+		// One empty list can be a backend startup race. Two consecutive
+		// successful empty manifests are treated as an intentional full removal.
+		if p.emptyToolLists[serverName] < 2 {
+			return false
+		}
+		if _, existed := p.toolCache[serverName]; !existed {
+			return false
+		}
+		delete(p.toolCache, serverName)
+		p.savePersistentToolCacheLocked()
+		return true
+	}
+	p.emptyToolLists[serverName] = 0
 	if reflect.DeepEqual(p.toolCache[serverName], cloned) {
 		return false
 	}
@@ -627,25 +783,39 @@ func (p *Proxy) handleToolsCall(msg JSONRPCMessage) (*JSONRPCMessage, error) {
 
 	// Strip the namespace prefix to get the original tool name
 	originalName := strings.TrimPrefix(callParams.Name, serverName+"__")
+	callID := newEvidenceID("call")
+	attemptID := newEvidenceID("attempt")
+	enforceThisCall := p.enforceMode()
+	effectiveMode := "observe"
+	if enforceThisCall {
+		effectiveMode = "enforce"
+	}
 
 	// --- 1. Policy check ---
 	var finalVerdict string = "pass"
 	var finalResult detection.Result
 	var syncPolicy telemetry.SyncPolicy
+	evaluationStatus := "evaluated"
+	decisionID := ""
 
 	if p.telemetry != nil {
 		syncPolicy = p.telemetry.Policy()
 		policyResult := policy.Evaluate(syncPolicy, serverName, originalName, callParams.Arguments)
 
 		if policyResult.Verdict == "block" {
-			if p.config.EnforceMode {
+			if enforceThisCall {
 				// Enforce: block immediately, log, and return error
-				p.config.Logger.LogToolCall(serverName, originalName, callParams.Arguments, detection.Result{
+				blockedResult := detection.Result{
 					Verdict:     detection.VerdictBlock,
 					PatternName: policyResult.Rule,
 					Severity:    "high",
 					Description: policyResult.Reason,
 					Category:    "policy",
+				}
+				p.logToolOutcome(serverName, originalName, callParams.Arguments, blockedResult, logging.ToolCallOutcome{
+					CallID: callID, AttemptID: attemptID, Mode: effectiveMode,
+					PolicyDecision: "block", EvaluationStatus: evaluationStatus,
+					RequiredDisposition: "deny_before_dispatch", AppliedDisposition: "denied_before_dispatch",
 				})
 				errResult := map[string]interface{}{
 					"content": []map[string]interface{}{
@@ -680,6 +850,14 @@ func (p *Proxy) handleToolsCall(msg JSONRPCMessage) (*JSONRPCMessage, error) {
 		}
 	}
 
+	if poisoned, found := p.poisonedTool(callParams.Name); found {
+		poisoned = applyDetectionPolicy(poisoned, syncPolicy, p.config.Detection)
+		if verdictRank(string(poisoned.Verdict)) > verdictRank(finalVerdict) {
+			finalVerdict = string(poisoned.Verdict)
+			finalResult = poisoned
+		}
+	}
+
 	// --- 2. Embedded detection ---
 
 	if p.config.DetectionEngine != nil {
@@ -693,7 +871,15 @@ func (p *Proxy) handleToolsCall(msg JSONRPCMessage) (*JSONRPCMessage, error) {
 
 	// --- 3. Connected detection (API, 4s timeout) ---
 	if p.telemetry != nil {
-		apiResult := p.telemetry.Evaluate(serverName, originalName, callParams.Arguments)
+		apiResult := p.telemetry.Evaluate(serverName, originalName, callParams.Arguments, callID, attemptID)
+		if apiResult == nil {
+			evaluationStatus = "degraded_local"
+		} else {
+			decisionID = apiResult.DecisionID
+			if apiResult.EvaluationStatus != "" {
+				evaluationStatus = apiResult.EvaluationStatus
+			}
+		}
 		if apiResult != nil && verdictRank(apiResult.Verdict) > verdictRank(finalVerdict) {
 			finalVerdict = apiResult.Verdict
 			finalResult = detection.Result{
@@ -706,11 +892,14 @@ func (p *Proxy) handleToolsCall(msg JSONRPCMessage) (*JSONRPCMessage, error) {
 		}
 	}
 
-	// --- 4. Log merged result ---
-	p.config.Logger.LogToolCall(serverName, originalName, callParams.Arguments, finalResult)
-
-	// --- 5. Enforce merged verdict ---
-	if finalVerdict == "block" && p.config.EnforceMode {
+	// --- 4. Enforce merged verdict ---
+	if finalVerdict == "block" && enforceThisCall {
+		p.logToolOutcome(serverName, originalName, callParams.Arguments, finalResult, logging.ToolCallOutcome{
+			CallID: callID, AttemptID: attemptID, Mode: effectiveMode,
+			PolicyDecision: finalVerdict, EvaluationStatus: evaluationStatus,
+			DecisionID:          decisionID,
+			RequiredDisposition: "deny_before_dispatch", AppliedDisposition: "denied_before_dispatch",
+		})
 		errResult := map[string]interface{}{
 			"content": []map[string]interface{}{
 				{
@@ -724,12 +913,26 @@ func (p *Proxy) handleToolsCall(msg JSONRPCMessage) (*JSONRPCMessage, error) {
 		return &JSONRPCMessage{JSONRPC: "2.0", ID: msg.ID, Result: resultJSON}, nil
 	}
 
-	// --- 6. Forward to backend server ---
+	// --- 5. Forward to backend server ---
 	srv := p.manager.Get(serverName)
 	if srv == nil {
+		p.logToolOutcome(serverName, originalName, callParams.Arguments, finalResult, logging.ToolCallOutcome{
+			CallID: callID, AttemptID: attemptID, Mode: effectiveMode,
+			PolicyDecision: finalVerdict, EvaluationStatus: evaluationStatus,
+			DecisionID:          decisionID,
+			RequiredDisposition: "forward", AppliedDisposition: "dispatch_failed",
+			FailureReason: "server_not_available",
+		})
 		return nil, fmt.Errorf("server not available: %s", serverName)
 	}
 	if err := srv.Initialize(); err != nil {
+		p.logToolOutcome(serverName, originalName, callParams.Arguments, finalResult, logging.ToolCallOutcome{
+			CallID: callID, AttemptID: attemptID, Mode: effectiveMode,
+			PolicyDecision: finalVerdict, EvaluationStatus: evaluationStatus,
+			DecisionID:          decisionID,
+			RequiredDisposition: "forward", AppliedDisposition: "dispatch_failed",
+			FailureReason: "server_initialize_failed",
+		})
 		return nil, fmt.Errorf("initializing %s: %w", serverName, err)
 	}
 
@@ -741,17 +944,34 @@ func (p *Proxy) handleToolsCall(msg JSONRPCMessage) (*JSONRPCMessage, error) {
 
 	response, err := srv.Call("tools/call", forwardJSON)
 	if err != nil {
+		p.logToolOutcome(serverName, originalName, callParams.Arguments, finalResult, logging.ToolCallOutcome{
+			CallID: callID, AttemptID: attemptID, Mode: effectiveMode,
+			PolicyDecision: finalVerdict, EvaluationStatus: evaluationStatus,
+			DecisionID:          decisionID,
+			RequiredDisposition: "forward", AppliedDisposition: "dispatch_failed",
+			Dispatched: true, FailureReason: "upstream_call_failed",
+		})
 		return nil, fmt.Errorf("calling %s/%s: %w", serverName, originalName, err)
 	}
 
-	// --- 7. Post-execution response scan ---
+	// --- 6. Post-execution response scan ---
 	if p.config.DetectionEngine != nil {
 		respStr := string(response)
 		result := p.config.DetectionEngine.EvaluateToolResponse(serverName, originalName, respStr)
 		result = applyDetectionPolicy(result, syncPolicy, p.config.Detection)
 		if result.Verdict != detection.VerdictPass {
-			p.config.Logger.LogDetection(serverName, originalName, result)
-			if result.Verdict == detection.VerdictBlock && p.config.EnforceMode {
+			if verdictRank(string(result.Verdict)) > verdictRank(finalVerdict) {
+				finalVerdict = string(result.Verdict)
+				finalResult = result
+			}
+			if result.Verdict == detection.VerdictBlock && enforceThisCall {
+				p.logToolOutcome(serverName, originalName, callParams.Arguments, finalResult, logging.ToolCallOutcome{
+					CallID: callID, AttemptID: attemptID, Mode: effectiveMode,
+					PolicyDecision: finalVerdict, EvaluationStatus: evaluationStatus,
+					DecisionID:          decisionID,
+					RequiredDisposition: "withhold_result", AppliedDisposition: "result_withheld",
+					Dispatched: true, ResultReceived: true, ResponseWithheld: true,
+				})
 				errResult := map[string]interface{}{
 					"content": []map[string]interface{}{
 						{
@@ -767,7 +987,90 @@ func (p *Proxy) handleToolsCall(msg JSONRPCMessage) (*JSONRPCMessage, error) {
 		}
 	}
 
+	p.logToolOutcome(serverName, originalName, callParams.Arguments, finalResult, logging.ToolCallOutcome{
+		CallID: callID, AttemptID: attemptID, Mode: effectiveMode,
+		PolicyDecision: finalVerdict, EvaluationStatus: evaluationStatus,
+		DecisionID:          decisionID,
+		RequiredDisposition: "forward", AppliedDisposition: "result_returned",
+		Dispatched: true, ResultReceived: true, ResultReturned: true,
+	})
+
 	return &JSONRPCMessage{JSONRPC: "2.0", ID: msg.ID, Result: response}, nil
+}
+
+func (p *Proxy) logToolOutcome(serverName, toolName string, params map[string]interface{}, result detection.Result, outcome logging.ToolCallOutcome) {
+	outcome.ClientName = p.config.ClientName
+	outcome.ConfigSourceHash = p.config.ConfigSourceHash
+	outcome.RouteRevision = p.config.RouteRevision
+	if p.config.Logger != nil {
+		p.config.Logger.LogToolCallOutcome(serverName, toolName, params, result, outcome)
+	}
+	if p.config.ReceiptStore == nil {
+		return
+	}
+	syncedPolicy := telemetry.SyncPolicy{}
+	if p.telemetry != nil {
+		syncedPolicy = p.telemetry.Policy()
+	}
+	rawSnapshotID, effectiveViewHash := p.manifestEvidence(serverName, syncedPolicy)
+	if _, err := p.config.ReceiptStore.Enqueue(receipt.Input{
+		CallID:              outcome.CallID,
+		AttemptID:           outcome.AttemptID,
+		DecisionID:          outcome.DecisionID,
+		ClientName:          p.config.ClientName,
+		ConfigSourceHash:    p.config.ConfigSourceHash,
+		Phase:               "terminal",
+		ServerName:          serverName,
+		ToolName:            toolName,
+		PolicyDecision:      outcome.PolicyDecision,
+		EvaluationStatus:    outcome.EvaluationStatus,
+		RequiredDisposition: outcome.RequiredDisposition,
+		AppliedDisposition:  outcome.AppliedDisposition,
+		EffectiveMode:       outcome.Mode,
+		PolicyHash:          hashJSON(syncedPolicy),
+		RouteRevision:       p.config.RouteRevision,
+		RawSnapshotID:       rawSnapshotID,
+		EffectiveViewHash:   effectiveViewHash,
+		Dispatched:          outcome.Dispatched,
+		ResultReceived:      outcome.ResultReceived,
+		ResultReturned:      outcome.ResultReturned,
+		ResponseWithheld:    outcome.ResponseWithheld,
+		Terminal:            true,
+		FailureReason:       outcome.FailureReason,
+	}); err != nil && p.config.Logger != nil {
+		p.config.Logger.Warn("could not persist signed application receipt: %v", err)
+	}
+}
+
+func (p *Proxy) manifestEvidence(serverName string, syncedPolicy telemetry.SyncPolicy) (string, string) {
+	rawTools := p.cachedTools(serverName)
+	rawSnapshotID := hashJSON(rawTools)
+	if !p.enforceMode() {
+		return rawSnapshotID, rawSnapshotID
+	}
+	namespacedTools := make([]interface{}, 0, len(rawTools))
+	toolMap := make(map[string]string, len(rawTools))
+	appendNamespacedTools(&namespacedTools, toolMap, serverName, rawTools)
+	effectiveTools := filterToolsForPolicy(namespacedTools, toolMap, syncedPolicy)
+	effectiveTools = p.filterPoisonedTools(effectiveTools)
+	return rawSnapshotID, hashJSON(effectiveTools)
+}
+
+func hashJSON(value interface{}) string {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(data)
+	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
+func newEvidenceID(prefix string) string {
+	var raw [16]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return fmt.Sprintf("%s-%d", prefix, time.Now().UTC().UnixNano())
+	}
+	return prefix + "-" + hex.EncodeToString(raw[:])
 }
 
 func applyDetectionPolicy(result detection.Result, p telemetry.SyncPolicy, local telemetry.DetectionConfig) detection.Result {
@@ -779,7 +1082,7 @@ func applyDetectionPolicy(result detection.Result, p telemetry.SyncPolicy, local
 		if strings.EqualFold(p.Detection.SensitiveData, "block") || strings.EqualFold(local.SensitiveData, "block") {
 			result.Verdict = detection.VerdictBlock
 		}
-	case "threat":
+	case "threat", "tool_poisoning":
 		if strings.EqualFold(p.Detection.Threat, "block") || strings.EqualFold(local.Threat, "block") {
 			result.Verdict = detection.VerdictBlock
 		}
@@ -788,47 +1091,201 @@ func applyDetectionPolicy(result detection.Result, p telemetry.SyncPolicy, local
 }
 
 func (p *Proxy) handleResourcesList(msg JSONRPCMessage) (*JSONRPCMessage, error) {
-	p.startToolRefresh()
-	result := map[string]interface{}{"resources": []interface{}{}}
+	resources, routes := p.loadResources()
+	p.mu.Lock()
+	p.resourceMap = routes
+	p.mu.Unlock()
+	result := map[string]interface{}{"resources": resources}
 	resultJSON, _ := json.Marshal(result)
 	return &JSONRPCMessage{JSONRPC: "2.0", ID: msg.ID, Result: resultJSON}, nil
 }
 
 func (p *Proxy) handleResourcesRead(msg JSONRPCMessage) (*JSONRPCMessage, error) {
-	// Forward to appropriate server based on resource URI
-	// For now, try all servers
-	for _, name := range p.manager.ServerNames() {
+	var params struct {
+		URI string `json:"uri"`
+	}
+	if err := json.Unmarshal(msg.Params, &params); err != nil || params.URI == "" {
+		return nil, fmt.Errorf("invalid resources/read params")
+	}
+	p.mu.Lock()
+	route, ok := p.resourceMap[params.URI]
+	p.mu.Unlock()
+	if !ok {
+		_, routes := p.loadResources()
+		p.mu.Lock()
+		p.resourceMap = routes
+		route, ok = routes[params.URI]
+		p.mu.Unlock()
+	}
+	if !ok {
+		return nil, fmt.Errorf("unknown resource URI")
+	}
+	srv := p.manager.Get(route.ServerName)
+	if srv == nil {
+		return nil, fmt.Errorf("server not available: %s", route.ServerName)
+	}
+	forwardParams, _ := json.Marshal(map[string]interface{}{"uri": route.OriginalURI})
+	response, err := srv.Call("resources/read", forwardParams)
+	if err != nil {
+		return nil, fmt.Errorf("reading resource from %s: %w", route.ServerName, err)
+	}
+	return p.inspectContentResult(msg.ID, route.ServerName, "resources/read", response)
+}
+
+func (p *Proxy) loadResources() ([]interface{}, map[string]resourceRoute) {
+	all := make([]interface{}, 0)
+	routes := make(map[string]resourceRoute)
+	names := p.manager.ServerNames()
+	sort.Strings(names)
+	for _, name := range names {
 		srv := p.manager.Get(name)
 		if srv == nil {
 			continue
 		}
-		response, err := srv.Call("resources/read", msg.Params)
-		if err == nil {
-			return &JSONRPCMessage{JSONRPC: "2.0", ID: msg.ID, Result: response}, nil
+		resources, err := srv.ListResources()
+		if err != nil {
+			p.warn("failed to list resources from %s: %v", name, err)
+			continue
+		}
+		for _, value := range resources {
+			resource, ok := value.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			originalURI, _ := resource["uri"].(string)
+			if originalURI == "" {
+				continue
+			}
+			virtualURI := "agentkeeper://resource/" + base64.RawURLEncoding.EncodeToString([]byte(name)) + "/" + base64.RawURLEncoding.EncodeToString([]byte(originalURI))
+			copy := make(map[string]interface{}, len(resource)+1)
+			for key, entry := range resource {
+				copy[key] = entry
+			}
+			copy["uri"] = virtualURI
+			copy["_meta"] = map[string]interface{}{"agentkeeper": map[string]interface{}{"server": name, "original_uri": originalURI}}
+			all = append(all, copy)
+			routes[virtualURI] = resourceRoute{ServerName: name, OriginalURI: originalURI}
 		}
 	}
-	return nil, fmt.Errorf("no server could handle resources/read")
+	return all, routes
 }
 
 func (p *Proxy) handlePromptsList(msg JSONRPCMessage) (*JSONRPCMessage, error) {
-	p.startToolRefresh()
-	result := map[string]interface{}{"prompts": []interface{}{}}
+	prompts, routes := p.loadPrompts()
+	p.mu.Lock()
+	p.promptMap = routes
+	p.mu.Unlock()
+	result := map[string]interface{}{"prompts": prompts}
 	resultJSON, _ := json.Marshal(result)
 	return &JSONRPCMessage{JSONRPC: "2.0", ID: msg.ID, Result: resultJSON}, nil
 }
 
 func (p *Proxy) handlePromptsGet(msg JSONRPCMessage) (*JSONRPCMessage, error) {
-	for _, name := range p.manager.ServerNames() {
+	var params map[string]interface{}
+	if err := json.Unmarshal(msg.Params, &params); err != nil {
+		return nil, fmt.Errorf("invalid prompts/get params")
+	}
+	namespacedName, _ := params["name"].(string)
+	p.mu.Lock()
+	serverName, ok := p.promptMap[namespacedName]
+	p.mu.Unlock()
+	if !ok {
+		_, routes := p.loadPrompts()
+		p.mu.Lock()
+		p.promptMap = routes
+		serverName, ok = routes[namespacedName]
+		p.mu.Unlock()
+	}
+	if !ok {
+		return nil, fmt.Errorf("unknown prompt: %s", namespacedName)
+	}
+	params["name"] = strings.TrimPrefix(namespacedName, serverName+"__")
+	forwardParams, _ := json.Marshal(params)
+	srv := p.manager.Get(serverName)
+	if srv == nil {
+		return nil, fmt.Errorf("server not available: %s", serverName)
+	}
+	response, err := srv.Call("prompts/get", forwardParams)
+	if err != nil {
+		return nil, fmt.Errorf("getting prompt from %s: %w", serverName, err)
+	}
+	return p.inspectContentResult(msg.ID, serverName, "prompts/get", response)
+}
+
+func (p *Proxy) loadPrompts() ([]interface{}, map[string]string) {
+	all := make([]interface{}, 0)
+	routes := make(map[string]string)
+	names := p.manager.ServerNames()
+	sort.Strings(names)
+	for _, name := range names {
 		srv := p.manager.Get(name)
 		if srv == nil {
 			continue
 		}
-		response, err := srv.Call("prompts/get", msg.Params)
-		if err == nil {
-			return &JSONRPCMessage{JSONRPC: "2.0", ID: msg.ID, Result: response}, nil
+		prompts, err := srv.ListPrompts()
+		if err != nil {
+			p.warn("failed to list prompts from %s: %v", name, err)
+			continue
+		}
+		for _, value := range prompts {
+			prompt, ok := value.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			originalName, _ := prompt["name"].(string)
+			if originalName == "" {
+				continue
+			}
+			namespacedName := name + "__" + originalName
+			copy := make(map[string]interface{}, len(prompt))
+			for key, entry := range prompt {
+				copy[key] = entry
+			}
+			copy["name"] = namespacedName
+			all = append(all, copy)
+			routes[namespacedName] = name
 		}
 	}
-	return nil, fmt.Errorf("no server could handle prompts/get")
+	return all, routes
+}
+
+func (p *Proxy) inspectContentResult(id *json.RawMessage, serverName, method string, response json.RawMessage) (*JSONRPCMessage, error) {
+	enforceThisCall := p.enforceMode()
+	result := detection.Result{Verdict: detection.VerdictPass}
+	if p.config.DetectionEngine != nil {
+		result = p.config.DetectionEngine.EvaluateToolResponse(serverName, method, string(response))
+		if p.telemetry != nil {
+			result = applyDetectionPolicy(result, p.telemetry.Policy(), p.config.Detection)
+		}
+	}
+	decision := string(result.Verdict)
+	if decision == "" {
+		decision = "pass"
+	}
+	outcome := logging.ToolCallOutcome{
+		CallID: newEvidenceID("call"), AttemptID: newEvidenceID("attempt"),
+		Mode: "observe", PolicyDecision: decision, EvaluationStatus: "evaluated",
+		RequiredDisposition: "forward", AppliedDisposition: "result_returned",
+		Dispatched: true, ResultReceived: true, ResultReturned: true,
+	}
+	if enforceThisCall {
+		outcome.Mode = "enforce"
+	}
+	if result.Verdict == detection.VerdictBlock && enforceThisCall {
+		outcome.RequiredDisposition = "withhold_result"
+		outcome.AppliedDisposition = "result_withheld"
+		outcome.ResultReturned = false
+		outcome.ResponseWithheld = true
+		p.logToolOutcome(serverName, method, nil, result, outcome)
+		blocked := map[string]interface{}{
+			"content": []map[string]interface{}{{"type": "text", "text": "Blocked by AgentKeeper: upstream content was withheld."}},
+			"isError": true,
+		}
+		blockedJSON, _ := json.Marshal(blocked)
+		return &JSONRPCMessage{JSONRPC: "2.0", ID: id, Result: blockedJSON}, nil
+	}
+	p.logToolOutcome(serverName, method, nil, result, outcome)
+	return &JSONRPCMessage{JSONRPC: "2.0", ID: id, Result: response}, nil
 }
 
 func (p *Proxy) getBuiltinTools() []interface{} {
@@ -857,7 +1314,7 @@ func (p *Proxy) handleBuiltinToolCall(id *json.RawMessage, name string, args map
 	switch name {
 	case "agentkeeper_status":
 		mode := "audit"
-		if p.config.EnforceMode {
+		if p.enforceMode() {
 			mode = "enforce"
 		}
 		servers := p.manager.ServerNames()

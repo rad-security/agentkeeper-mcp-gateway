@@ -26,6 +26,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strings"
 
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/config"
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/configbackup"
@@ -66,14 +67,16 @@ type Adapter struct {
 // Plan describes what Apply would do for a single IDE, in one struct so the
 // command layer can render a summary and the caller can run --dry-run safely.
 type Plan struct {
-	IDE          string
-	ConfigPath   string
-	Exists       bool          // did the file exist when Plan was built
-	HasGateway   bool          // an exact AgentKeeper gateway entry is present
-	AlreadyWired bool          // gateway is the sole MCP entry already
-	Migrated     []NamedServer // servers we'd move into the gateway's own config
-	NativeKept   []NamedServer // remote OAuth/native-auth servers kept in the IDE config
-	BackupPath   string        // set by Apply when it writes a backup
+	IDE           string
+	ConfigPath    string
+	Exists        bool          // did the file exist when Plan was built
+	HasGateway    bool          // an exact AgentKeeper gateway entry is present
+	AlreadyWired  bool          // gateway is the sole MCP entry already
+	Migrated      []NamedServer // servers we'd move into the gateway's own config
+	NativeKept    []NamedServer // remote OAuth/native-auth servers kept in the IDE config
+	BackupPath    string        // set by Apply when it writes a backup
+	SourceHash    string        // hash of the exact client config read during preview
+	RouteRevision string        // deterministic route identity bound to client + source
 }
 
 // Adapters returns the adapters applicable on the current OS.
@@ -139,24 +142,33 @@ func cursorAdapter() *Adapter {
 }
 
 // gatewayEntry is the single server entry we write into every IDE config.
-func gatewayEntry() ServerEntry {
+func gatewayEntry(plan Plan) ServerEntry {
 	return ServerEntry{
 		Command: gatewayentry.Command(),
 		Args:    []string{"server"},
+		Env: map[string]string{
+			gatewayentry.EnvClientName:       plan.IDE,
+			gatewayentry.EnvConfigSourceHash: plan.SourceHash,
+			gatewayentry.EnvRouteRevision:    plan.RouteRevision,
+		},
 	}
 }
 
 // isGatewayEntry reports whether an entry matches our canonical shape. When an
 // installed binary path is known, the command must match that path exactly so a
 // rerun repairs stale /usr/local or bare entries.
-func isGatewayEntry(e ServerEntry) bool {
+func isGatewayCommandEntry(e ServerEntry) bool {
 	if !gatewayentry.IsCurrentGatewayCommand(e.Command) {
 		return false
 	}
-	if len(e.Args) != 1 || e.Args[0] != "server" {
-		return false
-	}
-	return true
+	return len(e.Args) == 1 && e.Args[0] == "server"
+}
+
+func isGatewayEntry(e ServerEntry, clientName string) bool {
+	return isGatewayCommandEntry(e) &&
+		strings.TrimSpace(e.Env[gatewayentry.EnvClientName]) == clientName &&
+		strings.TrimSpace(e.Env[gatewayentry.EnvConfigSourceHash]) != "" &&
+		strings.TrimSpace(e.Env[gatewayentry.EnvRouteRevision]) != ""
 }
 
 // Plan reads the IDE config and computes what Apply would do. Missing files
@@ -174,10 +186,12 @@ func (a *Adapter) Plan() (Plan, error) {
 	case err == nil:
 		p.Exists = true
 	case errors.Is(err, os.ErrNotExist):
+		p.SourceHash, p.RouteRevision = routeIdentity(a.Name, []byte("absent"))
 		return p, nil
 	default:
 		return p, fmt.Errorf("reading %s: %w", path, err)
 	}
+	p.SourceHash, p.RouteRevision = routeIdentity(a.Name, data)
 
 	// Preserve unknown top-level keys via RawMessage. We only decode the
 	// `mcpServers` key into a typed map.
@@ -194,9 +208,11 @@ func (a *Adapter) Plan() (Plan, error) {
 	}
 
 	hasCurrentGateway := false
-	if entry, ok := servers[GatewayServerName]; ok && isGatewayEntry(entry) {
-		hasCurrentGateway = true
+	if entry, ok := servers[GatewayServerName]; ok && isGatewayCommandEntry(entry) {
 		p.HasGateway = true
+		if isGatewayEntry(entry, a.Name) {
+			hasCurrentGateway = true
+		}
 	}
 
 	// Collect everything except any existing gateway entry — that one gets
@@ -258,6 +274,10 @@ func (a *Adapter) apply(p *Plan, pruneNativeGatewayEntries bool) error {
 		if err != nil {
 			return fmt.Errorf("re-reading %s for apply: %w", p.ConfigPath, err)
 		}
+		currentSourceHash, _ := routeIdentity(p.IDE, data)
+		if p.SourceHash == "" || currentSourceHash != p.SourceHash {
+			return fmt.Errorf("configuration changed after preview for %s; refusing to write (expected %s, observed %s)", p.ConfigPath, p.SourceHash, currentSourceHash)
+		}
 		if err := json.Unmarshal(data, &raw); err != nil {
 			return fmt.Errorf("parsing %s: %w", p.ConfigPath, err)
 		}
@@ -266,12 +286,16 @@ func (a *Adapter) apply(p *Plan, pruneNativeGatewayEntries bool) error {
 			return fmt.Errorf("writing backup %s: %w", backup, err)
 		}
 		p.BackupPath = backup
+	} else if _, err := os.Stat(p.ConfigPath); err == nil {
+		return fmt.Errorf("configuration appeared after preview for %s; refusing to write", p.ConfigPath)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("checking %s before apply: %w", p.ConfigPath, err)
 	}
 	if raw == nil {
 		raw = map[string]json.RawMessage{}
 	}
 
-	newServers := map[string]ServerEntry{GatewayServerName: gatewayEntry()}
+	newServers := map[string]ServerEntry{GatewayServerName: gatewayEntry(*p)}
 	for _, kept := range p.NativeKept {
 		if kept.Name == "" || kept.Name == GatewayServerName {
 			continue
@@ -302,6 +326,10 @@ func (a *Adapter) apply(p *Plan, pruneNativeGatewayEntries bool) error {
 		pruneNativeKeptFromGatewayConfig(p.NativeKept)
 	}
 	return nil
+}
+
+func routeIdentity(clientName string, source []byte) (string, string) {
+	return gatewayentry.RouteIdentity(clientName, source)
 }
 
 func writeAtomic(path string, data []byte, mode os.FileMode) error {

@@ -377,6 +377,11 @@ func (s *Server) sendNotification(method string, params json.RawMessage) {
 	s.mu.Unlock()
 }
 
+// Notify forwards a client notification to this upstream MCP server.
+func (s *Server) Notify(method string, params json.RawMessage) {
+	s.sendNotification(method, params)
+}
+
 func (s *Server) IsHTTP() bool {
 	return normalizeTransport(s.config) == "http"
 }

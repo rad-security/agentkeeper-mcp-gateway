@@ -27,6 +27,41 @@ func TestLogToolCallDefaultsEmptyVerdictToPass(t *testing.T) {
 	}
 }
 
+func TestLogToolCallOutcomeSeparatesDecisionFromAppliedDisposition(t *testing.T) {
+	logger, err := NewLogger(filepath.Join(t.TempDir(), "events.jsonl"), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.LogToolCallOutcome("atlas", "delete", nil, detection.Result{
+		Verdict: detection.VerdictBlock,
+	}, ToolCallOutcome{
+		CallID:              "call-1",
+		AttemptID:           "attempt-1",
+		Mode:                "observe",
+		PolicyDecision:      "block",
+		EvaluationStatus:    "evaluated",
+		RequiredDisposition: "forward",
+		AppliedDisposition:  "result_returned",
+		Dispatched:          true,
+		ResultReceived:      true,
+		ResultReturned:      true,
+	})
+
+	events := logger.FlushBuffer()
+	if len(events) != 1 {
+		t.Fatalf("events = %d, want 1", len(events))
+	}
+	if got := events[0].Context["policy_decision"]; got != "block" {
+		t.Fatalf("policy_decision = %#v", got)
+	}
+	if got := events[0].Context["applied_disposition"]; got != "result_returned" {
+		t.Fatalf("applied_disposition = %#v", got)
+	}
+	if got := events[0].Context["dispatched"]; got != true {
+		t.Fatalf("dispatched = %#v", got)
+	}
+}
+
 func TestLogSessionStartStaysLocalButDoesNotUpload(t *testing.T) {
 	logPath := filepath.Join(t.TempDir(), "events.jsonl")
 	logger, err := NewLogger(logPath, false)

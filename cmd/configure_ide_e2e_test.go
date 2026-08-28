@@ -131,6 +131,22 @@ func writeGatewayConfig(t *testing.T, home, body string) string {
 	return path
 }
 
+func routedGatewayOnlyConfig(client string) string {
+	return fmt.Sprintf(`{
+		"mcpServers": {
+			"agentkeeper-mcp-gateway": {
+				"command": %q,
+				"args": ["server"],
+				"env": {
+					"AGENTKEEPER_MCP_CLIENT": %q,
+					"AGENTKEEPER_MCP_CONFIG_SOURCE_HASH": "sha256:test-fixture",
+					"AGENTKEEPER_MCP_ROUTE_REVISION": "route:test-fixture"
+				}
+			}
+		}
+	}`, binary, client)
+}
+
 // readConfig parses a written IDE config.
 func readConfig(t *testing.T, path string) map[string]json.RawMessage {
 	t.Helper()
@@ -540,7 +556,7 @@ func TestE2E17_AlreadyWiredPreservesExtras(t *testing.T) {
 	home := t.TempDir()
 	body := fmt.Sprintf(`{
   "mcpServers": {
-    "agentkeeper-mcp-gateway": {"command": %q, "args": ["server"]}
+	    "agentkeeper-mcp-gateway": {"command": %q, "args": ["server"], "env": {"AGENTKEEPER_MCP_CLIENT":"cursor","AGENTKEEPER_MCP_CONFIG_SOURCE_HASH":"sha256:source","AGENTKEEPER_MCP_ROUTE_REVISION":"route:revision"}}
   },
   "editor": {"tabSize": 2},
   "version": 42
@@ -619,7 +635,7 @@ func TestE2E19_CaseSensitiveBasenameMatch(t *testing.T) {
 // has an extra field like "type":"stdio" that some IDEs add.
 func TestE2E20_ExtraFieldOnGatewayEntry_StillWired(t *testing.T) {
 	home := t.TempDir()
-	body := fmt.Sprintf(`{"mcpServers":{"agentkeeper-mcp-gateway":{"command":%q,"args":["server"],"type":"stdio"}}}`, binary)
+	body := fmt.Sprintf(`{"mcpServers":{"agentkeeper-mcp-gateway":{"command":%q,"args":["server"],"type":"stdio","env":{"AGENTKEEPER_MCP_CLIENT":"cursor","AGENTKEEPER_MCP_CONFIG_SOURCE_HASH":"sha256:source","AGENTKEEPER_MCP_ROUTE_REVISION":"route:revision"}}}}`, binary)
 	writeFixture(t, home, "cursor", body)
 	// We don't have a getter for the Plan struct here; we can only check via
 	// observable behavior: no backup should be created if we consider this wired.
@@ -1146,14 +1162,7 @@ func TestE2E27_CoworkPluginMCPJSONMigrated(t *testing.T) {
 
 func TestE2E28_CoworkDoctorReportsPartialRouting(t *testing.T) {
 	home := t.TempDir()
-	writeFixture(t, home, "claude-desktop", fmt.Sprintf(`{
-		"mcpServers": {
-			"agentkeeper-mcp-gateway": {
-				"command": %q,
-				"args": ["server"]
-			}
-		}
-	}`, binary))
+	writeFixture(t, home, "claude-desktop", routedGatewayOnlyConfig("cowork"))
 
 	pluginMCP := filepath.Join(
 		claudeAppSupportPath(home),
@@ -1319,14 +1328,7 @@ func TestE2E30_CoworkGuardOnceDisablesNewRemoteMCPSource(t *testing.T) {
 
 func TestE2E31_CoworkDoctorCanFailWhenNativeConnectorCoverageIsRequired(t *testing.T) {
 	home := t.TempDir()
-	writeFixture(t, home, "claude-desktop", fmt.Sprintf(`{
-		"mcpServers": {
-			"agentkeeper-mcp-gateway": {
-				"command": %q,
-				"args": ["server"]
-			}
-		}
-	}`, binary))
+	writeFixture(t, home, "claude-desktop", routedGatewayOnlyConfig("cowork"))
 	writeGatewayConfig(t, home, `{
 		"mode": "audit",
 		"servers": [{
@@ -1350,14 +1352,7 @@ func TestE2E31_CoworkDoctorCanFailWhenNativeConnectorCoverageIsRequired(t *testi
 
 func TestE2E32_CoworkDoctorStrictFailsWhenGatewayHasNoBackends(t *testing.T) {
 	home := t.TempDir()
-	writeFixture(t, home, "claude-desktop", fmt.Sprintf(`{
-		"mcpServers": {
-			"agentkeeper-mcp-gateway": {
-				"command": %q,
-				"args": ["server"]
-			}
-		}
-	}`, binary))
+	writeFixture(t, home, "claude-desktop", routedGatewayOnlyConfig("cowork"))
 
 	out, stderr, code := run(t, home, "cowork", "doctor", "--strict")
 	if code == 0 {

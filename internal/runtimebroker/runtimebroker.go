@@ -134,7 +134,7 @@ type brokerResponse struct {
 
 func Post(ctx context.Context, socketPath, operation string, payload any, out any) (int, error) {
 	switch operation {
-	case "sync", "evaluate", "events":
+	case "sync", "register", "evaluate", "evaluate_v2", "events", "receipts":
 	default:
 		return 0, fmt.Errorf("unsupported runtime broker operation %q", operation)
 	}
