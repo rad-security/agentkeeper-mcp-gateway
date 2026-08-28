@@ -39,6 +39,12 @@ signs:
     signature: "${artifact}.sig"
     certificate: "${artifact}.pem"
 
+# Preserve SemVer prerelease tags (for example, v0.2.0-sandbox.2) as GitHub
+# prereleases when GoReleaser publishes assets to an existing release. Stable
+# tags continue to publish as ordinary releases.
+release:
+  prerelease: auto
+
 # Homebrew tap is out of scope for v0.1.0 — tap repo does not exist.
 # Re-enable once rad-security/homebrew-tap is created (see parent plan §4 Non-Goals).
 # brews:
