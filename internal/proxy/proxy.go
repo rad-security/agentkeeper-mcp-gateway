@@ -1254,9 +1254,15 @@ func (p *Proxy) inspectContentResult(id *json.RawMessage, serverName, method str
 	result := detection.Result{Verdict: detection.VerdictPass}
 	if p.config.DetectionEngine != nil {
 		result = p.config.DetectionEngine.EvaluateToolResponse(serverName, method, string(response))
+		syncedPolicy := telemetry.SyncPolicy{}
 		if p.telemetry != nil {
-			result = applyDetectionPolicy(result, p.telemetry.Policy(), p.config.Detection)
+			syncedPolicy = p.telemetry.Policy()
 		}
+		// Local detection policy is authoritative even when the Gateway is
+		// offline or intentionally deployed without cloud telemetry. Resources
+		// and prompts must honor the same Observe/Enforce contract as tool
+		// results; cloud policy augments that contract but is not a prerequisite.
+		result = applyDetectionPolicy(result, syncedPolicy, p.config.Detection)
 	}
 	decision := string(result.Verdict)
 	if decision == "" {
