@@ -5,6 +5,7 @@ package proxy
 
 import (
 	"bufio"
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -15,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -30,7 +32,10 @@ import (
 
 const (
 	backendToolListWarmupDeadline = 2 * time.Second
+	backendContentListDeadline    = 2 * time.Second
 )
+
+var simpleResourceTemplateVariable = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_.-]*$`)
 
 // JSONRPCMessage represents a JSON-RPC 2.0 message.
 type JSONRPCMessage struct {
@@ -67,22 +72,27 @@ type Proxy struct {
 	config    Config
 	manager   *server.Manager
 	telemetry *telemetry.Client
+	ctx       context.Context
+	cancel    context.CancelFunc
+	closeOnce sync.Once
+	wg        sync.WaitGroup
 	mu        sync.Mutex
 	modeMu    sync.RWMutex
 	// Map from namespaced tool name to server name
-	toolMap         map[string]string
-	poisonedTools   map[string]detection.Result
-	resourceMap     map[string]resourceRoute
-	promptMap       map[string]string
-	toolCache       map[string][]interface{}
-	emptyToolLists  map[string]int
-	toolStatus      map[string]toolRefreshStatus
-	toolRefreshMu   sync.Mutex
-	toolRefreshDone chan struct{}
-	clientReady     bool
-	activeToolsList int
-	pendingListNote bool
-	writeMu         sync.Mutex
+	toolMap           map[string]string
+	poisonedTools     map[string]detection.Result
+	resourceMap       map[string]resourceRoute
+	resourceTemplates []resourceTemplateRoute
+	promptMap         map[string]string
+	toolCache         map[string][]interface{}
+	emptyToolLists    map[string]int
+	toolStatus        map[string]toolRefreshStatus
+	toolRefreshMu     sync.Mutex
+	toolRefreshDone   chan struct{}
+	clientReady       bool
+	activeToolsList   int
+	pendingListNote   bool
+	writeMu           sync.Mutex
 }
 
 type toolRefreshStatus struct {
@@ -94,6 +104,12 @@ type toolRefreshStatus struct {
 type resourceRoute struct {
 	ServerName  string
 	OriginalURI string
+}
+
+type resourceTemplateRoute struct {
+	ServerName string
+	Template   string
+	Matcher    *regexp.Regexp
 }
 
 type persistentToolCache struct {
@@ -108,10 +124,13 @@ type persistentToolSet struct {
 
 // NewProxy creates a new MCP proxy.
 func NewProxy(cfg Config, mgr *server.Manager, tc *telemetry.Client) *Proxy {
+	ctx, cancel := context.WithCancel(context.Background())
 	p := &Proxy{
 		config:         cfg,
 		manager:        mgr,
 		telemetry:      tc,
+		ctx:            ctx,
+		cancel:         cancel,
 		toolMap:        make(map[string]string),
 		poisonedTools:  make(map[string]detection.Result),
 		resourceMap:    make(map[string]resourceRoute),
@@ -153,7 +172,21 @@ func verdictRank(v string) int {
 
 // Run starts the proxy, reading from stdin and writing to stdout.
 func (p *Proxy) Run() error {
+	defer p.Close()
 	return p.run(os.Stdin, os.Stdout)
+}
+
+// Close cancels background discovery and waits for it to leave backend pipes
+// before the manager closes child processes.
+func (p *Proxy) Close() {
+	p.closeOnce.Do(func() {
+		if p.cancel != nil {
+			p.cancel()
+		}
+		p.toolRefreshMu.Lock()
+		p.toolRefreshMu.Unlock()
+		p.wg.Wait()
+	})
 }
 
 func (p *Proxy) run(input io.Reader, writer io.Writer) error {
@@ -240,6 +273,8 @@ func (p *Proxy) handleMessage(msg JSONRPCMessage) (*JSONRPCMessage, error) {
 		return p.handleToolsCall(msg)
 	case "resources/list":
 		return p.handleResourcesList(msg)
+	case "resources/templates/list":
+		return p.handleResourceTemplatesList(msg)
 	case "resources/read":
 		return p.handleResourcesRead(msg)
 	case "prompts/list":
@@ -305,7 +340,7 @@ func (p *Proxy) handleInitialize(msg JSONRPCMessage) (*JSONRPCMessage, error) {
 }
 
 func negotiateProtocolVersion(params json.RawMessage) string {
-	const fallback = "2024-11-05"
+	const fallback = "2025-11-25"
 	var request struct {
 		ProtocolVersion string `json:"protocolVersion"`
 	}
@@ -313,7 +348,7 @@ func negotiateProtocolVersion(params json.RawMessage) string {
 		return fallback
 	}
 	switch request.ProtocolVersion {
-	case "2024-11-05", "2025-03-26", "2025-06-18":
+	case "2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25":
 		return request.ProtocolVersion
 	default:
 		return fallback
@@ -388,6 +423,16 @@ func filterToolsForPolicy(tools []interface{}, toolMap map[string]string, synced
 
 func (p *Proxy) startToolRefresh() <-chan struct{} {
 	p.toolRefreshMu.Lock()
+	if p.ctx != nil {
+		select {
+		case <-p.ctx.Done():
+			done := make(chan struct{})
+			close(done)
+			p.toolRefreshMu.Unlock()
+			return done
+		default:
+		}
+	}
 	if p.toolRefreshDone != nil {
 		done := p.toolRefreshDone
 		p.toolRefreshMu.Unlock()
@@ -396,9 +441,11 @@ func (p *Proxy) startToolRefresh() <-chan struct{} {
 
 	done := make(chan struct{})
 	p.toolRefreshDone = done
+	p.wg.Add(1)
 	p.toolRefreshMu.Unlock()
 
 	go func() {
+		defer p.wg.Done()
 		defer close(done)
 		p.refreshTools()
 
@@ -428,7 +475,7 @@ func (p *Proxy) refreshTools() {
 				results <- listResult{name: name}
 				return
 			}
-			tools, err := srv.ListTools()
+			tools, err := srv.ListToolsContext(p.proxyContext())
 			results <- listResult{name: name, tools: tools, err: err}
 		}(name)
 	}
@@ -436,6 +483,9 @@ func (p *Proxy) refreshTools() {
 	for remaining := len(names); remaining > 0; remaining-- {
 		result := <-results
 		if result.err != nil {
+			if p.ctx != nil && p.ctx.Err() != nil {
+				continue
+			}
 			p.warn("failed to list tools from %s: %v", result.name, result.err)
 			p.setToolStatus(result.name, toolRefreshStatus{
 				Status:    "degraded",
@@ -650,6 +700,13 @@ func (p *Proxy) beginToolsList() func() {
 }
 
 func (p *Proxy) emitToolsListChanged() {
+	if p.ctx != nil {
+		select {
+		case <-p.ctx.Done():
+			return
+		default:
+		}
+	}
 	p.mu.Lock()
 	if !p.clientReady {
 		p.mu.Unlock()
@@ -666,6 +723,13 @@ func (p *Proxy) emitToolsListChanged() {
 		JSONRPC: "2.0",
 		Method:  "notifications/tools/list_changed",
 	})
+}
+
+func (p *Proxy) proxyContext() context.Context {
+	if p.ctx != nil {
+		return p.ctx
+	}
+	return context.Background()
 }
 
 func (p *Proxy) cachedTools(serverName string) []interface{} {
@@ -1177,6 +1241,21 @@ func (p *Proxy) handleResourcesRead(msg JSONRPCMessage) (*JSONRPCMessage, error)
 		p.mu.Unlock()
 	}
 	if !ok {
+		p.mu.Lock()
+		templates := append([]resourceTemplateRoute(nil), p.resourceTemplates...)
+		p.mu.Unlock()
+		if len(templates) == 0 {
+			_, templates = p.loadResourceTemplates()
+			p.mu.Lock()
+			p.resourceTemplates = templates
+			p.mu.Unlock()
+		}
+		if templateRoute, resolved := resolveResourceTemplateRoute(params.URI, templates); resolved {
+			route = resourceRoute{ServerName: templateRoute.ServerName, OriginalURI: params.URI}
+			ok = true
+		}
+	}
+	if !ok {
 		return nil, fmt.Errorf("unknown resource URI")
 	}
 	srv := p.manager.Get(route.ServerName)
@@ -1192,20 +1271,46 @@ func (p *Proxy) handleResourcesRead(msg JSONRPCMessage) (*JSONRPCMessage, error)
 }
 
 func (p *Proxy) loadResources() ([]interface{}, map[string]resourceRoute) {
-	all := make([]interface{}, 0)
-	routes := make(map[string]resourceRoute)
 	names := p.manager.ServerNames()
 	sort.Strings(names)
+	type listResult struct {
+		name      string
+		resources []interface{}
+		err       error
+	}
+	ctx, cancel := context.WithTimeout(p.proxyContext(), backendContentListDeadline)
+	defer cancel()
+	results := make(chan listResult, len(names))
 	for _, name := range names {
-		srv := p.manager.Get(name)
-		if srv == nil {
-			continue
+		go func(name string) {
+			srv := p.manager.Get(name)
+			if srv == nil {
+				results <- listResult{name: name}
+				return
+			}
+			resources, err := srv.ListResourcesContext(ctx)
+			results <- listResult{name: name, resources: resources, err: err}
+		}(name)
+	}
+	listed := make(map[string][]interface{}, len(names))
+	for remaining := len(names); remaining > 0; remaining-- {
+		select {
+		case result := <-results:
+			if result.err != nil {
+				if ctx.Err() == nil {
+					p.warn("failed to list resources from %s: %v", result.name, result.err)
+				}
+				continue
+			}
+			listed[result.name] = result.resources
+		case <-ctx.Done():
+			remaining = 0
 		}
-		resources, err := srv.ListResources()
-		if err != nil {
-			p.warn("failed to list resources from %s: %v", name, err)
-			continue
-		}
+	}
+	all := make([]interface{}, 0)
+	routes := make(map[string]resourceRoute)
+	for _, name := range names {
+		resources := listed[name]
 		for _, value := range resources {
 			resource, ok := value.(map[string]interface{})
 			if !ok {
@@ -1227,6 +1332,126 @@ func (p *Proxy) loadResources() ([]interface{}, map[string]resourceRoute) {
 		}
 	}
 	return all, routes
+}
+
+func (p *Proxy) handleResourceTemplatesList(msg JSONRPCMessage) (*JSONRPCMessage, error) {
+	templates, routes := p.loadResourceTemplates()
+	p.mu.Lock()
+	p.resourceTemplates = routes
+	p.mu.Unlock()
+	resultJSON, _ := json.Marshal(map[string]interface{}{"resourceTemplates": templates})
+	return &JSONRPCMessage{JSONRPC: "2.0", ID: msg.ID, Result: resultJSON}, nil
+}
+
+func (p *Proxy) loadResourceTemplates() ([]interface{}, []resourceTemplateRoute) {
+	names := p.manager.ServerNames()
+	sort.Strings(names)
+	type listResult struct {
+		name      string
+		templates []interface{}
+		err       error
+	}
+	ctx, cancel := context.WithTimeout(p.proxyContext(), backendContentListDeadline)
+	defer cancel()
+	results := make(chan listResult, len(names))
+	for _, name := range names {
+		go func(name string) {
+			srv := p.manager.Get(name)
+			if srv == nil {
+				results <- listResult{name: name}
+				return
+			}
+			templates, err := srv.ListResourceTemplatesContext(ctx)
+			results <- listResult{name: name, templates: templates, err: err}
+		}(name)
+	}
+	listed := make(map[string][]interface{}, len(names))
+	for remaining := len(names); remaining > 0; remaining-- {
+		select {
+		case result := <-results:
+			if result.err != nil {
+				if ctx.Err() == nil {
+					p.warn("failed to list resource templates from %s: %v", result.name, result.err)
+				}
+				continue
+			}
+			listed[result.name] = result.templates
+		case <-ctx.Done():
+			remaining = 0
+		}
+	}
+	all := make([]interface{}, 0)
+	routes := make([]resourceTemplateRoute, 0)
+	for _, name := range names {
+		for _, value := range listed[name] {
+			template, ok := value.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			originalTemplate, _ := template["uriTemplate"].(string)
+			matcher := compileResourceTemplate(originalTemplate)
+			if originalTemplate == "" || matcher == nil {
+				continue
+			}
+			copy := make(map[string]interface{}, len(template)+1)
+			for key, entry := range template {
+				copy[key] = entry
+			}
+			if originalName, _ := copy["name"].(string); originalName != "" {
+				copy["name"] = name + "__" + originalName
+			}
+			copy["_meta"] = map[string]interface{}{"agentkeeper": map[string]interface{}{"server": name, "original_uri_template": originalTemplate}}
+			all = append(all, copy)
+			routes = append(routes, resourceTemplateRoute{ServerName: name, Template: originalTemplate, Matcher: matcher})
+		}
+	}
+	return all, routes
+}
+
+func compileResourceTemplate(template string) *regexp.Regexp {
+	if strings.TrimSpace(template) == "" {
+		return nil
+	}
+	var pattern strings.Builder
+	pattern.WriteString("^")
+	for cursor := 0; cursor < len(template); {
+		open := strings.IndexByte(template[cursor:], '{')
+		if open < 0 {
+			pattern.WriteString(regexp.QuoteMeta(template[cursor:]))
+			break
+		}
+		open += cursor
+		closeOffset := strings.IndexByte(template[open+1:], '}')
+		if closeOffset < 0 {
+			return nil
+		}
+		closeIndex := open + 1 + closeOffset
+		variable := template[open+1 : closeIndex]
+		if !simpleResourceTemplateVariable.MatchString(variable) {
+			return nil
+		}
+		pattern.WriteString(regexp.QuoteMeta(template[cursor:open]))
+		pattern.WriteString("[^/?#]+")
+		cursor = closeIndex + 1
+	}
+	pattern.WriteString("$")
+	matcher, err := regexp.Compile(pattern.String())
+	if err != nil {
+		return nil
+	}
+	return matcher
+}
+
+func resolveResourceTemplateRoute(uri string, routes []resourceTemplateRoute) (resourceTemplateRoute, bool) {
+	var match resourceTemplateRoute
+	count := 0
+	for _, route := range routes {
+		if route.Matcher != nil && route.Matcher.MatchString(uri) {
+			match = route
+			count++
+		}
+	}
+	return match, count == 1
 }
 
 func (p *Proxy) handlePromptsList(msg JSONRPCMessage) (*JSONRPCMessage, error) {
@@ -1272,20 +1497,46 @@ func (p *Proxy) handlePromptsGet(msg JSONRPCMessage) (*JSONRPCMessage, error) {
 }
 
 func (p *Proxy) loadPrompts() ([]interface{}, map[string]string) {
-	all := make([]interface{}, 0)
-	routes := make(map[string]string)
 	names := p.manager.ServerNames()
 	sort.Strings(names)
+	type listResult struct {
+		name    string
+		prompts []interface{}
+		err     error
+	}
+	ctx, cancel := context.WithTimeout(p.proxyContext(), backendContentListDeadline)
+	defer cancel()
+	results := make(chan listResult, len(names))
 	for _, name := range names {
-		srv := p.manager.Get(name)
-		if srv == nil {
-			continue
+		go func(name string) {
+			srv := p.manager.Get(name)
+			if srv == nil {
+				results <- listResult{name: name}
+				return
+			}
+			prompts, err := srv.ListPromptsContext(ctx)
+			results <- listResult{name: name, prompts: prompts, err: err}
+		}(name)
+	}
+	listed := make(map[string][]interface{}, len(names))
+	for remaining := len(names); remaining > 0; remaining-- {
+		select {
+		case result := <-results:
+			if result.err != nil {
+				if ctx.Err() == nil {
+					p.warn("failed to list prompts from %s: %v", result.name, result.err)
+				}
+				continue
+			}
+			listed[result.name] = result.prompts
+		case <-ctx.Done():
+			remaining = 0
 		}
-		prompts, err := srv.ListPrompts()
-		if err != nil {
-			p.warn("failed to list prompts from %s: %v", name, err)
-			continue
-		}
+	}
+	all := make([]interface{}, 0)
+	routes := make(map[string]string)
+	for _, name := range names {
+		prompts := listed[name]
 		for _, value := range prompts {
 			prompt, ok := value.(map[string]interface{})
 			if !ok {

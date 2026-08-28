@@ -66,14 +66,28 @@ func NewLogger(logPath string, verbose bool) (*Logger, error) {
 		logPath = filepath.Join(home, ".config", "agentkeeper-mcp-gateway", "events.jsonl")
 	}
 
-	if err := os.MkdirAll(filepath.Dir(logPath), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(logPath), 0700); err != nil {
 		fmt.Fprintf(os.Stderr, "[agentkeeper] local event log disabled: creating log directory: %v\n", err)
 		return newBufferedLogger(nil, logPath, verbose), nil
 	}
+	if info, err := os.Lstat(logPath); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+			fmt.Fprintf(os.Stderr, "[agentkeeper] local event log disabled: refusing non-regular log path %s\n", logPath)
+			return newBufferedLogger(nil, logPath, verbose), nil
+		}
+	} else if !os.IsNotExist(err) {
+		fmt.Fprintf(os.Stderr, "[agentkeeper] local event log disabled: inspecting log file: %v\n", err)
+		return newBufferedLogger(nil, logPath, verbose), nil
+	}
 
-	file, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	file, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[agentkeeper] local event log disabled: opening log file: %v\n", err)
+		return newBufferedLogger(nil, logPath, verbose), nil
+	}
+	if err := file.Chmod(0600); err != nil {
+		_ = file.Close()
+		fmt.Fprintf(os.Stderr, "[agentkeeper] local event log disabled: securing log file: %v\n", err)
 		return newBufferedLogger(nil, logPath, verbose), nil
 	}
 

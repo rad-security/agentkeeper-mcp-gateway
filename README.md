@@ -22,6 +22,18 @@ agentkeeper-mcp-gateway list --health
 
 Restart the MCP client after `configure-ide`, then make one real tool call. The gateway proxies routed MCP traffic, detects threats in real time, and logs everything locally. Manual `agentkeeper-mcp-gateway add` is still available for unsupported config sources, gateway-native admin setup, and lab cases, but it is not the default rollout workflow.
 
+## MCP protocol compatibility
+
+The gateway negotiates MCP protocol versions `2024-11-05`, `2025-03-26`,
+`2025-06-18`, and `2025-11-25`. It aggregates and routes tools, resources,
+resource templates, and prompts only when an upstream server declares the
+corresponding capability. Resource-template routing supports the common
+single-value `{name}` form; it is not a claim of complete RFC 6570 support.
+
+Backend process configuration is structured: keep the executable in `command`
+and its arguments in `args`. Existing legacy command strings remain compatible,
+but an executable path containing spaces is treated as one atomic path.
+
 ## Local Development
 
 This repository is the standalone Go MCP gateway used by AgentKeeper. The main
@@ -95,6 +107,11 @@ agentkeeper-mcp-gateway server
 ```bash
 agentkeeper-mcp-gateway server --enforce
 ```
+
+Local event files and their containing directory are owner-only (`0600` and
+`0700`). If the configured event path is a symlink or another non-regular file,
+local persistence is disabled while the in-memory upload buffer remains
+available.
 
 ## Warn Mode
 
