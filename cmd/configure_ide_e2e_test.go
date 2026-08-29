@@ -774,6 +774,93 @@ func TestE2E25_NewServerBetweenRunsMigrated(t *testing.T) {
 	}
 }
 
+func TestE2E25A_RemoveManualRoutingRestoresExactClientBytes(t *testing.T) {
+	home := t.TempDir()
+	path := writeFixture(t, home, "cursor", "{\n  \"theme\": \"dark\",\n  \"mcpServers\": {\"fixture\": {\"command\": \"fixture-server\"}}\n}\n")
+	original, _ := os.ReadFile(path)
+	if _, stderr, code := run(t, home, "configure-ide", "--ide=cursor"); code != 0 {
+		t.Fatalf("configure exit=%d stderr=%s", code, stderr)
+	}
+	out, stderr, code := run(t, home, "configure-ide", "--ide=cursor", "--remove-routing")
+	if code != 0 {
+		t.Fatalf("remove exit=%d stderr=%s", code, stderr)
+	}
+	if !strings.Contains(out, `"exact_restored": [`) || !strings.Contains(out, `"cursor"`) {
+		t.Fatalf("rollback did not report exact restoration:\n%s", out)
+	}
+	restored, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(restored, original) {
+		t.Fatalf("manual rollback changed original bytes\n got: %s\nwant: %s", restored, original)
+	}
+	gw, _ := os.ReadFile(filepath.Join(home, ".config", "agentkeeper-mcp-gateway", "config.json"))
+	if strings.Contains(string(gw), `"fixture"`) {
+		t.Fatalf("owned migrated server remains after rollback:\n%s", gw)
+	}
+}
+
+func TestE2E25B_RemoveManualRoutingPreservesPostRouteChanges(t *testing.T) {
+	home := t.TempDir()
+	path := writeFixture(t, home, "cursor", `{"mcpServers":{"fixture":{"command":"fixture-server"}},"theme":"dark"}`)
+	if _, stderr, code := run(t, home, "configure-ide", "--ide=cursor"); code != 0 {
+		t.Fatalf("configure exit=%d stderr=%s", code, stderr)
+	}
+	document := readConfig(t, path)
+	var servers map[string]json.RawMessage
+	if err := json.Unmarshal(document["mcpServers"], &servers); err != nil {
+		t.Fatal(err)
+	}
+	late, _ := json.Marshal(map[string]any{"command": "late-server"})
+	servers["late"] = late
+	encoded, _ := json.Marshal(servers)
+	document["mcpServers"] = encoded
+	document["customer_added"] = json.RawMessage(`true`)
+	drifted, _ := json.MarshalIndent(document, "", "  ")
+	if err := os.WriteFile(path, append(drifted, '\n'), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, stderr, code := run(t, home, "configure-ide", "--ide=cursor", "--remove-routing")
+	if code != 0 {
+		t.Fatalf("remove exit=%d stderr=%s", code, stderr)
+	}
+	if !strings.Contains(out, `"structural_restored": [`) {
+		t.Fatalf("rollback did not report structural restoration:\n%s", out)
+	}
+	restored := readConfig(t, path)
+	if _, ok := restored["customer_added"]; !ok {
+		t.Fatal("rollback removed a post-route top-level setting")
+	}
+	servers = map[string]json.RawMessage{}
+	if err := json.Unmarshal(restored["mcpServers"], &servers); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := servers["agentkeeper-mcp-gateway"]; ok {
+		t.Fatal("rollback left the owned Gateway route")
+	}
+	if _, ok := servers["fixture"]; !ok {
+		t.Fatal("rollback did not restore the migrated server")
+	}
+	if _, ok := servers["late"]; !ok {
+		t.Fatal("rollback removed a post-route server")
+	}
+}
+
+func TestE2E25C_RemoveManualRoutingRefusesUnownedGatewayEntry(t *testing.T) {
+	home := t.TempDir()
+	path := writeFixture(t, home, "cursor", fmt.Sprintf(`{"mcpServers":{"agentkeeper-mcp-gateway":{"command":%q,"args":["server"]}}}`, binary))
+	before, _ := os.ReadFile(path)
+	_, stderr, code := run(t, home, "configure-ide", "--ide=cursor", "--remove-routing")
+	if code == 0 || !strings.Contains(stderr, "ownership manifest is missing") {
+		t.Fatalf("expected safe ownership refusal; code=%d stderr=%s", code, stderr)
+	}
+	after, _ := os.ReadFile(path)
+	if !bytes.Equal(before, after) {
+		t.Fatal("ownership refusal modified the client config")
+	}
+}
+
 func TestE2E26_ClaudeCodeProjectMCPJSONMigrated(t *testing.T) {
 	home := t.TempDir()
 	project := filepath.Join(home, "repo")

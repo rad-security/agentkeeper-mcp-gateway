@@ -7,10 +7,10 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/rad-security/agentkeeper-mcp-gateway/internal/config"
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/discovery"
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/ideconfig"
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/managedrouting"
+	"github.com/rad-security/agentkeeper-mcp-gateway/internal/manualrouting"
 	"github.com/spf13/cobra"
 )
 
@@ -23,6 +23,7 @@ var (
 	configureIDEManagedRuntimeConfig string
 	configureIDENonInteractive       bool
 	configureIDERemoveManaged        bool
+	configureIDERemoveManual         bool
 )
 
 var configureIDECmd = &cobra.Command{
@@ -43,6 +44,9 @@ By default every detected IDE is configured. Use --ide to target just one.
 	RunE: func(cmd *cobra.Command, args []string) error {
 		out := cmd.OutOrStdout()
 		if strings.TrimSpace(configureIDEManagedRuntimeConfig) != "" {
+			if configureIDERemoveManual {
+				return fmt.Errorf("--remove-routing cannot be combined with --managed-runtime-config")
+			}
 			if !configureIDENonInteractive {
 				return fmt.Errorf("--managed-runtime-config requires --non-interactive")
 			}
@@ -64,6 +68,9 @@ By default every detected IDE is configured. Use --ide to target just one.
 		}
 		if configureIDERemoveManaged {
 			return fmt.Errorf("--remove-managed-routing requires --managed-runtime-config")
+		}
+		if configureIDERemoveManual && (shouldUseProjectMigration() || configureIDETargetIncludes(discovery.ClientCowork)) {
+			return fmt.Errorf("--remove-routing owns global claude-code, claude-desktop, and cursor routes only; Cowork and project-scoped routes require their dedicated rollback")
 		}
 		if shouldUseProjectMigration() {
 			cwd := configureIDECWD
@@ -115,25 +122,31 @@ By default every detected IDE is configured. Use --ide to target just one.
 			}
 		}
 
-		var migratedAll []ideconfig.NamedServer
-		for _, a := range adapters {
-			plan, err := a.Plan()
+		if configureIDERemoveManual {
+			report, err := manualrouting.Remove(manualrouting.RemoveOptions{Adapters: adapters, DryRun: configureIDEDryRun})
 			if err != nil {
-				fmt.Fprintf(out, "  %-16s error planning: %v\n", a.Name, err)
-				continue
+				return err
 			}
-			printPlan(out, a.Name, plan)
-			if configureIDEDryRun {
-				continue
+			encoded, err := json.MarshalIndent(report, "", "  ")
+			if err != nil {
+				return err
 			}
-			if err := a.Apply(&plan); err != nil {
-				fmt.Fprintf(out, "  %-16s error applying: %v\n", a.Name, err)
-				continue
-			}
+			fmt.Fprintln(out, string(encoded))
+			return nil
+		}
+
+		manualReport, err := manualrouting.Configure(manualrouting.ConfigureOptions{Adapters: adapters, DryRun: configureIDEDryRun})
+		if err != nil {
+			return err
+		}
+		for _, plan := range manualReport.Plans {
+			printPlan(out, plan.IDE, plan)
 			if plan.BackupPath != "" {
 				fmt.Fprintf(out, "  %-16s backup: %s\n", "", plan.BackupPath)
 			}
-			migratedAll = append(migratedAll, plan.Migrated...)
+		}
+		for ide, message := range manualReport.Errors {
+			fmt.Fprintf(out, "  %-16s error planning: %s\n", ide, message)
 		}
 
 		if configureIDETargetIncludes("claude-code") {
@@ -179,7 +192,7 @@ By default every detected IDE is configured. Use --ide to target just one.
 			}
 		}
 
-		if len(migratedAll) == 0 {
+		if len(manualReport.MigratedServers) == 0 {
 			fmt.Fprintln(out, "")
 			if configureIDEDryRun {
 				fmt.Fprintln(out, "(dry-run - no files written)")
@@ -187,37 +200,14 @@ By default every detected IDE is configured. Use --ide to target just one.
 			return nil
 		}
 
-		// Move migrated servers into the gateway's own config. De-dupe by name
-		// to avoid double-registering when multiple IDEs list the same server.
-		seen := map[string]bool{}
 		fmt.Fprintln(out, "")
 		fmt.Fprintln(out, "Migrating servers into gateway config:")
-		for _, s := range migratedAll {
-			if seen[s.Name] {
-				continue
-			}
-			seen[s.Name] = true
+		for _, name := range manualReport.MigratedServers {
 			if configureIDEDryRun {
-				fmt.Fprintf(out, "  would add: %s (%s)\n", s.Name, renderCommand(s.Entry))
+				fmt.Fprintf(out, "  would add: %s\n", name)
 				continue
 			}
-			entry := config.ServerEntry{
-				Name:    s.Name,
-				Command: s.Entry.Command,
-				Args:    s.Entry.Args,
-				Env:     s.Entry.Env,
-				URL:     s.Entry.URL,
-				Headers: s.Entry.Headers,
-			}
-			// IDE "type:http" maps to gateway "transport:http"
-			if s.Entry.Type != "" {
-				entry.Transport = s.Entry.Type
-			}
-			if err := config.AddServer(entry); err != nil {
-				fmt.Fprintf(out, "  error adding %s to gateway config: %v\n", s.Name, err)
-				continue
-			}
-			fmt.Fprintf(out, "  added: %s\n", s.Name)
+			fmt.Fprintf(out, "  added: %s\n", name)
 		}
 		if configureIDEDryRun {
 			fmt.Fprintln(out, "")
@@ -403,5 +393,6 @@ func init() {
 	configureIDECmd.Flags().StringVar(&configureIDEManagedRuntimeConfig, "managed-runtime-config", "", "Root-owned AgentKeeper runtime broker configuration")
 	configureIDECmd.Flags().BoolVar(&configureIDENonInteractive, "non-interactive", false, "Disable interactive behavior for managed deployment")
 	configureIDECmd.Flags().BoolVar(&configureIDERemoveManaged, "remove-managed-routing", false, "Remove only routing owned by the managed runtime deployment")
+	configureIDECmd.Flags().BoolVar(&configureIDERemoveManual, "remove-routing", false, "Restore only global IDE routes owned by manual AgentKeeper configuration")
 	rootCmd.AddCommand(configureIDECmd)
 }
