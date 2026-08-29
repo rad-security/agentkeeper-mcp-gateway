@@ -168,6 +168,7 @@ agentkeeper-mcp-gateway configure-ide [--dry-run] [--ide=claude-code|claude-desk
 ```bash
 agentkeeper-mcp-gateway configure-ide --dry-run   # preview; writes nothing
 agentkeeper-mcp-gateway configure-ide              # apply
+agentkeeper-mcp-gateway configure-ide --remove-routing # restore owned global routes
 ```
 
 For Cowork sources created after setup, run `agentkeeper-mcp-gateway cowork guard` from a login item/service, or rerun `configure-ide`. Native Cowork cloud connectors that are not represented as local MCP sources require the AgentKeeper Cowork ZIP/guardrail path; the standalone gateway can only govern MCP traffic it can route.
@@ -180,7 +181,9 @@ Supports **Claude Code** (`~/.claude.json`), **Claude Desktop** (macOS + Linux),
 4. Rewrites the IDE's `mcpServers` map to include the gateway plus any native-auth servers that must remain direct
 5. Preserves every non-MCP top-level key verbatim (`permissions`, `preferences`, etc.)
 
-A second invocation is a no-op when the exact current Gateway shape is already present. Every write creates a backup and uses a source-hash compare-and-swap check, so a file edited after planning is left unchanged. Package installation must remain stage-only: do not run the applying form from a postinstall script or broad MDM assignment. Managed routing is a separate, explicitly approved activation step after preview and client-state checks.
+A second invocation is a no-op when the exact current Gateway shape is already present. Every write creates a backup and uses a source-hash compare-and-swap check, so a file edited after planning is left unchanged. The applying form writes a private manual-ownership manifest. `--remove-routing` uses that manifest to restore byte-exact original client files when nothing drifted, or to remove only the owned Gateway entry and restore migrated servers while preserving later customer changes. It refuses inferred cleanup if ownership evidence is missing or a migrated Gateway server has drifted. The manual rollback flag covers global Claude Code, Claude Desktop, and Cursor routes; project-scoped and Cowork sources retain their dedicated rollback paths.
+
+Package installation must remain stage-only: do not run the applying form from a postinstall script or broad MDM assignment. Managed routing is a separate, explicitly approved activation step after preview and client-state checks.
 
 ## AgentKeeper Linux runtime integration
 
