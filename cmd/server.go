@@ -105,6 +105,15 @@ are blocked.`,
 			)
 			if receiptStore != nil {
 				tc.SetReceiptStore(receiptStore)
+				policyCachePath := filepath.Join(filepath.Dir(receiptRoot), "policy-cache-v1.json")
+				if err := tc.SetPolicyCache(policyCachePath); err != nil {
+					logger.Warn("last-known-good policy unavailable: %v", err)
+				}
+				if restoredMode, _ := tc.EffectiveMode(); restoredMode == "enforce" {
+					cfg.Mode = "enforce"
+				} else {
+					cfg.Mode = "audit"
+				}
 			}
 
 			// Build server info for registration
@@ -160,21 +169,6 @@ are blocked.`,
 		}
 		logger.LogSessionStart(hostname, runtime.GOOS, version, serverNames)
 
-		// Print startup message
-		mode := "audit"
-		if cfg.Mode == "enforce" {
-			mode = "enforce"
-		}
-		fmt.Fprintf(os.Stderr, "[agentkeeper] MCP Gateway v%s starting in %s mode\n", version, mode)
-		fmt.Fprintf(os.Stderr, "[agentkeeper] %d servers configured, %d detection patterns loaded\n", len(serverConfigs), 36)
-		if hasRuntimeBroker {
-			fmt.Fprintf(os.Stderr, "[agentkeeper] Connected through credentialless AgentKeeper runtime broker\n")
-		} else if hasAPIKey {
-			fmt.Fprintf(os.Stderr, "[agentkeeper] Connected to dashboard\n")
-		} else {
-			fmt.Fprintf(os.Stderr, "[agentkeeper] Local mode (run 'agentkeeper-mcp-gateway auth login' to connect)\n")
-		}
-
 		// Create and run proxy
 		p := proxy.NewProxy(proxy.Config{
 			EnforceMode:      cfg.Mode == "enforce",
@@ -193,6 +187,25 @@ are blocked.`,
 			})
 			tc.Start()
 			defer tc.Stop()
+		}
+
+		// Report the mode after the synchronous startup sync. This keeps the
+		// operator-visible message aligned with the mode the proxy will actually
+		// apply, while the proxy still cannot serve traffic until p.Run below.
+		mode := "audit"
+		if tc != nil {
+			mode, _ = tc.EffectiveMode()
+		} else if cfg.Mode == "enforce" {
+			mode = "enforce"
+		}
+		fmt.Fprintf(os.Stderr, "[agentkeeper] MCP Gateway v%s starting in %s mode\n", version, mode)
+		fmt.Fprintf(os.Stderr, "[agentkeeper] %d servers configured, %d detection patterns loaded\n", len(serverConfigs), 36)
+		if hasRuntimeBroker {
+			fmt.Fprintf(os.Stderr, "[agentkeeper] Connected through credentialless AgentKeeper runtime broker\n")
+		} else if hasAPIKey {
+			fmt.Fprintf(os.Stderr, "[agentkeeper] Connected to dashboard\n")
+		} else {
+			fmt.Fprintf(os.Stderr, "[agentkeeper] Local mode (run 'agentkeeper-mcp-gateway auth login' to connect)\n")
 		}
 
 		return p.Run()

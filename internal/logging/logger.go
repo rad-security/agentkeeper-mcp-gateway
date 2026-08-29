@@ -1,10 +1,13 @@
 package logging
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 
@@ -13,6 +16,7 @@ import (
 
 // Event represents a logged MCP event.
 type Event struct {
+	EventID     string                 `json:"event_id,omitempty"`
 	Timestamp   string                 `json:"timestamp"`
 	EventType   string                 `json:"event_type"`
 	ServerName  string                 `json:"server_name,omitempty"`
@@ -54,8 +58,11 @@ type Logger struct {
 	logPath string
 	verbose bool
 	// Buffer for batch telemetry upload
-	buffer   []Event
-	bufferMu sync.Mutex
+	buffer       []Event
+	bufferMu     sync.Mutex
+	queueDir     string
+	rejectedDir  string
+	durableQueue bool
 }
 
 // NewLogger creates a logger writing to the specified path.
@@ -95,12 +102,14 @@ func NewLogger(logPath string, verbose bool) (*Logger, error) {
 }
 
 func newBufferedLogger(file *os.File, logPath string, verbose bool) *Logger {
-	return &Logger{
+	logger := &Logger{
 		file:    file,
 		logPath: logPath,
 		verbose: verbose,
 		buffer:  make([]Event, 0, 100),
 	}
+	logger.initDurableQueue()
+	return logger
 }
 
 // LogToolCall logs an MCP tool call event.
@@ -240,15 +249,141 @@ func (l *Logger) RequeueFront(events []Event) {
 	l.buffer = next
 }
 
+// PendingEvents returns a stable upload batch. When the owner-only disk queue
+// is available, returned events remain pending until ResolveEvents receives an
+// explicit terminal acknowledgment, so process restarts cannot lose them.
+func (l *Logger) PendingEvents(limit int) ([]Event, bool, error) {
+	if !l.durableQueue {
+		return l.FlushBuffer(), false, nil
+	}
+	entries, err := os.ReadDir(l.queueDir)
+	if err != nil {
+		return nil, true, err
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
+	if limit <= 0 {
+		limit = 100
+	}
+	events := make([]Event, 0, limit)
+	seen := make(map[string]bool, limit)
+	for _, entry := range entries {
+		if len(events) >= limit {
+			break
+		}
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+			continue
+		}
+		path := filepath.Join(l.queueDir, entry.Name())
+		data, readErr := os.ReadFile(path)
+		if os.IsNotExist(readErr) {
+			continue
+		}
+		if readErr != nil {
+			return nil, true, readErr
+		}
+		var event Event
+		if decodeErr := json.Unmarshal(data, &event); decodeErr != nil || event.EventID == "" {
+			if renameErr := os.Rename(path, filepath.Join(l.rejectedDir, entry.Name())); renameErr != nil && !os.IsNotExist(renameErr) {
+				return nil, true, fmt.Errorf("quarantining corrupt event %s: %w", entry.Name(), renameErr)
+			}
+			continue
+		}
+		events = append(events, event)
+		seen[event.EventID] = true
+	}
+
+	// Include any event that could not be persisted but is still alive in this
+	// process. Persisted entries win so a batch never contains duplicates.
+	l.bufferMu.Lock()
+	for _, event := range l.buffer {
+		if len(events) >= limit {
+			break
+		}
+		if event.EventID != "" && !seen[event.EventID] {
+			events = append(events, event)
+			seen[event.EventID] = true
+		}
+	}
+	l.bufferMu.Unlock()
+	return events, true, nil
+}
+
+// ResolveEvents applies per-item acknowledgments. Accepted and duplicate
+// events are deleted; terminal rejects are quarantined; missing and retryable
+// statuses remain pending.
+func (l *Logger) ResolveEvents(statusByEventID map[string]string) error {
+	terminal := make(map[string]bool)
+	for eventID, status := range statusByEventID {
+		if status == "accepted" || status == "duplicate" || status == "rejected" || status == "conflicted" {
+			terminal[eventID] = true
+		}
+	}
+	if l.durableQueue {
+		entries, err := os.ReadDir(l.queueDir)
+		if err != nil {
+			return err
+		}
+		for _, entry := range entries {
+			if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+				continue
+			}
+			source := filepath.Join(l.queueDir, entry.Name())
+			data, err := os.ReadFile(source)
+			if os.IsNotExist(err) {
+				continue
+			}
+			if err != nil {
+				return err
+			}
+			var event Event
+			if err := json.Unmarshal(data, &event); err != nil || event.EventID == "" {
+				continue
+			}
+			status := statusByEventID[event.EventID]
+			switch status {
+			case "accepted", "duplicate":
+				if err := os.Remove(source); err != nil && !os.IsNotExist(err) {
+					return err
+				}
+			case "rejected", "conflicted":
+				if err := os.Rename(source, filepath.Join(l.rejectedDir, entry.Name())); err != nil && !os.IsNotExist(err) {
+					return err
+				}
+			}
+		}
+	}
+	if len(terminal) > 0 {
+		l.bufferMu.Lock()
+		remaining := l.buffer[:0]
+		for _, event := range l.buffer {
+			if !terminal[event.EventID] {
+				remaining = append(remaining, event)
+			}
+		}
+		l.buffer = remaining
+		l.bufferMu.Unlock()
+	}
+	return nil
+}
+
 // Close closes the log file.
 func (l *Logger) Close() error {
 	if l.file == nil {
 		return nil
 	}
+	_ = l.file.Sync()
 	return l.file.Close()
 }
 
 func (l *Logger) writeEvent(event Event) {
+	if remoteIngestable(event) && event.EventID == "" {
+		event.EventID = newEventID()
+		if l.durableQueue {
+			if err := l.persistEvent(event); err != nil {
+				fmt.Fprintf(os.Stderr, "[agentkeeper] durable event queue unavailable for %s: %v\n", event.EventID, err)
+			}
+		}
+	}
 	data, err := json.Marshal(event)
 	if err != nil {
 		return
@@ -279,4 +414,88 @@ func (l *Logger) writeEvent(event Event) {
 
 func remoteIngestable(event Event) bool {
 	return event.ServerName != "" && event.ToolName != ""
+}
+
+func (l *Logger) initDurableQueue() {
+	root := filepath.Join(filepath.Dir(l.logPath), "events-v1")
+	l.queueDir = filepath.Join(root, "queue")
+	l.rejectedDir = filepath.Join(root, "rejected")
+	for _, dir := range []string{root, l.queueDir, l.rejectedDir} {
+		if err := ensurePrivateDir(dir); err != nil {
+			l.durableQueue = false
+			return
+		}
+	}
+	l.durableQueue = true
+}
+
+func ensurePrivateDir(path string) error {
+	if info, err := os.Lstat(path); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+			return fmt.Errorf("refusing non-directory queue path %s", path)
+		}
+		return os.Chmod(path, 0o700)
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	if err := os.Mkdir(path, 0o700); err != nil && !os.IsExist(err) {
+		return err
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return fmt.Errorf("refusing non-directory queue path %s", path)
+	}
+	return os.Chmod(path, 0o700)
+}
+
+func (l *Logger) persistEvent(event Event) error {
+	data, err := json.Marshal(event)
+	if err != nil {
+		return err
+	}
+	name := fmt.Sprintf("%020d-%s.json", time.Now().UTC().UnixNano(), event.EventID)
+	return atomicWriteEvent(filepath.Join(l.queueDir, name), append(data, '\n'))
+}
+
+func atomicWriteEvent(path string, data []byte) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".event-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return err
+	}
+	if dir, err := os.Open(filepath.Dir(path)); err == nil {
+		_ = dir.Sync()
+		_ = dir.Close()
+	}
+	return nil
+}
+
+func newEventID() string {
+	var raw [16]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return fmt.Sprintf("event-%d", time.Now().UTC().UnixNano())
+	}
+	return "event-" + hex.EncodeToString(raw[:])
 }

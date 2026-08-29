@@ -1,6 +1,7 @@
 package policy
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/telemetry"
@@ -156,5 +157,17 @@ func TestServerBlockTakesPriority(t *testing.T) {
 	}
 	if r.Rule != "blocked_server" {
 		t.Errorf("expected blocked_server (first match), got %s", r.Rule)
+	}
+}
+
+func TestFailClosedWildcardBlocksEveryServer(t *testing.T) {
+	result := Evaluate(telemetry.SyncPolicy{
+		BlockedServers: []string{"*"},
+	}, "payments", "transfer", nil)
+	if result.Verdict != "block" || result.Rule != "blocked_server" {
+		t.Fatalf("wildcard fail-closed result = %+v", result)
+	}
+	if !strings.Contains(result.Reason, "policy is expired or untrusted") {
+		t.Fatalf("fail-closed reason is not actionable: %q", result.Reason)
 	}
 }

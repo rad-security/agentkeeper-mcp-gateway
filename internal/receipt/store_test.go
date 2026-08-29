@@ -117,3 +117,27 @@ func TestConcurrentStoresShareOneSigningIdentity(t *testing.T) {
 		}
 	}
 }
+
+func TestStoreSignsAndVerifiesAuxiliaryArtifactsAcrossRestart(t *testing.T) {
+	root := t.TempDir()
+	store, err := NewStore(root, "0.2.0-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte(`{"policy":"last-known-good"}`)
+	signature := store.SignBytes(payload)
+	if signature == "" || !store.VerifyBytes(payload, signature) {
+		t.Fatal("fresh store did not verify its auxiliary signature")
+	}
+	if store.VerifyBytes([]byte(`{"policy":"tampered"}`), signature) {
+		t.Fatal("tampered auxiliary artifact verified")
+	}
+
+	restarted, err := NewStore(root, "0.2.0-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !restarted.VerifyBytes(payload, signature) {
+		t.Fatal("durable endpoint key did not verify after restart")
+	}
+}

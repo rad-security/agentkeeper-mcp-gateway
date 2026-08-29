@@ -21,10 +21,14 @@ type Result struct {
 func Evaluate(p telemetry.SyncPolicy, serverName, toolName string, args map[string]interface{}) Result {
 	// 1. Blocked server?
 	for _, s := range p.BlockedServers {
-		if strings.EqualFold(s, serverName) {
+		if s == "*" || strings.EqualFold(s, serverName) {
+			reason := "Server '" + serverName + "' is blocked by organization policy"
+			if s == "*" {
+				reason = "MCP tools are unavailable while AgentKeeper policy is expired or untrusted"
+			}
 			return Result{
 				Verdict: "block",
-				Reason:  "Server '" + serverName + "' is blocked by organization policy",
+				Reason:  reason,
 				Rule:    "blocked_server",
 			}
 		}
