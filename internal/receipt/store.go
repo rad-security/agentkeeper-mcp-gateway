@@ -129,6 +129,21 @@ func NewStore(root, artifactVersion string) (*Store, error) {
 func (s *Store) SignerKeyID() string     { return s.signerKeyID }
 func (s *Store) PublicKeyBase64() string { return base64.StdEncoding.EncodeToString(s.publicKey) }
 
+// SignBytes signs an auxiliary endpoint artifact with the same durable key
+// used for application receipts. The key never leaves the Store; callers use
+// this for owner-only local integrity checks such as the last-known-good
+// policy cache.
+func (s *Store) SignBytes(payload []byte) string {
+	return base64.StdEncoding.EncodeToString(ed25519.Sign(s.privateKey, payload))
+}
+
+// VerifyBytes verifies an auxiliary endpoint artifact against this Store's
+// durable public key.
+func (s *Store) VerifyBytes(payload []byte, signatureBase64 string) bool {
+	signature, err := base64.StdEncoding.DecodeString(signatureBase64)
+	return err == nil && ed25519.Verify(s.publicKey, payload, signature)
+}
+
 func (s *Store) Enqueue(input Input) (Envelope, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -280,7 +295,10 @@ func (s *Store) loadOrCreateKey() error {
 	if err := s.loadKey(path); err == nil {
 		return nil
 	} else if !os.IsNotExist(err) {
-		return err
+		// Another MCP client process can have exclusively created the key file
+		// but not finished its durable write yet. Treat a present, temporarily
+		// incomplete file as a concurrent create and wait for the complete key.
+		return s.loadKeyAfterConcurrentCreate(path)
 	}
 	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {

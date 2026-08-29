@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/detection"
@@ -152,5 +153,113 @@ func TestNewLoggerRefusesSymlinkLogPath(t *testing.T) {
 	}
 	if len(logger.FlushBuffer()) != 1 {
 		t.Fatal("remote telemetry buffer should remain available when local symlink is refused")
+	}
+}
+
+func TestDurableEventQueueSurvivesRestartAndAcknowledgment(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "events.jsonl")
+	first, err := NewLogger(logPath, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first.LogToolCall("payments", "transfer", nil, detection.Result{})
+	pending, durable, err := first.PendingEvents(100)
+	if err != nil || !durable || len(pending) != 1 || pending[0].EventID == "" {
+		t.Fatalf("initial durable batch=%+v durable=%v err=%v", pending, durable, err)
+	}
+	eventID := pending[0].EventID
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	restarted, err := NewLogger(logPath, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restarted.Close()
+	pending, durable, err = restarted.PendingEvents(100)
+	if err != nil || !durable || len(pending) != 1 || pending[0].EventID != eventID {
+		t.Fatalf("restarted durable batch=%+v durable=%v err=%v", pending, durable, err)
+	}
+	if err := restarted.ResolveEvents(map[string]string{eventID: "accepted"}); err != nil {
+		t.Fatal(err)
+	}
+	pending, _, err = restarted.PendingEvents(100)
+	if err != nil || len(pending) != 0 {
+		t.Fatalf("acknowledged event remained pending: %+v err=%v", pending, err)
+	}
+
+	for _, path := range []string{
+		filepath.Join(dir, "events-v1"),
+		filepath.Join(dir, "events-v1", "queue"),
+		filepath.Join(dir, "events-v1", "rejected"),
+	} {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode().Perm() != 0o700 {
+			t.Fatalf("queue directory %s mode=%o, want 0700", path, info.Mode().Perm())
+		}
+	}
+}
+
+func TestConcurrentLoggersShareDurableQueue(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "events.jsonl")
+	const count = 12
+	loggers := make([]*Logger, count)
+	errs := make([]error, count)
+	start := make(chan struct{})
+	var wait sync.WaitGroup
+	for index := 0; index < count; index++ {
+		wait.Add(1)
+		go func(index int) {
+			defer wait.Done()
+			<-start
+			loggers[index], errs[index] = NewLogger(logPath, false)
+		}(index)
+	}
+	close(start)
+	wait.Wait()
+	for index, logger := range loggers {
+		if errs[index] != nil {
+			t.Fatalf("logger %d failed: %v", index, errs[index])
+		}
+		if !logger.durableQueue {
+			t.Fatalf("logger %d lost durable queue during concurrent startup", index)
+		}
+		_ = logger.Close()
+	}
+}
+
+func TestDurableEventQueueRetainsRetryablePartialAcknowledgment(t *testing.T) {
+	logger, err := NewLogger(filepath.Join(t.TempDir(), "events.jsonl"), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer logger.Close()
+	logger.LogToolCall("payments", "first", nil, detection.Result{})
+	logger.LogToolCall("payments", "second", nil, detection.Result{})
+	pending, durable, err := logger.PendingEvents(100)
+	if err != nil || !durable || len(pending) != 2 {
+		t.Fatalf("pending=%+v durable=%v err=%v", pending, durable, err)
+	}
+	if err := logger.ResolveEvents(map[string]string{
+		pending[0].EventID: "accepted",
+		pending[1].EventID: "retryable",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	remaining, _, err := logger.PendingEvents(100)
+	if err != nil || len(remaining) != 1 || remaining[0].EventID != pending[1].EventID {
+		t.Fatalf("partial ack remaining=%+v err=%v", remaining, err)
+	}
+	if err := logger.ResolveEvents(map[string]string{remaining[0].EventID: "duplicate"}); err != nil {
+		t.Fatal(err)
+	}
+	remaining, _, err = logger.PendingEvents(100)
+	if err != nil || len(remaining) != 0 {
+		t.Fatalf("duplicate-acknowledged event remained: %+v err=%v", remaining, err)
 	}
 }

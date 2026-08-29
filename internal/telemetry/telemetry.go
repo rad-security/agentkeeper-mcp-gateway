@@ -103,6 +103,14 @@ type Client struct {
 	clientName       string
 	configSourceHash string
 	routeRevision    string
+	policyCachePath  string
+	policyCacheTTL   time.Duration
+	policySyncedAt   time.Time
+	policyExpiresAt  time.Time
+	policyValid      bool
+	policyCacheBad   bool
+	policyCacheMu    sync.Mutex
+	now              func() time.Time
 }
 
 // NewRuntimeClient uses the local machine broker for all connected telemetry.
@@ -125,13 +133,15 @@ func NewClient(apiURL, apiKey string, logger *logging.Logger) *Client {
 	hostname := StableHostname()
 	machineID := machineid.Detect()
 	return &Client{
-		apiURL:    apiURL,
-		apiKey:    apiKey,
-		hostname:  hostname,
-		machineID: machineID,
-		mode:      "audit",
-		logger:    logger,
-		done:      make(chan struct{}),
+		apiURL:         apiURL,
+		apiKey:         apiKey,
+		hostname:       hostname,
+		machineID:      machineID,
+		mode:           "audit",
+		logger:         logger,
+		done:           make(chan struct{}),
+		policyCacheTTL: 24 * time.Hour,
+		now:            time.Now,
 	}
 }
 
@@ -146,14 +156,27 @@ func (c *Client) SetMode(mode string) {
 // The handler is invoked only for an explicit valid Observe/Enforce assignment.
 func (c *Client) SetModeChangeHandler(handler func(mode string, revision int64)) {
 	c.modeMu.Lock()
-	defer c.modeMu.Unlock()
 	c.modeChange = handler
+	mode := c.mode
+	revision := c.modeRevision
+	c.modeMu.Unlock()
+	if handler != nil && revision > 0 {
+		handler(modeLabel(mode), revision)
+	}
 }
 
 func (c *Client) currentMode() (string, int64) {
 	c.modeMu.RLock()
 	defer c.modeMu.RUnlock()
 	return c.mode, c.modeRevision
+}
+
+// EffectiveMode returns the mode and assignment revision that will be applied
+// to the proxy. It includes a restored last-known-good assignment before the
+// proxy starts, avoiding an audit-mode startup window after an offline restart.
+func (c *Client) EffectiveMode() (string, int64) {
+	mode, revision := c.currentMode()
+	return modeLabel(mode), revision
 }
 
 func (c *Client) applyAssignedMode(mode string, revision int64) {
@@ -197,6 +220,21 @@ func (c *Client) SetDiscoveryProvider(discover func() []DiscoveredServerInfo) {
 
 func (c *Client) SetReceiptStore(store *receipt.Store) {
 	c.receiptStore = store
+}
+
+// SetPolicyCache enables the owner-only, locally signed last-known-good policy
+// cache and restores it immediately when present. SetReceiptStore must be
+// called first so the snapshot can be verified with the endpoint signing key.
+func (c *Client) SetPolicyCache(path string) error {
+	c.policyCachePath = strings.TrimSpace(path)
+	if c.policyCachePath == "" {
+		return nil
+	}
+	if c.receiptStore == nil {
+		return fmt.Errorf("policy cache requires the durable receipt signer")
+	}
+	c.policyCachePath = c.scopedPolicyCachePath(c.policyCachePath)
+	return c.loadPolicyCache()
 }
 
 func (c *Client) SetRouteContext(clientName, configSourceHash, routeRevision string) {
@@ -249,12 +287,25 @@ func (c *Client) Stop() {
 	close(c.done)
 }
 
-// Policy returns the cached dashboard policy. Returns zero-value SyncPolicy
-// if no policy has been synced (local-only mode or first boot).
+// Policy returns the cached dashboard policy. A verified last-known-good
+// policy survives process restart. If that snapshot expires while the Gateway
+// is enforcing, every upstream server is denied until a fresh policy arrives;
+// Observe mode retains stale classification without changing call continuity.
+// A true first boot with no established policy retains legacy local behavior.
 func (c *Client) Policy() SyncPolicy {
 	c.policyMu.RLock()
-	defer c.policyMu.RUnlock()
-	return c.cachedPolicy
+	policy := cloneSyncPolicy(c.cachedPolicy)
+	valid := c.policyValid
+	cacheBad := c.policyCacheBad
+	expiresAt := c.policyExpiresAt
+	c.policyMu.RUnlock()
+
+	expired := valid && !expiresAt.IsZero() && !c.now().Before(expiresAt)
+	mode, _ := c.currentMode()
+	if strings.EqualFold(mode, "enforce") && (cacheBad || expired) {
+		return failClosedPolicy()
+	}
+	return policy
 }
 
 // Evaluate sends a tool call to the server-side detection engine.
@@ -352,8 +403,15 @@ func (c *Client) sync() {
 		}
 		if result.OK {
 			c.policyMu.Lock()
-			c.cachedPolicy = result.Policy
+			c.cachedPolicy = cloneSyncPolicy(result.Policy)
+			c.policySyncedAt = c.now().UTC()
+			c.policyExpiresAt = c.policySyncedAt.Add(c.policyCacheTTL)
+			c.policyValid = true
+			c.policyCacheBad = false
 			c.policyMu.Unlock()
+			if err := c.persistPolicyCache(); err != nil && c.logger != nil {
+				c.logger.Warn("could not persist last-known-good policy: %v", err)
+			}
 		}
 	}
 	if status != http.StatusOK {
@@ -405,6 +463,9 @@ func (c *Client) syncV2() bool {
 	}
 	if result.RouteAssignment != nil {
 		c.applyAssignedMode(result.RouteAssignment.DesiredMode, result.RouteAssignment.DesiredRevision)
+		if err := c.persistPolicyCache(); err != nil && c.logger != nil {
+			c.logger.Warn("could not persist assigned Gateway mode: %v", err)
+		}
 	}
 	return true
 }
@@ -437,7 +498,11 @@ func (c *Client) flush() {
 	if c.logger == nil {
 		return
 	}
-	events := c.logger.FlushBuffer()
+	events, durable, pendingErr := c.logger.PendingEvents(100)
+	if pendingErr != nil {
+		c.logger.Warn("could not read durable event queue: %v", pendingErr)
+		return
+	}
 	if len(events) == 0 {
 		return
 	}
@@ -452,7 +517,9 @@ func (c *Client) flush() {
 
 	data, err := json.Marshal(payload)
 	if err != nil {
-		c.logger.RequeueFront(events)
+		if !durable {
+			c.logger.RequeueFront(events)
+		}
 		return
 	}
 
@@ -462,24 +529,41 @@ func (c *Client) flush() {
 		Received *int   `json:"received"`
 		Disabled bool   `json:"disabled"`
 		Error    string `json:"error"`
+		Acks     []struct {
+			EventID string `json:"event_id"`
+			Status  string `json:"status"`
+		} `json:"acks"`
 	}
 	status, postErr := c.postJSON("events", "/api/v1/mcp/events", data, &result)
 	if postErr != nil {
-		c.logger.RequeueFront(events)
+		if !durable {
+			c.logger.RequeueFront(events)
+		}
 		fmt.Fprintf(os.Stderr, "[agentkeeper] telemetry upload failed: %v\n", postErr)
 		return
 	}
 	if status < 200 || status >= 300 {
-		c.logger.RequeueFront(events)
+		if !durable {
+			c.logger.RequeueFront(events)
+		}
 		fmt.Fprintf(os.Stderr, "[agentkeeper] telemetry upload error (HTTP %d)\n", status)
 		return
 	}
 	if result.Disabled {
+		statuses := make(map[string]string, len(events))
+		for _, event := range events {
+			statuses[event.EventID] = "accepted"
+		}
+		if err := c.logger.ResolveEvents(statuses); err != nil {
+			c.logger.Warn("could not resolve disabled event batch: %v", err)
+		}
 		c.logger.Info("telemetry upload skipped: connector disabled")
 		return
 	}
-	if !result.OK || result.Error != "" || (result.Received != nil && *result.Received < len(events)) {
-		c.logger.RequeueFront(events)
+	if !result.OK || result.Error != "" {
+		if !durable {
+			c.logger.RequeueFront(events)
+		}
 		if result.Error != "" {
 			fmt.Fprintf(os.Stderr, "[agentkeeper] telemetry upload not acknowledged: %s\n", result.Error)
 		} else {
@@ -487,10 +571,48 @@ func (c *Client) flush() {
 		}
 		return
 	}
-	received := len(events)
-	if result.Received != nil {
-		received = *result.Received
+	if len(result.Acks) > 0 {
+		statuses := make(map[string]string, len(result.Acks))
+		for _, ack := range result.Acks {
+			if ack.EventID != "" {
+				statuses[ack.EventID] = ack.Status
+			}
+		}
+		if !durable {
+			retry := make([]logging.Event, 0, len(events))
+			for _, event := range events {
+				switch statuses[event.EventID] {
+				case "accepted", "duplicate", "rejected", "conflicted":
+				default:
+					retry = append(retry, event)
+				}
+			}
+			c.logger.RequeueFront(retry)
+		}
+		if err := c.logger.ResolveEvents(statuses); err != nil {
+			c.logger.Warn("could not resolve event acknowledgments: %v", err)
+			return
+		}
+		c.logger.Info("telemetry upload acknowledged per item: sent=%d acked=%d inserted=%d", len(events), len(statuses), result.Inserted)
+		return
 	}
+	if result.Received == nil || *result.Received != len(events) {
+		if !durable {
+			c.logger.RequeueFront(events)
+		}
+		fmt.Fprintf(os.Stderr, "[agentkeeper] telemetry upload not fully acknowledged\n")
+		return
+	}
+	statuses := make(map[string]string, len(events))
+	for _, event := range events {
+		statuses[event.EventID] = "accepted"
+	}
+	if err := c.logger.ResolveEvents(statuses); err != nil {
+		c.logger.Warn("could not resolve acknowledged event batch: %v", err)
+		return
+	}
+	received := len(events)
+	received = *result.Received
 	c.logger.Info("telemetry upload acknowledged: sent=%d received=%d inserted=%d", len(events), received, result.Inserted)
 }
 
