@@ -18,14 +18,20 @@ builds:
       - -X github.com/rad-security/agentkeeper-mcp-gateway/cmd.date={{.Date}}
 
 archives:
-  - format: tar.gz
+  - formats: [tar.gz]
     name_template: "{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}"
     format_overrides:
       - goos: windows
-        format: zip
+        formats: [zip]
 
 checksum:
   name_template: "checksums.txt"
+
+# Generate an SPDX JSON SBOM for every platform archive. GoReleaser adds the
+# documents to checksums.txt, so the existing keyless checksum signature also
+# binds the SBOMs to this release.
+sboms:
+  - artifacts: archive
 
 signs:
   - cmd: cosign
