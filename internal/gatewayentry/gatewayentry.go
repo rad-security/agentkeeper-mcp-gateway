@@ -3,7 +3,10 @@ package gatewayentry
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
+	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 )
@@ -22,25 +25,137 @@ func Command() string {
 	if configured := strings.TrimSpace(os.Getenv(EnvBinary)); configured != "" {
 		return configured
 	}
-	if exe, err := os.Executable(); err == nil && filepath.Base(exe) == BinaryName {
+	if exe, err := os.Executable(); err == nil && isGatewayBasename(filepath.Base(exe)) {
 		return exe
 	}
 	return BinaryName
 }
 
-// RouteIdentity binds a routed client process to the exact client
-// configuration that was inspected before AgentKeeper rewrote it. The route
-// revision also includes the installed Gateway command so an artifact/path
-// replacement produces a new route instead of silently inheriting trust.
+// ContentHash hashes exact bytes for compare-and-swap checks before a client
+// configuration is changed.
+func ContentHash(source []byte) string {
+	sum := sha256.Sum256(source)
+	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
+// RouteIdentity binds a routed client process to the durable client
+// configuration it launches from. The two embedded attestation values are
+// removed before canonical JSON hashing to avoid a self-referential hash while
+// retaining every behavior-affecting field, including the absolute command.
 func RouteIdentity(clientName string, source []byte) (string, string) {
-	sourceSum := sha256.Sum256(source)
-	sourceHash := "sha256:" + hex.EncodeToString(sourceSum[:])
+	canonical := canonicalRouteSource(source)
+	sourceHash := ContentHash(canonical)
 	routeSum := sha256.Sum256([]byte(clientName + "\x00" + sourceHash + "\x00" + Command()))
 	return sourceHash, "route:" + hex.EncodeToString(routeSum[:])
 }
 
+func canonicalRouteSource(source []byte) []byte {
+	var document interface{}
+	if json.Unmarshal(source, &document) != nil {
+		return source
+	}
+	walkRouteEntries(document, func(_ map[string]interface{}, env map[string]interface{}) {
+		delete(env, EnvConfigSourceHash)
+		delete(env, EnvRouteRevision)
+	})
+	canonical, err := json.Marshal(document)
+	if err != nil {
+		return source
+	}
+	return canonical
+}
+
+// AttestRoutes binds every AgentKeeper Gateway entry in a client document,
+// including Claude Code project-scoped entries nested under `projects`, to the
+// same final durable route identity. It deliberately does not modify other MCP
+// servers or their environment variables.
+func AttestRoutes(clientName string, source []byte) ([]byte, string, string, error) {
+	var document interface{}
+	if err := json.Unmarshal(source, &document); err != nil {
+		return nil, "", "", fmt.Errorf("parsing client route document: %w", err)
+	}
+	found := false
+	walkRouteEntries(document, func(entry map[string]interface{}, env map[string]interface{}) {
+		found = true
+		env[EnvClientName] = clientName
+		delete(env, EnvConfigSourceHash)
+		delete(env, EnvRouteRevision)
+		entry["env"] = env
+	})
+	if !found {
+		return nil, "", "", fmt.Errorf("client route document contains no AgentKeeper Gateway entry")
+	}
+	identityDocument, err := json.Marshal(document)
+	if err != nil {
+		return nil, "", "", fmt.Errorf("encoding client route identity document: %w", err)
+	}
+	sourceHash, routeRevision := RouteIdentity(clientName, identityDocument)
+	walkRouteEntries(document, func(entry map[string]interface{}, env map[string]interface{}) {
+		env[EnvConfigSourceHash] = sourceHash
+		env[EnvRouteRevision] = routeRevision
+		entry["env"] = env
+	})
+	bound, err := json.MarshalIndent(document, "", "  ")
+	if err != nil {
+		return nil, "", "", fmt.Errorf("encoding attested client route document: %w", err)
+	}
+	verifiedHash, verifiedRevision := RouteIdentity(clientName, bound)
+	if verifiedHash != sourceHash || verifiedRevision != routeRevision {
+		return nil, "", "", fmt.Errorf("client route identity changed while binding attestation")
+	}
+	return bound, sourceHash, routeRevision, nil
+}
+
+func walkRouteEntries(value interface{}, visit func(entry map[string]interface{}, env map[string]interface{})) {
+	switch current := value.(type) {
+	case map[string]interface{}:
+		if servers, ok := current["mcpServers"].(map[string]interface{}); ok {
+			for _, rawEntry := range servers {
+				entry, ok := rawEntry.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				command, _ := entry["command"].(string)
+				if !IsGatewayCommand(command) {
+					continue
+				}
+				env, _ := entry["env"].(map[string]interface{})
+				if env == nil {
+					env = make(map[string]interface{})
+				}
+				visit(entry, env)
+			}
+		}
+		for _, child := range current {
+			walkRouteEntries(child, visit)
+		}
+	case []interface{}:
+		for _, child := range current {
+			walkRouteEntries(child, visit)
+		}
+	}
+}
+
 func IsGatewayCommand(command string) bool {
-	return filepath.Base(strings.TrimSpace(command)) == BinaryName
+	clean := strings.ReplaceAll(strings.TrimSpace(command), "\\", "/")
+	if configured := strings.ReplaceAll(strings.TrimSpace(os.Getenv(EnvBinary)), "\\", "/"); configured != "" && clean == configured {
+		return true
+	}
+	base := path.Base(clean)
+	return isGatewayBasename(base) || filepath.Base(clean) == BinaryName
+}
+
+func isGatewayBasename(base string) bool {
+	base = strings.TrimSuffix(base, ".exe")
+	if base == BinaryName {
+		return true
+	}
+	for _, suffix := range []string{"_darwin_amd64", "_darwin_arm64", "_linux_amd64", "_linux_arm64", "_windows_amd64", "_windows_arm64"} {
+		if base == BinaryName+suffix {
+			return true
+		}
+	}
+	return false
 }
 
 // IsCurrentGatewayCommand reports whether command is the canonical gateway
@@ -57,5 +172,5 @@ func IsCurrentGatewayCommand(command string) bool {
 	if current == BinaryName {
 		return true
 	}
-	return command == current
+	return strings.ReplaceAll(command, "\\", "/") == strings.ReplaceAll(current, "\\", "/")
 }

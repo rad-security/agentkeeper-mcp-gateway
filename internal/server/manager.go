@@ -7,9 +7,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -52,9 +54,18 @@ type Server struct {
 	capabilities    map[string]bool
 	protocolVersion string
 	sessionID       string
+	sessionMu       sync.RWMutex
 	nextID          atomic.Int64
 	pending         map[int64]chan rpcResponse
 	pendMu          sync.Mutex
+	notify          func(method string, params json.RawMessage)
+	done            chan struct{}
+	sseMu           sync.Mutex
+	sseEndpoint     string
+	sseBody         io.ReadCloser
+	sseCancel       context.CancelFunc
+	sseEndpointCh   chan string
+	sseErrCh        chan error
 }
 
 type rpcResponse struct {
@@ -64,17 +75,52 @@ type rpcResponse struct {
 
 // Manager manages multiple MCP server processes.
 type Manager struct {
-	servers map[string]*Server
-	configs []ServerConfig
-	mu      sync.RWMutex
-	startMu sync.Mutex
+	servers             map[string]*Server
+	configs             []ServerConfig
+	mu                  sync.RWMutex
+	startMu             sync.Mutex
+	stopping            bool
+	restartAttempts     map[string]int
+	notificationHandler func(serverName, method string, params json.RawMessage)
+	lifecycleHandler    func(serverName, state string, err error)
 }
 
 // NewManager creates a server manager from configs.
 func NewManager(configs []ServerConfig) *Manager {
 	return &Manager{
-		servers: make(map[string]*Server),
-		configs: configs,
+		servers:         make(map[string]*Server),
+		configs:         configs,
+		restartAttempts: make(map[string]int),
+	}
+}
+
+// SetNotificationHandler forwards upstream MCP notifications such as progress
+// to the connected client. The handler must be concurrency-safe.
+func (m *Manager) SetNotificationHandler(handler func(serverName, method string, params json.RawMessage)) {
+	m.mu.Lock()
+	m.notificationHandler = handler
+	for name, srv := range m.servers {
+		srv.notify = m.serverNotifier(name)
+	}
+	m.mu.Unlock()
+}
+
+// SetLifecycleHandler reports backend availability changes to the proxy so it
+// can remove stale capabilities before a dead process is restarted.
+func (m *Manager) SetLifecycleHandler(handler func(serverName, state string, err error)) {
+	m.mu.Lock()
+	m.lifecycleHandler = handler
+	m.mu.Unlock()
+}
+
+func (m *Manager) serverNotifier(name string) func(string, json.RawMessage) {
+	return func(method string, params json.RawMessage) {
+		m.mu.RLock()
+		handler := m.notificationHandler
+		m.mu.RUnlock()
+		if handler != nil {
+			handler(name, method, params)
+		}
 	}
 }
 
@@ -96,17 +142,20 @@ func (m *Manager) StartAll() error {
 			continue
 		}
 		transport := normalizeTransport(cfg)
-		if transport == "http" {
+		if transport == "http" || transport == "sse" {
 			if strings.TrimSpace(cfg.URL) == "" {
 				fmt.Fprintf(os.Stderr, "[agentkeeper] skipping MCP server %s: empty URL for HTTP transport\n", cfg.Name)
 				continue
 			}
-			cfg.Transport = "http"
+			cfg.Transport = transport
 			// HTTP servers don't need to be spawned — they're remote
 			m.mu.Lock()
 			m.servers[cfg.Name] = &Server{
-				config:  cfg,
-				pending: make(map[int64]chan rpcResponse),
+				config:        cfg,
+				pending:       make(map[int64]chan rpcResponse),
+				notify:        m.serverNotifier(cfg.Name),
+				sseEndpointCh: make(chan string, 1),
+				sseErrCh:      make(chan error, 1),
 			}
 			m.mu.Unlock()
 			continue
@@ -166,16 +215,106 @@ func (m *Manager) startServer(cfg ServerConfig) error {
 		stdin:   stdin,
 		stdout:  bufio.NewReader(stdout),
 		pending: make(map[int64]chan rpcResponse),
+		notify:  m.serverNotifier(cfg.Name),
+		done:    make(chan struct{}),
 	}
 
-	// Read responses in background
+	// Read responses and own cmd.Wait in background. Exactly one goroutine may
+	// wait on an exec.Cmd; StopAll waits on srv.done instead.
 	go srv.readResponses()
 
 	m.mu.Lock()
 	m.servers[cfg.Name] = srv
 	m.mu.Unlock()
+	go m.watchServer(cfg, srv)
 
 	return nil
+}
+
+func (m *Manager) watchServer(cfg ServerConfig, srv *Server) {
+	err := srv.cmd.Wait()
+	close(srv.done)
+	if err == nil {
+		err = io.EOF
+	}
+	srv.failPending(err)
+
+	m.mu.Lock()
+	if current := m.servers[cfg.Name]; current == srv {
+		delete(m.servers, cfg.Name)
+	}
+	stopping := m.stopping
+	handler := m.lifecycleHandler
+	m.mu.Unlock()
+	if handler != nil {
+		handler(cfg.Name, "degraded", err)
+	}
+	if !stopping {
+		m.scheduleRestart(cfg, err)
+	}
+}
+
+const maxRestartAttempts = 5
+
+func (m *Manager) scheduleRestart(cfg ServerConfig, cause error) {
+	m.mu.Lock()
+	if m.stopping || !m.configuredLocked(cfg.Name) {
+		m.mu.Unlock()
+		return
+	}
+	m.restartAttempts[cfg.Name]++
+	attempt := m.restartAttempts[cfg.Name]
+	handler := m.lifecycleHandler
+	m.mu.Unlock()
+	if attempt > maxRestartAttempts {
+		if handler != nil {
+			handler(cfg.Name, "circuit_open", cause)
+		}
+		return
+	}
+	delay := 100 * time.Millisecond * time.Duration(1<<min(attempt-1, 5))
+	if handler != nil {
+		handler(cfg.Name, "restarting", cause)
+	}
+	time.AfterFunc(delay, func() {
+		m.startMu.Lock()
+		defer m.startMu.Unlock()
+		m.mu.RLock()
+		stopping := m.stopping
+		configured := m.configuredLockedRead(cfg.Name)
+		alreadyRunning := m.servers[cfg.Name] != nil
+		m.mu.RUnlock()
+		if stopping || !configured || alreadyRunning {
+			return
+		}
+		if err := m.startServer(cfg); err != nil {
+			m.scheduleRestart(cfg, err)
+		}
+	})
+}
+
+func (m *Manager) configuredLocked(name string) bool {
+	for _, cfg := range m.configs {
+		if cfg.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *Manager) configuredLockedRead(name string) bool {
+	return m.configuredLocked(name)
+}
+
+// MarkHealthy resets the crash-loop budget after a successful MCP operation.
+func (m *Manager) MarkHealthy(name string) {
+	m.mu.Lock()
+	m.restartAttempts[name] = 0
+	handler := m.lifecycleHandler
+	m.mu.Unlock()
+	if handler != nil {
+		handler(name, "ready", nil)
+	}
 }
 
 // resolveCommand treats command and args as structured fields. Existing
@@ -225,6 +364,20 @@ func (m *Manager) ServerNames() []string {
 	return names
 }
 
+// ConfiguredNames returns desired backends, including ones that are currently
+// degraded or waiting for bounded restart.
+func (m *Manager) ConfiguredNames() []string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	names := make([]string, 0, len(m.configs))
+	for _, cfg := range m.configs {
+		if cfg.Name != "" {
+			names = append(names, cfg.Name)
+		}
+	}
+	return names
+}
+
 // Get returns a server by name.
 func (m *Manager) Get(name string) *Server {
 	m.mu.RLock()
@@ -238,24 +391,39 @@ func (m *Manager) StopAll() {
 	defer m.startMu.Unlock()
 
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.stopping = true
+	servers := make([]*Server, 0, len(m.servers))
 	for _, srv := range m.servers {
-		if srv.cmd != nil && srv.cmd.Process != nil {
-			_ = srv.stdin.Close()
-			done := make(chan struct{})
-			go func(cmd *exec.Cmd) {
-				_ = cmd.Wait()
-				close(done)
-			}(srv.cmd)
-			select {
-			case <-done:
-			case <-time.After(backendStopGracePeriod):
-				_ = srv.cmd.Process.Kill()
-				<-done
-			}
-		}
+		servers = append(servers, srv)
 	}
 	m.servers = make(map[string]*Server)
+	m.mu.Unlock()
+	for _, srv := range servers {
+		srv.stop()
+	}
+}
+
+func (s *Server) stop() {
+	if s.IsSSE() {
+		s.sseMu.Lock()
+		if s.sseCancel != nil {
+			s.sseCancel()
+		}
+		if s.sseBody != nil {
+			_ = s.sseBody.Close()
+		}
+		s.sseMu.Unlock()
+	}
+	if s.cmd == nil || s.cmd.Process == nil {
+		return
+	}
+	_ = s.stdin.Close()
+	select {
+	case <-s.done:
+	case <-time.After(backendStopGracePeriod):
+		_ = s.cmd.Process.Kill()
+		<-s.done
+	}
 }
 
 // Initialize sends the initialize handshake to a server.
@@ -267,6 +435,9 @@ func (s *Server) Initialize() error {
 func (s *Server) InitializeContext(ctx context.Context) error {
 	if s.IsHTTP() {
 		return s.ensureHTTPInitializedContext(ctx)
+	}
+	if s.IsSSE() {
+		return s.ensureSSEInitializedContext(ctx)
 	}
 
 	s.initMu.Lock()
@@ -414,6 +585,14 @@ func (s *Server) CallContext(ctx context.Context, method string, params json.Raw
 		}
 		return s.callHTTPContext(ctx, method, params)
 	}
+	if s.IsSSE() {
+		if method != "initialize" && !strings.HasPrefix(method, "notifications/") {
+			if err := s.ensureSSEInitializedContext(ctx); err != nil {
+				return nil, err
+			}
+		}
+		return s.callSSEContext(ctx, method, params)
+	}
 
 	s.mu.Lock()
 	id := s.nextID.Add(1)
@@ -456,6 +635,7 @@ func (s *Server) CallContext(ctx context.Context, method string, params json.Raw
 		s.pendMu.Lock()
 		delete(s.pending, id)
 		s.pendMu.Unlock()
+		s.sendCancellation(id, ctx.Err())
 		return nil, ctx.Err()
 	case <-timer.C:
 		s.pendMu.Lock()
@@ -468,6 +648,10 @@ func (s *Server) CallContext(ctx context.Context, method string, params json.Raw
 func (s *Server) sendNotification(method string, params json.RawMessage) {
 	if s.IsHTTP() {
 		s.sendHTTPNotification(method, params)
+		return
+	}
+	if s.IsSSE() {
+		s.sendSSENotification(method, params)
 		return
 	}
 
@@ -492,6 +676,19 @@ func (s *Server) Notify(method string, params json.RawMessage) {
 
 func (s *Server) IsHTTP() bool {
 	return normalizeTransport(s.config) == "http"
+}
+
+func (s *Server) IsSSE() bool {
+	return normalizeTransport(s.config) == "sse"
+}
+
+func (s *Server) sendCancellation(id int64, cause error) {
+	reason := "request cancelled"
+	if cause != nil {
+		reason = cause.Error()
+	}
+	params, _ := json.Marshal(map[string]interface{}{"requestId": id, "reason": reason})
+	s.sendNotification("notifications/cancelled", params)
 }
 
 func (s *Server) ensureHTTPInitialized() error {
@@ -540,7 +737,11 @@ func (s *Server) callHTTPContext(ctx context.Context, method string, params json
 		msg["params"] = json.RawMessage(params)
 	}
 
-	return s.postHTTPContext(ctx, msg, id, true, timeoutForMethod(method))
+	result, err := s.postHTTPContext(ctx, msg, id, true, timeoutForMethod(method))
+	if err != nil && ctx.Err() != nil {
+		s.sendCancellation(id, ctx.Err())
+	}
+	return result, err
 }
 
 func (s *Server) sendHTTPNotification(method string, params json.RawMessage) {
@@ -572,8 +773,11 @@ func (s *Server) postHTTPContext(ctx context.Context, msg map[string]interface{}
 	for k, v := range s.config.Headers {
 		req.Header.Set(k, v)
 	}
-	if s.sessionID != "" {
-		req.Header.Set("Mcp-Session-Id", s.sessionID)
+	s.sessionMu.RLock()
+	sessionID := s.sessionID
+	s.sessionMu.RUnlock()
+	if sessionID != "" {
+		req.Header.Set("Mcp-Session-Id", sessionID)
 	}
 	if protocolVersion := s.negotiatedProtocolVersion(); protocolVersion != "" {
 		req.Header.Set("MCP-Protocol-Version", protocolVersion)
@@ -587,7 +791,9 @@ func (s *Server) postHTTPContext(ctx context.Context, msg map[string]interface{}
 	defer resp.Body.Close()
 
 	if sid := resp.Header.Get("Mcp-Session-Id"); sid != "" {
+		s.sessionMu.Lock()
 		s.sessionID = sid
+		s.sessionMu.Unlock()
 	}
 	if !expectResult || resp.StatusCode == http.StatusAccepted {
 		return json.RawMessage(`{}`), nil
@@ -606,9 +812,302 @@ func (s *Server) postHTTPContext(ctx context.Context, msg map[string]interface{}
 		return nil, fmt.Errorf("HTTP %d from %s", resp.StatusCode, s.config.URL)
 	}
 	if strings.Contains(contentType, "text/event-stream") {
-		return readSSEResult(resp.Body, id)
+		return readSSEResult(resp.Body, id, s.notify)
 	}
 	return readJSONRPCResult(resp.Body, id)
+}
+
+func (s *Server) ensureSSEInitializedContext(ctx context.Context) error {
+	s.initMu.Lock()
+	defer s.initMu.Unlock()
+	if s.initialized {
+		return nil
+	}
+	if err := s.ensureSSEConnectedContext(ctx); err != nil {
+		return err
+	}
+	params := map[string]interface{}{
+		"protocolVersion": latestProtocolVersion,
+		"capabilities":    map[string]interface{}{},
+		"clientInfo": map[string]interface{}{
+			"name": "agentkeeper-mcp-gateway", "version": "0.1.0",
+		},
+	}
+	paramsJSON, _ := json.Marshal(params)
+	result, err := s.callSSEContext(ctx, "initialize", paramsJSON)
+	if err != nil {
+		return err
+	}
+	if err := s.recordInitializeResult(result); err != nil {
+		return err
+	}
+	s.sendSSENotification("notifications/initialized", nil)
+	s.initialized = true
+	return nil
+}
+
+func (s *Server) ensureSSEConnectedContext(ctx context.Context) error {
+	s.sseMu.Lock()
+	if s.sseEndpoint != "" {
+		s.sseMu.Unlock()
+		return nil
+	}
+	if s.sseCancel != nil {
+		endpointCh := s.sseEndpointCh
+		errCh := s.sseErrCh
+		s.sseMu.Unlock()
+		return waitForSSEEndpoint(ctx, endpointCh, errCh)
+	}
+	streamCtx, cancel := context.WithCancel(context.Background())
+	s.sseCancel = cancel
+	endpointCh := s.sseEndpointCh
+	errCh := s.sseErrCh
+	s.sseMu.Unlock()
+
+	req, err := http.NewRequestWithContext(streamCtx, http.MethodGet, s.config.URL, nil)
+	if err != nil {
+		s.resetSSEConnection(cancel, err)
+		return err
+	}
+	req.Header.Set("Accept", "text/event-stream")
+	for key, value := range s.config.Headers {
+		req.Header.Set(key, value)
+	}
+	client := &http.Client{Transport: &http.Transport{ResponseHeaderTimeout: backendDiscoveryTimeout}}
+	resp, err := client.Do(req)
+	if err != nil {
+		s.resetSSEConnection(cancel, err)
+		return err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		_ = resp.Body.Close()
+		err := fmt.Errorf("HTTP %d from %s", resp.StatusCode, s.config.URL)
+		s.resetSSEConnection(cancel, err)
+		return err
+	}
+	if !strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") {
+		_ = resp.Body.Close()
+		err := fmt.Errorf("legacy SSE endpoint %s returned %q", s.config.URL, resp.Header.Get("Content-Type"))
+		s.resetSSEConnection(cancel, err)
+		return err
+	}
+	s.sseMu.Lock()
+	s.sseBody = resp.Body
+	s.sseMu.Unlock()
+	go s.readLegacySSE(resp.Body)
+	return waitForSSEEndpoint(ctx, endpointCh, errCh)
+}
+
+func waitForSSEEndpoint(ctx context.Context, endpointCh <-chan string, errCh <-chan error) error {
+	timer := time.NewTimer(backendDiscoveryTimeout)
+	defer timer.Stop()
+	select {
+	case endpoint := <-endpointCh:
+		if endpoint == "" {
+			return errors.New("legacy SSE endpoint event was empty")
+		}
+		return nil
+	case err := <-errCh:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return fmt.Errorf("legacy SSE endpoint discovery timed out after %s", backendDiscoveryTimeout)
+	}
+}
+
+func (s *Server) readLegacySSE(body io.Reader) {
+	scanner := bufio.NewScanner(body)
+	eventName := ""
+	dataLines := make([]string, 0, 1)
+	dispatch := func() {
+		data := strings.Join(dataLines, "\n")
+		dataLines = dataLines[:0]
+		if strings.TrimSpace(data) == "" {
+			eventName = ""
+			return
+		}
+		switch eventName {
+		case "endpoint":
+			endpoint, err := resolveSSEEndpoint(s.config.URL, strings.TrimSpace(data))
+			if err != nil {
+				s.signalSSEError(err)
+				return
+			}
+			s.sseMu.Lock()
+			s.sseEndpoint = endpoint
+			s.sseMu.Unlock()
+			select {
+			case s.sseEndpointCh <- endpoint:
+			default:
+			}
+		default:
+			s.dispatchRPCPayload([]byte(data))
+		}
+		eventName = ""
+	}
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" {
+			dispatch()
+			continue
+		}
+		if strings.HasPrefix(line, "event:") {
+			eventName = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+			continue
+		}
+		if strings.HasPrefix(line, "data:") {
+			dataLines = append(dataLines, strings.TrimSpace(strings.TrimPrefix(line, "data:")))
+		}
+	}
+	dispatch()
+	err := scanner.Err()
+	if err == nil {
+		err = io.EOF
+	}
+	s.failPending(err)
+	s.sseMu.Lock()
+	errCh := s.sseErrCh
+	if s.sseCancel != nil {
+		s.sseCancel()
+	}
+	s.sseEndpoint = ""
+	s.sseBody = nil
+	s.sseCancel = nil
+	s.sseEndpointCh = make(chan string, 1)
+	s.sseErrCh = make(chan error, 1)
+	s.sseMu.Unlock()
+	s.initMu.Lock()
+	s.initialized = false
+	s.initMu.Unlock()
+	select {
+	case errCh <- err:
+	default:
+	}
+}
+
+func (s *Server) resetSSEConnection(cancel context.CancelFunc, cause error) {
+	if cancel != nil {
+		cancel()
+	}
+	s.sseMu.Lock()
+	errCh := s.sseErrCh
+	s.sseEndpoint = ""
+	s.sseBody = nil
+	s.sseCancel = nil
+	s.sseEndpointCh = make(chan string, 1)
+	s.sseErrCh = make(chan error, 1)
+	s.sseMu.Unlock()
+	if cause != nil {
+		select {
+		case errCh <- cause:
+		default:
+		}
+	}
+}
+
+func resolveSSEEndpoint(baseURL, endpoint string) (string, error) {
+	base, err := url.Parse(baseURL)
+	if err != nil {
+		return "", err
+	}
+	reference, err := url.Parse(endpoint)
+	if err != nil {
+		return "", err
+	}
+	resolved := base.ResolveReference(reference)
+	if resolved.Scheme != "http" && resolved.Scheme != "https" {
+		return "", fmt.Errorf("unsupported legacy SSE message endpoint %q", resolved.String())
+	}
+	return resolved.String(), nil
+}
+
+func (s *Server) signalSSEError(err error) {
+	select {
+	case s.sseErrCh <- err:
+	default:
+	}
+}
+
+func (s *Server) callSSEContext(ctx context.Context, method string, params json.RawMessage) (json.RawMessage, error) {
+	if err := s.ensureSSEConnectedContext(ctx); err != nil {
+		return nil, err
+	}
+	id := s.nextID.Add(1)
+	msg := map[string]interface{}{"jsonrpc": "2.0", "id": id, "method": method}
+	if params != nil {
+		msg["params"] = json.RawMessage(params)
+	}
+	ch := make(chan rpcResponse, 1)
+	s.pendMu.Lock()
+	s.pending[id] = ch
+	s.pendMu.Unlock()
+	if err := s.postSSE(ctx, msg); err != nil {
+		s.pendMu.Lock()
+		delete(s.pending, id)
+		s.pendMu.Unlock()
+		return nil, err
+	}
+	timer := time.NewTimer(timeoutForMethod(method))
+	defer timer.Stop()
+	select {
+	case response := <-ch:
+		return response.result, response.err
+	case <-ctx.Done():
+		s.pendMu.Lock()
+		delete(s.pending, id)
+		s.pendMu.Unlock()
+		s.sendCancellation(id, ctx.Err())
+		return nil, ctx.Err()
+	case <-timer.C:
+		s.pendMu.Lock()
+		delete(s.pending, id)
+		s.pendMu.Unlock()
+		return nil, fmt.Errorf("%s timed out after %s", method, timeoutForMethod(method))
+	}
+}
+
+func (s *Server) sendSSENotification(method string, params json.RawMessage) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := s.ensureSSEConnectedContext(ctx); err != nil {
+		return
+	}
+	msg := map[string]interface{}{"jsonrpc": "2.0", "method": method}
+	if params != nil {
+		msg["params"] = json.RawMessage(params)
+	}
+	_ = s.postSSE(ctx, msg)
+}
+
+func (s *Server) postSSE(ctx context.Context, msg map[string]interface{}) error {
+	s.sseMu.Lock()
+	endpoint := s.sseEndpoint
+	s.sseMu.Unlock()
+	if endpoint == "" {
+		return errors.New("legacy SSE message endpoint is unavailable")
+	}
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(data))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	for key, value := range s.config.Headers {
+		req.Header.Set(key, value)
+	}
+	resp, err := (&http.Client{Timeout: backendDefaultTimeout}).Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("HTTP %d from %s", resp.StatusCode, endpoint)
+	}
+	return nil
 }
 
 // SupportsCapability reports the upstream capability observed during the
@@ -676,7 +1175,7 @@ func readJSONRPCResult(r io.Reader, id int64) (json.RawMessage, error) {
 	return parseJSONRPCResult(data, id)
 }
 
-func readSSEResult(r io.Reader, id int64) (json.RawMessage, error) {
+func readSSEResult(r io.Reader, id int64, notify func(string, json.RawMessage)) (json.RawMessage, error) {
 	scanner := bufio.NewScanner(r)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -685,6 +1184,20 @@ func readSSEResult(r io.Reader, id int64) (json.RawMessage, error) {
 		}
 		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 		if payload == "" || payload == "[DONE]" {
+			continue
+		}
+		var envelope struct {
+			ID     *int64          `json:"id"`
+			Method string          `json:"method"`
+			Params json.RawMessage `json:"params"`
+		}
+		if err := json.Unmarshal([]byte(payload), &envelope); err != nil {
+			continue
+		}
+		if envelope.ID == nil && envelope.Method != "" {
+			if notify != nil {
+				notify(envelope.Method, envelope.Params)
+			}
 			continue
 		}
 		result, err := parseJSONRPCResult([]byte(payload), id)
@@ -725,8 +1238,10 @@ func parseJSONRPCResult(data []byte, id int64) (json.RawMessage, error) {
 func normalizeTransport(cfg ServerConfig) string {
 	transport := strings.ToLower(strings.TrimSpace(cfg.Transport))
 	switch transport {
-	case "http", "sse", "streamable-http":
+	case "http", "streamable-http":
 		return "http"
+	case "sse":
+		return "sse"
 	case "":
 		if strings.TrimSpace(cfg.URL) != "" {
 			return "http"
@@ -745,41 +1260,47 @@ func (s *Server) readResponses() {
 			return
 		}
 
-		var msg struct {
-			ID     *int64          `json:"id"`
-			Result json.RawMessage `json:"result"`
-			Error  *struct {
-				Code    int    `json:"code"`
-				Message string `json:"message"`
-			} `json:"error"`
-		}
-		if err := json.Unmarshal(line, &msg); err != nil {
-			continue
-		}
-
-		if msg.ID == nil {
-			// Notification from server — ignore for now
-			continue
-		}
-
-		s.pendMu.Lock()
-		ch, ok := s.pending[*msg.ID]
-		if ok {
-			delete(s.pending, *msg.ID)
-		}
-		s.pendMu.Unlock()
-
-		if ok {
-			if msg.Error != nil {
-				ch <- rpcResponse{err: fmt.Errorf("%s", msg.Error.Message)}
-			} else {
-				if msg.Result == nil {
-					msg.Result = json.RawMessage(`{}`)
-				}
-				ch <- rpcResponse{result: msg.Result}
-			}
-		}
+		s.dispatchRPCPayload(line)
 	}
+}
+
+func (s *Server) dispatchRPCPayload(payload []byte) {
+	var msg struct {
+		ID     *int64          `json:"id"`
+		Method string          `json:"method"`
+		Params json.RawMessage `json:"params"`
+		Result json.RawMessage `json:"result"`
+		Error  *struct {
+			Code    int    `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(payload, &msg); err != nil {
+		return
+	}
+	if msg.ID == nil {
+		if msg.Method != "" && s.notify != nil {
+			s.notify(msg.Method, msg.Params)
+		}
+		return
+	}
+	s.pendMu.Lock()
+	ch, ok := s.pending[*msg.ID]
+	if ok {
+		delete(s.pending, *msg.ID)
+	}
+	s.pendMu.Unlock()
+	if !ok {
+		return
+	}
+	if msg.Error != nil {
+		ch <- rpcResponse{err: fmt.Errorf("%s", msg.Error.Message)}
+		return
+	}
+	if msg.Result == nil {
+		msg.Result = json.RawMessage(`{}`)
+	}
+	ch <- rpcResponse{result: msg.Result}
 }
 
 func (s *Server) failPending(err error) {

@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -17,6 +18,139 @@ import (
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/server"
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/telemetry"
 )
+
+func TestClientCancellationTerminatesReceiptForwardsUpstreamAndDoesNotStallNextCall(t *testing.T) {
+	enteredSlow := make(chan struct{}, 1)
+	cancelledUpstream := make(chan struct{}, 1)
+	completedFast := make(chan struct{}, 1)
+	forwardedMeta := make(chan interface{}, 1)
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request struct {
+			ID     *int64                 `json:"id"`
+			Method string                 `json:"method"`
+			Params map[string]interface{} `json:"params"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Error(err)
+			return
+		}
+		switch request.Method {
+		case "initialize":
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"jsonrpc": "2.0", "id": request.ID,
+				"result": map[string]interface{}{"protocolVersion": "2025-11-25", "capabilities": map[string]interface{}{"tools": map[string]interface{}{}}},
+			})
+		case "notifications/initialized":
+			w.WriteHeader(http.StatusAccepted)
+		case "notifications/cancelled":
+			cancelledUpstream <- struct{}{}
+			w.WriteHeader(http.StatusAccepted)
+		case "tools/call":
+			arguments, _ := request.Params["arguments"].(map[string]interface{})
+			if slow, _ := arguments["slow"].(bool); slow {
+				enteredSlow <- struct{}{}
+				<-r.Context().Done()
+				return
+			}
+			forwardedMeta <- request.Params["_meta"]
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"jsonrpc": "2.0", "id": request.ID,
+				"result": map[string]interface{}{"content": []map[string]interface{}{{"type": "text", "text": "ok"}}},
+			})
+			completedFast <- struct{}{}
+		default:
+			w.WriteHeader(http.StatusAccepted)
+		}
+	}))
+	defer backend.Close()
+
+	store, err := receipt.NewStore(t.TempDir(), "0.2.0-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mgr := server.NewManager([]server.ServerConfig{{Name: "backend", Transport: "http", URL: backend.URL}})
+	if err := mgr.StartAll(); err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.StopAll()
+	p := NewProxy(Config{ReceiptStore: store, GatewayVersion: "0.2.0-test"}, mgr, nil)
+	p.mu.Lock()
+	p.toolMap["backend__wait"] = "backend"
+	p.mu.Unlock()
+
+	input, inputWriter := io.Pipe()
+	var output bytes.Buffer
+	runDone := make(chan error, 1)
+	go func() { runDone <- p.run(input, &output) }()
+	_, _ = io.WriteString(inputWriter, `{"jsonrpc":"2.0","id":41,"method":"tools/call","params":{"name":"backend__wait","arguments":{"slow":true}}}`+"\n")
+	select {
+	case <-enteredSlow:
+	case <-time.After(2 * time.Second):
+		t.Fatal("slow call never reached backend")
+	}
+	_, _ = io.WriteString(inputWriter, `{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":41,"reason":"client stopped"}}`+"\n")
+	select {
+	case <-cancelledUpstream:
+	case <-time.After(2 * time.Second):
+		t.Fatal("client cancellation was not forwarded upstream")
+	}
+	_, _ = io.WriteString(inputWriter, `{"jsonrpc":"2.0","id":42,"method":"tools/call","params":{"name":"backend__wait","arguments":{"slow":false},"_meta":{"progressToken":"qa-token"}}}`+"\n")
+	select {
+	case <-completedFast:
+	case <-time.After(2 * time.Second):
+		t.Fatal("next call stalled after cancellation")
+	}
+	meta := (<-forwardedMeta).(map[string]interface{})
+	if meta["progressToken"] != "qa-token" {
+		t.Fatalf("tools/call _meta was not forwarded: %+v", meta)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		queued, peekErr := store.Peek(10)
+		if peekErr != nil {
+			t.Fatal(peekErr)
+		}
+		found := false
+		for _, item := range queued {
+			if item.AppliedDisposition == "result_returned" && item.ResultReturned {
+				found = true
+				break
+			}
+		}
+		if found {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	_ = inputWriter.Close()
+	if err := <-runDone; err != nil {
+		t.Fatal(err)
+	}
+	p.Close()
+
+	if !strings.Contains(output.String(), `"id":41,"error":{"code":-32800`) || !strings.Contains(output.String(), `"id":42,"result"`) {
+		t.Fatalf("unexpected proxy responses: %s", output.String())
+	}
+	receipts, err := store.Peek(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(receipts) != 2 {
+		t.Fatalf("receipt count = %d, want 2", len(receipts))
+	}
+	var sawCancelled, sawReturned bool
+	for _, item := range receipts {
+		if item.AppliedDisposition == "client_cancelled" && item.Dispatched && !item.ResultReceived && !item.ResultReturned {
+			sawCancelled = true
+		}
+		if item.AppliedDisposition == "result_returned" && item.Dispatched && item.ResultReceived && item.ResultReturned {
+			sawReturned = true
+		}
+	}
+	if !sawCancelled || !sawReturned {
+		t.Fatalf("terminal receipt semantics wrong: %+v", receipts)
+	}
+}
 
 func TestMalformedInputReturnsParseErrorAndStreamContinues(t *testing.T) {
 	p := NewProxy(Config{}, server.NewManager(nil), nil)

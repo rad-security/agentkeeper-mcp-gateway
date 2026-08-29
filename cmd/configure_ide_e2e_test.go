@@ -83,7 +83,7 @@ func runInDir(t *testing.T, home, dir string, args ...string) (string, string, i
 func ideConfigPath(home, ide string) string {
 	switch ide {
 	case "claude-code":
-		return filepath.Join(home, ".claude", "settings.json")
+		return filepath.Join(home, ".claude.json")
 	case "claude-desktop":
 		if runtime.GOOS == "darwin" {
 			return filepath.Join(home, "Library", "Application Support", "Claude", "claude_desktop_config.json")
@@ -554,16 +554,17 @@ func TestE2E16_ConfigPathIsDirectory(t *testing.T) {
 // E2E-17: already-wired + extra unrelated top-level keys → no-op, keys preserved.
 func TestE2E17_AlreadyWiredPreservesExtras(t *testing.T) {
 	home := t.TempDir()
-	body := fmt.Sprintf(`{
-  "mcpServers": {
-	    "agentkeeper-mcp-gateway": {"command": %q, "args": ["server"], "env": {"AGENTKEEPER_MCP_CLIENT":"cursor","AGENTKEEPER_MCP_CONFIG_SOURCE_HASH":"sha256:source","AGENTKEEPER_MCP_ROUTE_REVISION":"route:revision"}}
-  },
+	body := `{
   "editor": {"tabSize": 2},
   "version": 42
-}`, binary)
+}`
 	p := writeFixture(t, home, "cursor", body)
+	_, _, code := run(t, home, "configure-ide", "--ide=cursor")
+	if code != 0 {
+		t.Fatalf("initial configure exit %d", code)
+	}
 	statBefore, _ := os.Stat(p)
-	_, _, code := run(t, home, "configure-ide")
+	_, _, code = run(t, home, "configure-ide", "--ide=cursor")
 	if code != 0 {
 		t.Fatalf("exit %d", code)
 	}
@@ -630,21 +631,19 @@ func TestE2E19_CaseSensitiveBasenameMatch(t *testing.T) {
 	}
 }
 
-// E2E-20: gateway entry with extra unknown per-server fields → should still match by basename+args.
-// This verifies we don't accidentally fail idempotency because a user's entry
-// has an extra field like "type":"stdio" that some IDEs add.
-func TestE2E20_ExtraFieldOnGatewayEntry_StillWired(t *testing.T) {
+// E2E-20: gateway entry with an unbound transport field is repaired. Client
+// routing behavior is covered by the attestation, so a post-write mutation
+// cannot be treated as an idempotent no-op.
+func TestE2E20_ExtraFieldOnGatewayEntry_RequiresRepair(t *testing.T) {
 	home := t.TempDir()
 	body := fmt.Sprintf(`{"mcpServers":{"agentkeeper-mcp-gateway":{"command":%q,"args":["server"],"type":"stdio","env":{"AGENTKEEPER_MCP_CLIENT":"cursor","AGENTKEEPER_MCP_CONFIG_SOURCE_HASH":"sha256:source","AGENTKEEPER_MCP_ROUTE_REVISION":"route:revision"}}}}`, binary)
 	writeFixture(t, home, "cursor", body)
-	// We don't have a getter for the Plan struct here; we can only check via
-	// observable behavior: no backup should be created if we consider this wired.
 	_, _, code := run(t, home, "configure-ide")
 	if code != 0 {
 		t.Fatalf("exit %d", code)
 	}
-	if countBackups(t, home) != 0 {
-		t.Errorf("backup created despite already-wired shape + extra harmless field; backups=%v", backupFiles(t, home))
+	if countBackups(t, home) != 1 {
+		t.Errorf("mutated route was not backed up and repaired; backups=%v", backupFiles(t, home))
 	}
 }
 
@@ -1018,7 +1017,7 @@ func TestE2E30_ClaudeCodeUserClaudeJSONMigrated(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("dry-run exit=%d out=%s", code, out)
 	}
-	for _, want := range []string{"claude-code:user", "notion", "raindrop", "(dry-run"} {
+	for _, want := range []string{"claude-code", "notion", "raindrop", "(dry-run"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("dry-run output missing %q:\n%s", want, out)
 		}
