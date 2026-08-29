@@ -11,6 +11,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -93,6 +94,10 @@ type Proxy struct {
 	activeToolsList   int
 	pendingListNote   bool
 	writeMu           sync.Mutex
+	outputMu          sync.RWMutex
+	output            io.Writer
+	inflightMu        sync.Mutex
+	inflight          map[string]context.CancelFunc
 }
 
 type toolRefreshStatus struct {
@@ -138,6 +143,11 @@ func NewProxy(cfg Config, mgr *server.Manager, tc *telemetry.Client) *Proxy {
 		toolCache:      make(map[string][]interface{}),
 		emptyToolLists: make(map[string]int),
 		toolStatus:     make(map[string]toolRefreshStatus),
+		inflight:       make(map[string]context.CancelFunc),
+	}
+	if mgr != nil {
+		mgr.SetNotificationHandler(p.forwardBackendNotification)
+		mgr.SetLifecycleHandler(p.handleBackendLifecycle)
 	}
 	p.loadPersistentToolCache()
 	return p
@@ -190,6 +200,9 @@ func (p *Proxy) Close() {
 }
 
 func (p *Proxy) run(input io.Reader, writer io.Writer) error {
+	p.outputMu.Lock()
+	p.output = writer
+	p.outputMu.Unlock()
 	reader := bufio.NewReader(input)
 
 	for {
@@ -224,26 +237,78 @@ func (p *Proxy) run(input io.Reader, writer io.Writer) error {
 			continue
 		}
 
-		response, err := p.handleMessage(msg)
-		if err != nil {
-			// Send JSON-RPC error response
-			if msg.ID != nil {
-				errResp := JSONRPCMessage{
-					JSONRPC: "2.0",
-					ID:      msg.ID,
-					Error: &JSONRPCError{
-						Code:    -32603,
-						Message: err.Error(),
-					},
-				}
-				p.writeJSONLine(writer, errResp)
-			}
+		if msg.Method == "notifications/cancelled" {
+			p.handleClientCancellation(msg.Params)
+			continue
+		}
+		if msg.Method == "tools/call" && msg.ID != nil {
+			ctx, cancel := context.WithCancel(p.proxyContext())
+			key := rpcIDKey(msg.ID)
+			p.inflightMu.Lock()
+			p.inflight[key] = cancel
+			p.inflightMu.Unlock()
+			p.wg.Add(1)
+			go func() {
+				defer p.wg.Done()
+				defer cancel()
+				defer func() {
+					p.inflightMu.Lock()
+					delete(p.inflight, key)
+					p.inflightMu.Unlock()
+				}()
+				response, err := p.handleMessageContext(ctx, msg)
+				p.writeResponse(writer, msg, response, err)
+			}()
 			continue
 		}
 
-		if response != nil {
-			p.writeJSONLine(writer, response)
+		response, err := p.handleMessage(msg)
+		p.writeResponse(writer, msg, response, err)
+	}
+}
+
+func (p *Proxy) writeResponse(writer io.Writer, msg JSONRPCMessage, response *JSONRPCMessage, err error) {
+	if err != nil {
+		// Send JSON-RPC error response
+		if msg.ID != nil {
+			errResp := JSONRPCMessage{
+				JSONRPC: "2.0",
+				ID:      msg.ID,
+				Error: &JSONRPCError{
+					Code:    -32603,
+					Message: err.Error(),
+				},
+			}
+			p.writeJSONLine(writer, errResp)
 		}
+		return
+	}
+
+	if response != nil {
+		p.writeJSONLine(writer, response)
+	}
+}
+
+func rpcIDKey(id *json.RawMessage) string {
+	if id == nil {
+		return ""
+	}
+	return strings.TrimSpace(string(*id))
+}
+
+func (p *Proxy) handleClientCancellation(params json.RawMessage) {
+	var payload struct {
+		RequestID json.RawMessage `json:"requestId"`
+	}
+	if json.Unmarshal(params, &payload) != nil || len(payload.RequestID) == 0 {
+		return
+	}
+	key := strings.TrimSpace(string(payload.RequestID))
+	p.inflightMu.Lock()
+	cancel := p.inflight[key]
+	p.inflightMu.Unlock()
+	if cancel != nil {
+		cancel()
 	}
 }
 
@@ -260,6 +325,10 @@ func (p *Proxy) writeJSONLine(writer io.Writer, value interface{}) {
 }
 
 func (p *Proxy) handleMessage(msg JSONRPCMessage) (*JSONRPCMessage, error) {
+	return p.handleMessageContext(p.proxyContext(), msg)
+}
+
+func (p *Proxy) handleMessageContext(ctx context.Context, msg JSONRPCMessage) (*JSONRPCMessage, error) {
 	switch msg.Method {
 	case "initialize":
 		return p.handleInitialize(msg)
@@ -270,7 +339,7 @@ func (p *Proxy) handleMessage(msg JSONRPCMessage) (*JSONRPCMessage, error) {
 	case "tools/list":
 		return p.handleToolsList(msg)
 	case "tools/call":
-		return p.handleToolsCall(msg)
+		return p.handleToolsCallContext(ctx, msg)
 	case "resources/list":
 		return p.handleResourcesList(msg)
 	case "resources/templates/list":
@@ -295,6 +364,44 @@ func (p *Proxy) handleMessage(msg JSONRPCMessage) (*JSONRPCMessage, error) {
 			Error:   &JSONRPCError{Code: -32601, Message: "method not supported by AgentKeeper MCP Gateway"},
 		}, nil
 	}
+}
+
+func (p *Proxy) forwardBackendNotification(_ string, method string, params json.RawMessage) {
+	if method == "notifications/tools/list_changed" {
+		p.startToolRefresh()
+		return
+	}
+	p.outputMu.RLock()
+	writer := p.output
+	p.outputMu.RUnlock()
+	if writer == nil {
+		return
+	}
+	p.writeJSONLine(writer, JSONRPCMessage{JSONRPC: "2.0", Method: method, Params: params})
+}
+
+func (p *Proxy) handleBackendLifecycle(serverName, state string, lifecycleErr error) {
+	if state == "ready" {
+		p.setToolStatus(serverName, toolRefreshStatus{Status: "ready", UpdatedAt: time.Now().UTC().Format(time.RFC3339Nano)})
+		return
+	}
+	p.mu.Lock()
+	delete(p.toolCache, serverName)
+	delete(p.emptyToolLists, serverName)
+	for name := range p.poisonedTools {
+		if strings.HasPrefix(name, serverName+"__") {
+			delete(p.poisonedTools, name)
+		}
+	}
+	status := toolRefreshStatus{Status: state, UpdatedAt: time.Now().UTC().Format(time.RFC3339Nano)}
+	if lifecycleErr != nil {
+		status.LastError = lifecycleErr.Error()
+	}
+	p.toolStatus[serverName] = status
+	p.savePersistentToolCacheLocked()
+	p.mu.Unlock()
+	p.rebuildToolMapFromCache()
+	p.emitToolsListChanged()
 }
 
 func (p *Proxy) forwardNotification(method string, params json.RawMessage) {
@@ -495,6 +602,7 @@ func (p *Proxy) refreshTools() {
 			continue
 		}
 		changed := p.setCachedTools(result.name, result.tools)
+		p.manager.MarkHealthy(result.name)
 		p.setToolStatus(result.name, toolRefreshStatus{
 			Status:    "ready",
 			UpdatedAt: time.Now().UTC().Format(time.RFC3339Nano),
@@ -528,12 +636,15 @@ func (p *Proxy) logToolDescriptionDetections(serverName string, tools []interfac
 		results := p.config.DetectionEngine.EvaluateToolDescriptions([]detection.ToolDescription{desc})
 		for _, r := range results {
 			found[serverName+"__"+desc.Name] = r
-			if p.config.Logger != nil {
-				p.config.Logger.LogDetection(serverName, desc.Name, r)
-			}
 		}
 	}
+	newFindings := make(map[string]detection.Result)
 	p.mu.Lock()
+	for name, result := range found {
+		if existing, ok := p.poisonedTools[name]; !ok || existing != result {
+			newFindings[name] = result
+		}
+	}
 	for name := range p.poisonedTools {
 		if strings.HasPrefix(name, serverName+"__") {
 			delete(p.poisonedTools, name)
@@ -543,6 +654,11 @@ func (p *Proxy) logToolDescriptionDetections(serverName string, tools []interfac
 		p.poisonedTools[name] = result
 	}
 	p.mu.Unlock()
+	if p.config.Logger != nil {
+		for name, result := range newFindings {
+			p.config.Logger.LogDetection(serverName, strings.TrimPrefix(name, serverName+"__"), result)
+		}
+	}
 }
 
 func (p *Proxy) filterPoisonedTools(tools []interface{}) []interface{} {
@@ -719,7 +835,13 @@ func (p *Proxy) emitToolsListChanged() {
 	}
 	p.mu.Unlock()
 
-	p.writeJSONLine(os.Stdout, JSONRPCMessage{
+	p.outputMu.RLock()
+	writer := p.output
+	p.outputMu.RUnlock()
+	if writer == nil {
+		return
+	}
+	p.writeJSONLine(writer, JSONRPCMessage{
 		JSONRPC: "2.0",
 		Method:  "notifications/tools/list_changed",
 	})
@@ -867,10 +989,15 @@ func cloneTools(tools []interface{}) []interface{} {
 }
 
 func (p *Proxy) handleToolsCall(msg JSONRPCMessage) (*JSONRPCMessage, error) {
+	return p.handleToolsCallContext(p.proxyContext(), msg)
+}
+
+func (p *Proxy) handleToolsCallContext(ctx context.Context, msg JSONRPCMessage) (*JSONRPCMessage, error) {
 	// Parse the tool call params
 	var callParams struct {
 		Name      string                 `json:"name"`
 		Arguments map[string]interface{} `json:"arguments"`
+		Meta      json.RawMessage        `json:"_meta,omitempty"`
 	}
 	if err := json.Unmarshal(msg.Params, &callParams); err != nil {
 		return nil, fmt.Errorf("invalid tools/call params: %w", err)
@@ -1048,7 +1175,7 @@ func (p *Proxy) handleToolsCall(msg JSONRPCMessage) (*JSONRPCMessage, error) {
 		})
 		return nil, fmt.Errorf("server not available: %s", serverName)
 	}
-	if err := srv.Initialize(); err != nil {
+	if err := srv.InitializeContext(ctx); err != nil {
 		p.logToolOutcome(serverName, originalName, callParams.Arguments, finalResult, logging.ToolCallOutcome{
 			CallID: callID, AttemptID: attemptID, Mode: effectiveMode,
 			PolicyDecision: finalVerdict, EvaluationStatus: evaluationStatus,
@@ -1063,10 +1190,22 @@ func (p *Proxy) handleToolsCall(msg JSONRPCMessage) (*JSONRPCMessage, error) {
 		"name":      originalName,
 		"arguments": callParams.Arguments,
 	}
+	if len(callParams.Meta) > 0 && string(callParams.Meta) != "null" {
+		forwardParams["_meta"] = callParams.Meta
+	}
 	forwardJSON, _ := json.Marshal(forwardParams)
 
-	response, err := srv.Call("tools/call", forwardJSON)
+	response, err := srv.CallContext(ctx, "tools/call", forwardJSON)
 	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
+			p.logToolOutcome(serverName, originalName, callParams.Arguments, finalResult, logging.ToolCallOutcome{
+				CallID: callID, AttemptID: attemptID, Mode: effectiveMode,
+				PolicyDecision: finalVerdict, EvaluationStatus: evaluationStatus,
+				DecisionID: decisionID, RequiredDisposition: "forward", AppliedDisposition: "client_cancelled",
+				Dispatched: true, ResultReceived: false, ResultReturned: false, FailureReason: "client_cancelled",
+			})
+			return &JSONRPCMessage{JSONRPC: "2.0", ID: msg.ID, Error: &JSONRPCError{Code: -32800, Message: "Request cancelled"}}, nil
+		}
 		p.logToolOutcome(serverName, originalName, callParams.Arguments, finalResult, logging.ToolCallOutcome{
 			CallID: callID, AttemptID: attemptID, Mode: effectiveMode,
 			PolicyDecision: finalVerdict, EvaluationStatus: evaluationStatus,
@@ -1076,6 +1215,7 @@ func (p *Proxy) handleToolsCall(msg JSONRPCMessage) (*JSONRPCMessage, error) {
 		})
 		return nil, fmt.Errorf("calling %s/%s: %w", serverName, originalName, err)
 	}
+	p.manager.MarkHealthy(serverName)
 
 	// --- 6. Post-execution response scan ---
 	if p.config.DetectionEngine != nil {
@@ -1633,13 +1773,14 @@ func (p *Proxy) handleBuiltinToolCall(id *json.RawMessage, name string, args map
 		if p.enforceMode() {
 			mode = "enforce"
 		}
-		servers := p.manager.ServerNames()
+		servers := p.manager.ConfiguredNames()
+		sort.Strings(servers)
 		cachedBackendCount, cachedToolCount, degradedBackendCount := p.cachedToolSummary()
 		text = fmt.Sprintf("AgentKeeper MCP Gateway\nMode: %s\nServers: %d configured (%s)\nTools: %d cached from %d backend(s); %d backend(s) degraded; refreshing in background\nDetection: active",
 			mode, len(servers), strings.Join(servers, ", "), cachedToolCount, cachedBackendCount, degradedBackendCount)
 	case "agentkeeper_audit":
 		p.startToolRefresh()
-		servers := p.manager.ServerNames()
+		servers := p.manager.ConfiguredNames()
 		sort.Strings(servers)
 		text = fmt.Sprintf("MCP Security Audit\nServers: %d\n", len(servers))
 		for _, s := range servers {
@@ -1673,7 +1814,7 @@ func (p *Proxy) cachedToolSummary() (backendCount int, toolCount int, degradedBa
 	defer p.mu.Unlock()
 	names := []string(nil)
 	if p.manager != nil {
-		names = p.manager.ServerNames()
+		names = p.manager.ConfiguredNames()
 	}
 	if len(names) == 0 {
 		for name := range p.toolCache {

@@ -17,7 +17,7 @@ func TestManagedConfigureIsIdempotentAndRemovalPreservesLaterChanges(t *testing.
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
 	t.Setenv("AGENTKEEPER_CONFIG", filepath.Join(home, ".config", "agentkeeper-mcp-gateway", "config.json"))
 	t.Setenv(gatewayentry.EnvBinary, "/usr/bin/agentkeeper-mcp-gateway")
-	clientPath := filepath.Join(home, ".claude", "settings.json")
+	clientPath := filepath.Join(home, ".claude.json")
 	if err := os.MkdirAll(filepath.Dir(clientPath), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -124,7 +124,7 @@ func TestManagedConfigureRoutesClaudeUserServerAddedAfterEnrollmentAndRestoresIt
 		RuntimeSocket: "/run/agentkeeper/runtime.sock",
 	}
 	manifestPath := filepath.Join(home, ".config", "agentkeeper-mcp-gateway", "managed-routing.json")
-	settingsPath := filepath.Join(home, ".claude", "settings.json")
+	settingsPath := filepath.Join(home, ".claude.json")
 	if err := os.MkdirAll(filepath.Dir(settingsPath), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -143,7 +143,7 @@ func TestManagedConfigureRoutesClaudeUserServerAddedAfterEnrollmentAndRestoresIt
 		t.Fatalf("initial managed configure failed: report=%+v err=%v", first, err)
 	}
 
-	claudeJSON := filepath.Join(home, ".claude.json")
+	claudeJSON := settingsPath
 	if err := os.WriteFile(claudeJSON, []byte(`{
   "theme": "dark",
   "mcpServers": {
@@ -233,7 +233,7 @@ func TestRemoveWithoutManifestIsSafeOnlyWhenNoGatewayEntryExists(t *testing.T) {
 	if err != nil || report.Result != "not_configured" {
 		t.Fatalf("absent routing should remove idempotently: report=%+v err=%v", report, err)
 	}
-	clientPath := filepath.Join(home, ".claude", "settings.json")
+	clientPath := filepath.Join(home, ".claude.json")
 	if err := os.MkdirAll(filepath.Dir(clientPath), 0o700); err != nil {
 		t.Fatal(err)
 	}

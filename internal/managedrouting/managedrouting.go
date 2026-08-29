@@ -313,24 +313,10 @@ func remove(managed runtimebroker.ManagedConfig, manifestPath string, dryRun boo
 }
 
 func managedAdapters() ([]*ideconfig.Adapter, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return nil, fmt.Errorf("resolve home for managed MCP routing: %w", err)
-	}
-	adapters := append([]*ideconfig.Adapter(nil), ideconfig.Adapters()...)
-	adapters = append(adapters, &ideconfig.Adapter{
-		Name: "claude-code-user",
-		PathResolver: func() (string, error) {
-			return filepath.Join(home, ".claude.json"), nil
-		},
-	})
-	return adapters, nil
+	return append([]*ideconfig.Adapter(nil), ideconfig.Adapters()...), nil
 }
 
 func managedAdapterTarget(name string) string {
-	if name == "claude-code-user" {
-		return "claude-code"
-	}
 	return name
 }
 

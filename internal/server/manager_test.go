@@ -1,17 +1,200 @@
 package server
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
+
+func TestLegacySSETransportUsesEndpointStreamAndForwardsProgress(t *testing.T) {
+	responses := make(chan []byte, 16)
+	var streamReady sync.Once
+	ready := make(chan struct{})
+	httpSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/sse" {
+			w.Header().Set("Content-Type", "text/event-stream")
+			flusher, ok := w.(http.Flusher)
+			if !ok {
+				t.Fatal("test server does not support flushing")
+			}
+			_, _ = io.WriteString(w, "event: endpoint\ndata: /messages\n\n")
+			flusher.Flush()
+			streamReady.Do(func() { close(ready) })
+			for {
+				select {
+				case payload := <-responses:
+					_, _ = fmt.Fprintf(w, "event: message\ndata: %s\n\n", payload)
+					flusher.Flush()
+				case <-r.Context().Done():
+					return
+				}
+			}
+		}
+		if r.Method != http.MethodPost || r.URL.Path != "/messages" {
+			http.NotFound(w, r)
+			return
+		}
+		var request struct {
+			ID     *int64          `json:"id"`
+			Method string          `json:"method"`
+			Params json.RawMessage `json:"params"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Error(err)
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusAccepted)
+		if request.ID == nil {
+			return
+		}
+		var result interface{}
+		switch request.Method {
+		case "initialize":
+			result = map[string]interface{}{"protocolVersion": latestProtocolVersion, "capabilities": map[string]interface{}{"tools": map[string]interface{}{}}}
+		case "tools/list":
+			result = map[string]interface{}{"tools": []map[string]interface{}{{"name": "lookup"}}}
+		case "tools/call":
+			progress, _ := json.Marshal(map[string]interface{}{"jsonrpc": "2.0", "method": "notifications/progress", "params": map[string]interface{}{"progress": 1, "total": 1}})
+			responses <- progress
+			result = map[string]interface{}{"content": []map[string]interface{}{{"type": "text", "text": "ok"}}}
+		default:
+			result = map[string]interface{}{}
+		}
+		response, _ := json.Marshal(map[string]interface{}{"jsonrpc": "2.0", "id": *request.ID, "result": result})
+		responses <- response
+	}))
+	defer httpSrv.Close()
+
+	mgr := NewManager([]ServerConfig{{Name: "legacy", Transport: "sse", URL: httpSrv.URL + "/sse"}})
+	progress := make(chan json.RawMessage, 1)
+	mgr.SetNotificationHandler(func(_ string, method string, params json.RawMessage) {
+		if method == "notifications/progress" {
+			progress <- params
+		}
+	})
+	if err := mgr.StartAll(); err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.StopAll()
+	srv := mgr.Get("legacy")
+	tools, err := srv.ListTools()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tools) != 1 || tools[0].(map[string]interface{})["name"] != "lookup" {
+		t.Fatalf("unexpected legacy SSE tools: %+v", tools)
+	}
+	select {
+	case <-ready:
+	default:
+		t.Fatal("legacy SSE GET stream never connected")
+	}
+	if _, err := srv.Call("tools/call", json.RawMessage(`{"name":"lookup","arguments":{}}`)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case params := <-progress:
+		if !strings.Contains(string(params), `"progress":1`) {
+			t.Fatalf("unexpected progress params: %s", params)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("legacy SSE progress notification was not forwarded")
+	}
+}
+
+func TestStdioCancellationIsForwardedUpstream(t *testing.T) {
+	reader, writer := io.Pipe()
+	srv := &Server{
+		config:  ServerConfig{Name: "slow"},
+		stdin:   writer,
+		pending: make(map[int64]chan rpcResponse),
+	}
+	cancelled := make(chan map[string]interface{}, 1)
+	go func() {
+		decoder := json.NewDecoder(bufio.NewReader(reader))
+		var call map[string]interface{}
+		if err := decoder.Decode(&call); err != nil {
+			return
+		}
+		var notification map[string]interface{}
+		if err := decoder.Decode(&notification); err != nil {
+			return
+		}
+		cancelled <- notification
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	_, err := srv.CallContext(ctx, "tools/call", json.RawMessage(`{"name":"slow"}`))
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("call error = %v, want deadline exceeded", err)
+	}
+	select {
+	case notification := <-cancelled:
+		if notification["method"] != "notifications/cancelled" {
+			t.Fatalf("upstream notification = %+v", notification)
+		}
+		params := notification["params"].(map[string]interface{})
+		if params["requestId"] != float64(1) {
+			t.Fatalf("upstream cancellation did not reference request 1: %+v", notification)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("upstream cancellation notification was not written")
+	}
+}
+
+func TestCrashedStdioBackendIsRemovedAndRestarted(t *testing.T) {
+	dir := t.TempDir()
+	countPath := filepath.Join(dir, "starts")
+	scriptPath := filepath.Join(dir, "backend.sh")
+	script := "#!/bin/sh\nprintf x >> \"$1\"\nif [ \"$(wc -c < \"$1\")\" -eq 1 ]; then exit 17; fi\nwhile IFS= read -r line; do :; done\n"
+	if err := os.WriteFile(scriptPath, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	mgr := NewManager([]ServerConfig{{Name: "restartable", Command: scriptPath, Args: []string{countPath}}})
+	states := make(chan string, 8)
+	mgr.SetLifecycleHandler(func(_ string, state string, _ error) { states <- state })
+	if err := mgr.StartAll(); err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.StopAll()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		data, _ := os.ReadFile(countPath)
+		if len(data) >= 2 && mgr.Get("restartable") != nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	data, _ := os.ReadFile(countPath)
+	if len(data) < 2 || mgr.Get("restartable") == nil {
+		t.Fatalf("backend was not restarted: starts=%d active=%v", len(data), mgr.Get("restartable") != nil)
+	}
+	seenDegraded, seenRestarting := false, false
+	for len(states) > 0 {
+		switch <-states {
+		case "degraded":
+			seenDegraded = true
+		case "restarting":
+			seenRestarting = true
+		}
+	}
+	if !seenDegraded || !seenRestarting {
+		t.Fatalf("lifecycle did not report removal and restart: degraded=%v restarting=%v", seenDegraded, seenRestarting)
+	}
+}
 
 func TestStartServerPreservesExecutablePathContainingSpaces(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "MCP Server With Spaces")

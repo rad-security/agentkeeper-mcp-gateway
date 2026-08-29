@@ -137,13 +137,7 @@ By default every detected IDE is configured. Use --ide to target just one.
 		}
 
 		if configureIDETargetIncludes("claude-code") {
-			plan, err := discovery.MigrateClaudeJSONUser(configureIDEDryRun)
-			if err != nil {
-				fmt.Fprintf(out, "  %-16s error applying: %v\n", "claude-code:user", err)
-			} else {
-				printMigrationPlan(out, plan)
-			}
-			plan, err = discovery.MigrateClaudeJSONProjects(configureIDEDryRun)
+			plan, err := discovery.MigrateClaudeJSONProjects(configureIDEDryRun)
 			if err != nil {
 				fmt.Fprintf(out, "  %-16s error applying: %v\n", "claude-code:projects", err)
 			} else {

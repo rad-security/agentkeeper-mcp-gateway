@@ -67,16 +67,17 @@ type Adapter struct {
 // Plan describes what Apply would do for a single IDE, in one struct so the
 // command layer can render a summary and the caller can run --dry-run safely.
 type Plan struct {
-	IDE           string
-	ConfigPath    string
-	Exists        bool          // did the file exist when Plan was built
-	HasGateway    bool          // an exact AgentKeeper gateway entry is present
-	AlreadyWired  bool          // gateway is the sole MCP entry already
-	Migrated      []NamedServer // servers we'd move into the gateway's own config
-	NativeKept    []NamedServer // remote OAuth/native-auth servers kept in the IDE config
-	BackupPath    string        // set by Apply when it writes a backup
-	SourceHash    string        // hash of the exact client config read during preview
-	RouteRevision string        // deterministic route identity bound to client + source
+	IDE                string
+	ConfigPath         string
+	Exists             bool          // did the file exist when Plan was built
+	HasGateway         bool          // an exact AgentKeeper gateway entry is present
+	AlreadyWired       bool          // gateway is the sole MCP entry already
+	Migrated           []NamedServer // servers we'd move into the gateway's own config
+	NativeKept         []NamedServer // remote OAuth/native-auth servers kept in the IDE config
+	BackupPath         string        // set by Apply when it writes a backup
+	ExpectedSourceHash string        // exact pre-write bytes used for compare-and-swap
+	SourceHash         string        // canonical hash of the final durable client config
+	RouteRevision      string        // deterministic route identity bound to final config + artifact
 }
 
 // Adapters returns the adapters applicable on the current OS.
@@ -96,7 +97,7 @@ func claudeCodeAdapter() *Adapter {
 			if err != nil {
 				return "", err
 			}
-			return filepath.Join(home, ".claude", "settings.json"), nil
+			return filepath.Join(home, ".claude.json"), nil
 		},
 	}
 }
@@ -185,13 +186,16 @@ func (a *Adapter) Plan() (Plan, error) {
 	switch {
 	case err == nil:
 		p.Exists = true
+		p.ExpectedSourceHash = gatewayentry.ContentHash(data)
 	case errors.Is(err, os.ErrNotExist):
-		p.SourceHash, p.RouteRevision = routeIdentity(a.Name, []byte("absent"))
+		raw := map[string]json.RawMessage{}
+		if err := setDesiredRouteIdentity(&p, raw); err != nil {
+			return Plan{}, err
+		}
 		return p, nil
 	default:
 		return p, fmt.Errorf("reading %s: %w", path, err)
 	}
-	p.SourceHash, p.RouteRevision = routeIdentity(a.Name, data)
 
 	// Preserve unknown top-level keys via RawMessage. We only decode the
 	// `mcpServers` key into a typed map.
@@ -207,12 +211,19 @@ func (a *Adapter) Plan() (Plan, error) {
 		}
 	}
 
-	hasCurrentGateway := false
-	if entry, ok := servers[GatewayServerName]; ok && isGatewayCommandEntry(entry) {
-		p.HasGateway = true
-		if isGatewayEntry(entry, a.Name) {
-			hasCurrentGateway = true
+	gatewayEntries := 0
+	var configuredGateway ServerEntry
+	for _, entry := range servers {
+		if isGatewayCommandEntry(entry) {
+			gatewayEntries++
+			configuredGateway = entry
 		}
+	}
+	if gatewayEntries > 1 {
+		return p, fmt.Errorf("%s contains %d Gateway routes; refusing ambiguous migration", path, gatewayEntries)
+	}
+	if gatewayEntries == 1 {
+		p.HasGateway = true
 	}
 
 	// Collect everything except any existing gateway entry — that one gets
@@ -220,7 +231,7 @@ func (a *Adapter) Plan() (Plan, error) {
 	// HTTP entries without credential headers are kept native so the MCP client
 	// can own OAuth and refresh tokens.
 	for name, entry := range servers {
-		if name == GatewayServerName {
+		if name == GatewayServerName || isGatewayCommandEntry(entry) {
 			continue
 		}
 		if nativeauth.RequiresNativeClientAuth(entry.Type, entry.URL, entry.Headers) {
@@ -231,6 +242,12 @@ func (a *Adapter) Plan() (Plan, error) {
 	}
 
 	p.NativeKept = mergeNamedServers(p.NativeKept, a.recoverNativeClientAuthServers(servers))
+	if err := setDesiredRouteIdentity(&p, raw); err != nil {
+		return Plan{}, err
+	}
+	hasCurrentGateway := gatewayEntries == 1 && isGatewayEntry(configuredGateway, a.Name) &&
+		configuredGateway.Env[gatewayentry.EnvConfigSourceHash] == p.SourceHash &&
+		configuredGateway.Env[gatewayentry.EnvRouteRevision] == p.RouteRevision
 	if hasCurrentGateway && len(p.Migrated) == 0 && len(p.NativeKept) == len(nonGatewayServers(servers)) {
 		p.AlreadyWired = true
 	}
@@ -274,9 +291,9 @@ func (a *Adapter) apply(p *Plan, pruneNativeGatewayEntries bool) error {
 		if err != nil {
 			return fmt.Errorf("re-reading %s for apply: %w", p.ConfigPath, err)
 		}
-		currentSourceHash, _ := routeIdentity(p.IDE, data)
-		if p.SourceHash == "" || currentSourceHash != p.SourceHash {
-			return fmt.Errorf("configuration changed after preview for %s; refusing to write (expected %s, observed %s)", p.ConfigPath, p.SourceHash, currentSourceHash)
+		currentSourceHash := gatewayentry.ContentHash(data)
+		if p.ExpectedSourceHash == "" || currentSourceHash != p.ExpectedSourceHash {
+			return fmt.Errorf("configuration changed after preview for %s; refusing to write (expected %s, observed %s)", p.ConfigPath, p.ExpectedSourceHash, currentSourceHash)
 		}
 		if err := json.Unmarshal(data, &raw); err != nil {
 			return fmt.Errorf("parsing %s: %w", p.ConfigPath, err)
@@ -295,20 +312,10 @@ func (a *Adapter) apply(p *Plan, pruneNativeGatewayEntries bool) error {
 		raw = map[string]json.RawMessage{}
 	}
 
-	newServers := map[string]ServerEntry{GatewayServerName: gatewayEntry(*p)}
-	for _, kept := range p.NativeKept {
-		if kept.Name == "" || kept.Name == GatewayServerName {
-			continue
-		}
-		newServers[kept.Name] = kept.Entry
+	if err := setDesiredRouteIdentity(p, raw); err != nil {
+		return err
 	}
-	encoded, err := json.Marshal(newServers)
-	if err != nil {
-		return fmt.Errorf("encoding mcpServers: %w", err)
-	}
-	raw["mcpServers"] = encoded
-
-	out, err := json.MarshalIndent(raw, "", "  ")
+	out, err := desiredConfigBytes(*p, raw)
 	if err != nil {
 		return fmt.Errorf("encoding final config: %w", err)
 	}
@@ -322,10 +329,54 @@ func (a *Adapter) apply(p *Plan, pruneNativeGatewayEntries bool) error {
 	if err := writeAtomic(p.ConfigPath, append(out, '\n'), mode); err != nil {
 		return fmt.Errorf("writing %s: %w", p.ConfigPath, err)
 	}
+	written, err := os.ReadFile(p.ConfigPath)
+	if err != nil {
+		return fmt.Errorf("verifying %s: %w", p.ConfigPath, err)
+	}
+	writtenHash, writtenRevision := routeIdentity(p.IDE, written)
+	if writtenHash != p.SourceHash || writtenRevision != p.RouteRevision {
+		return fmt.Errorf("route attestation mismatch after writing %s", p.ConfigPath)
+	}
 	if pruneNativeGatewayEntries {
 		pruneNativeKeptFromGatewayConfig(p.NativeKept)
 	}
 	return nil
+}
+
+func setDesiredRouteIdentity(plan *Plan, raw map[string]json.RawMessage) error {
+	plan.SourceHash = ""
+	plan.RouteRevision = ""
+	preview, err := desiredConfigBytes(*plan, raw)
+	if err != nil {
+		return err
+	}
+	plan.SourceHash, plan.RouteRevision = routeIdentity(plan.IDE, preview)
+	return nil
+}
+
+func desiredConfigBytes(plan Plan, raw map[string]json.RawMessage) ([]byte, error) {
+	copyRaw := make(map[string]json.RawMessage, len(raw)+1)
+	for key, value := range raw {
+		copyRaw[key] = value
+	}
+	newServers := map[string]ServerEntry{GatewayServerName: gatewayEntry(plan)}
+	for _, kept := range plan.NativeKept {
+		if kept.Name == "" || kept.Name == GatewayServerName {
+			continue
+		}
+		newServers[kept.Name] = kept.Entry
+	}
+	encoded, err := json.Marshal(newServers)
+	if err != nil {
+		return nil, fmt.Errorf("encoding mcpServers: %w", err)
+	}
+	copyRaw["mcpServers"] = encoded
+	clientDocument, err := json.MarshalIndent(copyRaw, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	attested, _, _, err := gatewayentry.AttestRoutes(plan.IDE, clientDocument)
+	return attested, err
 }
 
 func routeIdentity(clientName string, source []byte) (string, string) {
@@ -417,7 +468,7 @@ func mergeNamedServers(existing, add []NamedServer) []NamedServer {
 func nonGatewayServers(servers map[string]ServerEntry) []NamedServer {
 	out := make([]NamedServer, 0, len(servers))
 	for name, entry := range servers {
-		if name == GatewayServerName {
+		if name == GatewayServerName || isGatewayCommandEntry(entry) {
 			continue
 		}
 		out = append(out, NamedServer{Name: name, Entry: entry})

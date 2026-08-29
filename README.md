@@ -172,7 +172,7 @@ agentkeeper-mcp-gateway configure-ide              # apply
 
 For Cowork sources created after setup, run `agentkeeper-mcp-gateway cowork guard` from a login item/service, or rerun `configure-ide`. Native Cowork cloud connectors that are not represented as local MCP sources require the AgentKeeper Cowork ZIP/guardrail path; the standalone gateway can only govern MCP traffic it can route.
 
-Supports **Claude Code** (`~/.claude/settings.json`), **Claude Desktop** (macOS + Linux), and **Cursor** (`~/.cursor/mcp.json`). For each detected IDE it:
+Supports **Claude Code** (`~/.claude.json`), **Claude Desktop** (macOS + Linux), and **Cursor** (`~/.cursor/mcp.json`). Claude Code's `~/.claude/settings.json` remains a preferences/hooks file and is never treated as the user MCP route. For each detected IDE it:
 
 1. Backs up the existing config under the gateway backup directory, normally `~/.config/agentkeeper-mcp-gateway/backups/`
 2. Migrates routable local MCP servers and explicit-header HTTP servers into the gateway's own config (environment variables and all)

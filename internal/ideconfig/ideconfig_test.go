@@ -157,21 +157,14 @@ func TestPlan_AlreadyWired(t *testing.T) {
 	// else in mcpServers must be reported as AlreadyWired=true with no migration.
 	tmp := t.TempDir()
 	path := filepath.Join(tmp, "cfg.json")
-	writeJSON(t, path, `{
-		"mcpServers": {
-			"agentkeeper-mcp-gateway": {
-				"command": "agentkeeper-mcp-gateway",
-				"args": ["server"],
-				"env": {
-					"AGENTKEEPER_MCP_CLIENT": "test-ide",
-					"AGENTKEEPER_MCP_CONFIG_SOURCE_HASH": "sha256:source",
-					"AGENTKEEPER_MCP_ROUTE_REVISION": "route:revision"
-				}
-			}
-		}
-	}`)
-
 	a := mkAdapter(t, path)
+	initial, err := a.Plan()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Apply(&initial); err != nil {
+		t.Fatal(err)
+	}
 	p, err := a.Plan()
 	if err != nil {
 		t.Fatal(err)
@@ -190,21 +183,15 @@ func TestPlan_AlreadyWired_FullPathCommand(t *testing.T) {
 	// match, not exact string match.
 	tmp := t.TempDir()
 	path := filepath.Join(tmp, "cfg.json")
-	writeJSON(t, path, `{
-		"mcpServers": {
-			"agentkeeper-mcp-gateway": {
-				"command": "/Users/someone/go/bin/agentkeeper-mcp-gateway",
-				"args": ["server"],
-				"env": {
-					"AGENTKEEPER_MCP_CLIENT": "test-ide",
-					"AGENTKEEPER_MCP_CONFIG_SOURCE_HASH": "sha256:source",
-					"AGENTKEEPER_MCP_ROUTE_REVISION": "route:revision"
-				}
-			}
-		}
-	}`)
-
+	t.Setenv(gatewayentry.EnvBinary, "/Users/someone/go/bin/agentkeeper-mcp-gateway")
 	a := mkAdapter(t, path)
+	initial, err := a.Plan()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Apply(&initial); err != nil {
+		t.Fatal(err)
+	}
 	p, err := a.Plan()
 	if err != nil {
 		t.Fatal(err)
@@ -251,6 +238,28 @@ func TestPlan_LegacyGatewayWithoutRouteIdentityNeedsRepair(t *testing.T) {
 	entry := servers[GatewayServerName]
 	if entry.Env[gatewayentry.EnvClientName] != "test-ide" || entry.Env[gatewayentry.EnvRouteRevision] == "" {
 		t.Fatalf("repair did not add route identity: %+v", entry)
+	}
+}
+
+func TestPlan_DoesNotImportGatewayUnderDifferentName(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cfg.json")
+	writeJSON(t, path, `{"mcpServers":{"customer-alias":{"command":"agentkeeper-mcp-gateway","args":["server"]},"safe":{"command":"node","args":["safe.js"]}}}`)
+	a := mkAdapter(t, path)
+	p, err := a.Plan()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !p.HasGateway || len(p.Migrated) != 1 || p.Migrated[0].Name != "safe" {
+		t.Fatalf("Gateway alias was imported as an upstream server: %+v", p)
+	}
+}
+
+func TestPlan_RefusesMultipleGatewayRoutes(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cfg.json")
+	writeJSON(t, path, `{"mcpServers":{"one":{"command":"agentkeeper-mcp-gateway","args":["server"]},"two":{"command":"/opt/bin/agentkeeper-mcp-gateway","args":["server"]}}}`)
+	a := mkAdapter(t, path)
+	if _, err := a.Plan(); err == nil || !strings.Contains(err.Error(), "refusing ambiguous migration") {
+		t.Fatalf("multiple Gateway routes were not refused: %v", err)
 	}
 }
 
@@ -421,27 +430,19 @@ func TestApply_BacksUpThenWrites(t *testing.T) {
 func TestApply_AlreadyWired_IsNoop(t *testing.T) {
 	tmp := t.TempDir()
 	path := filepath.Join(tmp, "cfg.json")
-	original := `{
-  "mcpServers": {
-    "agentkeeper-mcp-gateway": {
-      "command": "agentkeeper-mcp-gateway",
-      "args": ["server"],
-      "env": {
-        "AGENTKEEPER_MCP_CLIENT": "test-ide",
-        "AGENTKEEPER_MCP_CONFIG_SOURCE_HASH": "sha256:source",
-        "AGENTKEEPER_MCP_ROUTE_REVISION": "route:revision"
-      }
-    }
-  }
-}`
-	writeJSON(t, path, original)
-	before, _ := os.Stat(path)
-
 	a := mkAdapter(t, path)
+	initial, err := a.Plan()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Apply(&initial); err != nil {
+		t.Fatal(err)
+	}
 	p, err := a.Plan()
 	if err != nil {
 		t.Fatal(err)
 	}
+	before, _ := os.Stat(path)
 	if err := a.Apply(&p); err != nil {
 		t.Fatal(err)
 	}

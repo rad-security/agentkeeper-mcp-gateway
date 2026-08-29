@@ -279,6 +279,10 @@ func TestMigrateMCPFileWritesSourceBoundObserveRoute(t *testing.T) {
 		gw.Env[gatewayentry.EnvRouteRevision] != plan.RouteRevision {
 		t.Fatalf("route identity was not written exactly: plan=%+v entry=%+v", plan, gw)
 	}
+	finalHash, finalRevision := gatewayentry.RouteIdentity(ClientClaudeCode, data)
+	if finalHash != plan.SourceHash || finalRevision != plan.RouteRevision {
+		t.Fatalf("route identity attests pre-write rather than final bytes: final=%s/%s plan=%s/%s", finalHash, finalRevision, plan.SourceHash, plan.RouteRevision)
+	}
 
 	cfg, err := config.Load()
 	if err != nil {
