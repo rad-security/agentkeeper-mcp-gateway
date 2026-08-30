@@ -12,11 +12,147 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/rad-security/agentkeeper-mcp-gateway/internal/detection"
+	"github.com/rad-security/agentkeeper-mcp-gateway/internal/logging"
 )
 
 type capturedAPIRequest struct {
 	path string
 	body map[string]any
+}
+
+func TestE2E32_EnforceCanRequireDurableEvidenceBeforeDispatch(t *testing.T) {
+	home := t.TempDir()
+	marker := filepath.Join(home, "side-effect.txt")
+	logPath := filepath.Join(home, ".config", "agentkeeper-mcp-gateway", "events.jsonl")
+	seed, err := logging.NewLogger(logPath, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seed.ConfigureQueueLimits(1, 1024*1024)
+	seed.LogToolCall("seed", "fill", nil, detection.Result{})
+	if err := seed.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	configPath := writeGatewayConfig(t, home, `{
+		"mode": "enforce",
+		"require_durable_events": true,
+		"event_queue_max_events": 1,
+		"event_queue_max_bytes": 1048576,
+		"log_path": "`+filepath.ToSlash(logPath)+`",
+		"servers": [{
+			"name": "payments",
+			"command": "/bin/sh",
+			"args": ["-c", "while IFS= read -r line; do case \"$line\" in *\\\"method\\\":\\\"initialize\\\"*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":\"payments\",\"version\":\"test\"}}}' ;; *\\\"method\\\":\\\"tools/list\\\"*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"transfer\",\"description\":\"fixture\",\"inputSchema\":{\"type\":\"object\"}}]}}' ;; *\\\"method\\\":\\\"tools/call\\\"*) : > `+filepath.ToSlash(marker)+`; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"should-not-run\"}]}}' ;; esac; done"]
+		}]
+	}`)
+
+	cmd := exec.Command(binary, "--config", configPath, "server")
+	cmd.Env = []string{"HOME=" + home, "PATH=" + os.Getenv("PATH"), "AGENTKEEPER_COWORK_GUARD=0"}
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = stdin.Close()
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		_, _ = cmd.Process.Wait()
+	}()
+
+	reader := bufio.NewReader(stdout)
+	writeRPC(t, stdin, `{"jsonrpc":"2.0","id":90,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e","version":"test"}}}`)
+	_ = readRPCLine(t, reader)
+	writeRPC(t, stdin, `{"jsonrpc":"2.0","id":91,"method":"tools/list","params":{}}`)
+	listResp := readRPCLine(t, reader)
+	if strings.Contains(listResp, "payments__transfer") {
+		t.Fatalf("full evidence queue exposed upstream tool in Enforce: %s", listResp)
+	}
+	writeRPC(t, stdin, `{"jsonrpc":"2.0","id":92,"method":"tools/call","params":{"name":"payments__transfer","arguments":{}}}`)
+	callResp := readRPCLine(t, reader)
+	if !strings.Contains(callResp, "evidence queue is unavailable or full") {
+		t.Fatalf("missing durable-evidence block response: %s stderr=%s", callResp, stderr.String())
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("backend side effect occurred despite evidence backpressure: %v", err)
+	}
+}
+
+func TestE2E32b_OfflineStartupDoesNotClaimDashboardConnection(t *testing.T) {
+	home := t.TempDir()
+	configPath := writeGatewayConfig(t, home, `{
+		"mode": "audit",
+		"api_key": "ak_live_offline_fixture",
+		"api_url": "http://127.0.0.1:1",
+		"servers": []
+	}`)
+	cmd := exec.Command(binary, "--config", configPath, "server")
+	cmd.Env = []string{"HOME=" + home, "PATH=" + os.Getenv("PATH"), "AGENTKEEPER_COWORK_GUARD=0"}
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stderrPipe, err := cmd.StderrPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = stdin.Close()
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		_, _ = cmd.Process.Wait()
+	}()
+
+	lines := make(chan string, 32)
+	go func() {
+		scanner := bufio.NewScanner(stderrPipe)
+		for scanner.Scan() {
+			lines <- scanner.Text()
+		}
+		close(lines)
+	}()
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	var captured []string
+	for {
+		select {
+		case line, ok := <-lines:
+			if !ok {
+				goto checked
+			}
+			captured = append(captured, line)
+			if strings.Contains(line, "Dashboard unavailable") {
+				goto checked
+			}
+		case <-deadline.C:
+			goto checked
+		}
+	}
+
+checked:
+	output := strings.Join(captured, "\n")
+	if !strings.Contains(output, "Dashboard unavailable; continuing with local or last-known-good policy") {
+		t.Fatalf("missing truthful offline startup diagnostic: %s", output)
+	}
+	if strings.Contains(output, "Connected to dashboard") {
+		t.Fatalf("offline startup falsely claimed a dashboard connection: %s", output)
+	}
 }
 
 func TestE2E33_ServerProxiesConfiguredMCPToolCall(t *testing.T) {

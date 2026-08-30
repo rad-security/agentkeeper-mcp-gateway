@@ -232,6 +232,29 @@ func TestLoadWithPath_MissingFileUsesDefaults(t *testing.T) {
 	if cfg.Mode != "audit" {
 		t.Errorf("expected default mode audit, got %q", cfg.Mode)
 	}
+	if cfg.EventQueueMaxEvents != 100000 || cfg.EventQueueMaxBytes != 256*1024*1024 {
+		t.Fatalf("unexpected default event queue limits: events=%d bytes=%d", cfg.EventQueueMaxEvents, cfg.EventQueueMaxBytes)
+	}
+}
+
+func TestLoadWithPathPreservesManagedEvidenceSettings(t *testing.T) {
+	isolateEnv(t)
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{
+  "mode": "enforce",
+  "require_durable_events": true,
+  "event_queue_max_events": 25000,
+  "event_queue_max_bytes": 67108864
+}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadWithPath(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.RequireDurableEvents || cfg.EventQueueMaxEvents != 25000 || cfg.EventQueueMaxBytes != 67108864 {
+		t.Fatalf("managed evidence settings were not preserved: %+v", cfg)
+	}
 }
 
 func TestLoadWithSource_LabelsFieldOrigins(t *testing.T) {

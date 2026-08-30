@@ -104,11 +104,13 @@ type Client struct {
 	configSourceHash string
 	routeRevision    string
 	policyCachePath  string
+	policyStatePath  string
 	policyCacheTTL   time.Duration
 	policySyncedAt   time.Time
 	policyExpiresAt  time.Time
 	policyValid      bool
 	policyCacheBad   bool
+	policyStateValid bool
 	policyCacheMu    sync.Mutex
 	now              func() time.Time
 }
@@ -234,6 +236,10 @@ func (c *Client) SetPolicyCache(path string) error {
 		return fmt.Errorf("policy cache requires the durable receipt signer")
 	}
 	c.policyCachePath = c.scopedPolicyCachePath(c.policyCachePath)
+	c.policyStatePath = c.policyCachePath + ".state"
+	if err := c.loadPolicyState(); err != nil {
+		return err
+	}
 	return c.loadPolicyCache()
 }
 
@@ -257,9 +263,9 @@ func (c *Client) RecordReceipt(input receipt.Input) {
 }
 
 // Start registers the gateway and begins background flush/heartbeat loops.
-func (c *Client) Start() {
+func (c *Client) Start() bool {
 	// Register immediately on startup
-	c.sync()
+	connected := c.sync()
 
 	go func() {
 		flushTicker := time.NewTicker(5 * time.Second)
@@ -280,6 +286,7 @@ func (c *Client) Start() {
 			}
 		}
 	}()
+	return connected
 }
 
 // Stop signals the flush loop to stop.
@@ -297,12 +304,13 @@ func (c *Client) Policy() SyncPolicy {
 	policy := cloneSyncPolicy(c.cachedPolicy)
 	valid := c.policyValid
 	cacheBad := c.policyCacheBad
+	stateValid := c.policyStateValid
 	expiresAt := c.policyExpiresAt
 	c.policyMu.RUnlock()
 
 	expired := valid && !expiresAt.IsZero() && !c.now().Before(expiresAt)
 	mode, _ := c.currentMode()
-	if strings.EqualFold(mode, "enforce") && (cacheBad || expired) {
+	if strings.EqualFold(mode, "enforce") && (cacheBad || expired || stateValid && !valid) {
 		return failClosedPolicy()
 	}
 	return policy
@@ -364,7 +372,7 @@ func shouldUseLegacyEvaluate(err error, status int) bool {
 }
 
 // sync registers or heartbeats the gateway via /api/v1/mcp/sync.
-func (c *Client) sync() {
+func (c *Client) sync() bool {
 	if c.receiptStore != nil {
 		c.syncV2()
 	}
@@ -383,7 +391,7 @@ func (c *Client) sync() {
 
 	data, err := json.Marshal(payload)
 	if err != nil {
-		return
+		return false
 	}
 
 	var result struct {
@@ -395,7 +403,7 @@ func (c *Client) sync() {
 	status, err := c.postJSON("sync", "/api/v1/mcp/sync", data, &result)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[agentkeeper] sync failed: %v\n", err)
-		return
+		return false
 	}
 	if err == nil {
 		if result.GatewayID != "" {
@@ -416,7 +424,9 @@ func (c *Client) sync() {
 	}
 	if status != http.StatusOK {
 		fmt.Fprintf(os.Stderr, "[agentkeeper] sync error (HTTP %d): %s\n", status, result.Error)
+		return false
 	}
+	return result.OK
 }
 
 func (c *Client) syncV2() bool {
@@ -463,6 +473,9 @@ func (c *Client) syncV2() bool {
 	}
 	if result.RouteAssignment != nil {
 		c.applyAssignedMode(result.RouteAssignment.DesiredMode, result.RouteAssignment.DesiredRevision)
+		if err := c.persistPolicyState(); err != nil && c.logger != nil {
+			c.logger.Warn("could not persist assigned Gateway state: %v", err)
+		}
 		if err := c.persistPolicyCache(); err != nil && c.logger != nil {
 			c.logger.Warn("could not persist assigned Gateway mode: %v", err)
 		}

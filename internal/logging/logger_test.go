@@ -263,3 +263,56 @@ func TestDurableEventQueueRetainsRetryablePartialAcknowledgment(t *testing.T) {
 		t.Fatalf("duplicate-acknowledged event remained: %+v err=%v", remaining, err)
 	}
 }
+
+func TestDurableEventQueueEnforcesCapacityAndRecoversAfterAck(t *testing.T) {
+	logger, err := NewLogger(filepath.Join(t.TempDir(), "events.jsonl"), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer logger.Close()
+	logger.ConfigureQueueLimits(2, 1024*1024)
+	logger.LogToolCall("payments", "first", nil, detection.Result{})
+	logger.LogToolCall("payments", "second", nil, detection.Result{})
+
+	status := logger.QueueStatus()
+	if status.State != "full" || status.Accepting || status.PendingEvents != 2 {
+		t.Fatalf("queue status at capacity = %+v", status)
+	}
+	if !strings.Contains(status.LastError, "capacity exceeded") && status.LastError != "" {
+		t.Fatalf("unexpected capacity error: %q", status.LastError)
+	}
+
+	pending, durable, err := logger.PendingEvents(100)
+	if err != nil || !durable || len(pending) != 2 {
+		t.Fatalf("pending at capacity=%+v durable=%v err=%v", pending, durable, err)
+	}
+	if err := logger.ResolveEvents(map[string]string{pending[0].EventID: "accepted"}); err != nil {
+		t.Fatal(err)
+	}
+	status = logger.QueueStatus()
+	if status.State != "healthy" || !status.Accepting || status.PendingEvents != 1 {
+		t.Fatalf("queue did not recover after ack: %+v", status)
+	}
+	logger.LogToolCall("payments", "replacement", nil, detection.Result{})
+	status = logger.QueueStatus()
+	if status.PendingEvents != 2 || status.Accepting {
+		t.Fatalf("replacement did not refill bounded queue: %+v", status)
+	}
+}
+
+func TestDurableEventQueueRejectsEventThatExceedsByteLimit(t *testing.T) {
+	logger, err := NewLogger(filepath.Join(t.TempDir(), "events.jsonl"), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer logger.Close()
+	logger.ConfigureQueueLimits(100, 64)
+	logger.LogToolCall("payments", "oversized", map[string]interface{}{"value": strings.Repeat("x", 256)}, detection.Result{})
+	status := logger.QueueStatus()
+	if status.PendingEvents != 0 || status.Accepting || status.State != "degraded" {
+		t.Fatalf("oversized event queue status = %+v", status)
+	}
+	if !strings.Contains(status.LastError, "capacity exceeded") {
+		t.Fatalf("missing byte-capacity diagnostic: %+v", status)
+	}
+}

@@ -11,6 +11,7 @@ import (
 
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/config"
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/discovery"
+	"github.com/rad-security/agentkeeper-mcp-gateway/internal/logging"
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/runtimebroker"
 	"github.com/spf13/cobra"
 )
@@ -76,18 +77,20 @@ var listCmd = &cobra.Command{
 }
 
 type listHealthReport struct {
-	ConfigPath         string                       `json:"config_path"`
-	DashboardConnected bool                         `json:"dashboard_connected"`
-	ConnectionMode     string                       `json:"connection_mode"`
-	APIURL             string                       `json:"api_url,omitempty"`
-	RoutedServers      []config.ServerEntry         `json:"routed_servers"`
-	BackendToolHealth  []backendToolHealth          `json:"backend_tool_health"`
-	DiscoveredServers  []discovery.DiscoveredServer `json:"discovered_servers"`
-	ConfigPathsChecked []string                     `json:"config_paths_checked"`
-	SeenOnlyCount      int                          `json:"seen_only_count"`
-	ToolManifestStatus string                       `json:"tool_manifest_status"`
-	NextSteps          []string                     `json:"next_steps"`
-	DiscoveryError     string                       `json:"discovery_error,omitempty"`
+	ConfigPath          string                       `json:"config_path"`
+	DashboardConnected  bool                         `json:"dashboard_connected"`
+	DashboardConfigured bool                         `json:"dashboard_configured"`
+	ConnectionMode      string                       `json:"connection_mode"`
+	APIURL              string                       `json:"api_url,omitempty"`
+	RoutedServers       []config.ServerEntry         `json:"routed_servers"`
+	BackendToolHealth   []backendToolHealth          `json:"backend_tool_health"`
+	DiscoveredServers   []discovery.DiscoveredServer `json:"discovered_servers"`
+	ConfigPathsChecked  []string                     `json:"config_paths_checked"`
+	SeenOnlyCount       int                          `json:"seen_only_count"`
+	ToolManifestStatus  string                       `json:"tool_manifest_status"`
+	EventQueue          logging.EventQueueStatus     `json:"event_queue"`
+	NextSteps           []string                     `json:"next_steps"`
+	DiscoveryError      string                       `json:"discovery_error,omitempty"`
 }
 
 type backendToolHealth struct {
@@ -106,7 +109,11 @@ func buildListHealthReport(cfg config.Config) listHealthReport {
 	discovered := res.Servers
 	seenOnly := countSeenOnly(discovered, cfg.Servers)
 	backendHealth := probeBackendToolHealth(cfg)
+	eventQueue := logging.InspectEventQueue(defaultEventLogPath(cfg), cfg.EventQueueMaxEvents, cfg.EventQueueMaxBytes)
 	nextSteps := healthNextSteps(cfg, discovered, seenOnly, backendHealth)
+	if cfg.RequireDurableEvents && eventQueue.State != "not_initialized" && !eventQueue.Accepting {
+		nextSteps = append(nextSteps, "Repair or drain the durable event queue before Enforce traffic resumes.")
+	}
 	connectionMode := "local_only"
 	if config.HasUsableAPIKey(cfg.APIKey) {
 		connectionMode = "api_key"
@@ -114,17 +121,18 @@ func buildListHealthReport(cfg config.Config) listHealthReport {
 		connectionMode = "managed_runtime_broker"
 	}
 	report := listHealthReport{
-		ConfigPath:         config.CurrentConfigPath(),
-		DashboardConnected: config.HasUsableAPIKey(cfg.APIKey) || hasManagedRuntimeBroker(cfg),
-		ConnectionMode:     connectionMode,
-		APIURL:             cfg.APIURL,
-		RoutedServers:      cfg.Servers,
-		BackendToolHealth:  backendHealth,
-		DiscoveredServers:  discovered,
-		ConfigPathsChecked: configPathsChecked(discovered),
-		SeenOnlyCount:      seenOnly,
-		ToolManifestStatus: summarizeToolManifestStatus(cfg.Servers, backendHealth),
-		NextSteps:          nextSteps,
+		ConfigPath:          config.CurrentConfigPath(),
+		DashboardConfigured: config.HasUsableAPIKey(cfg.APIKey) || hasManagedRuntimeBroker(cfg),
+		ConnectionMode:      connectionMode,
+		APIURL:              cfg.APIURL,
+		RoutedServers:       cfg.Servers,
+		BackendToolHealth:   backendHealth,
+		DiscoveredServers:   discovered,
+		ConfigPathsChecked:  configPathsChecked(discovered),
+		SeenOnlyCount:       seenOnly,
+		ToolManifestStatus:  summarizeToolManifestStatus(cfg.Servers, backendHealth),
+		EventQueue:          eventQueue,
+		NextSteps:           nextSteps,
 	}
 	if err != nil {
 		report.DiscoveryError = err.Error()
@@ -143,6 +151,12 @@ func printListHealth(out interface{ Write([]byte) (int, error) }, report listHea
 		} else {
 			fmt.Fprintln(out, "Dashboard: connected (managed runtime broker)")
 		}
+	} else if report.DashboardConfigured {
+		if report.ConnectionMode == "managed_runtime_broker" {
+			fmt.Fprintf(out, "Dashboard: configured (managed runtime broker via %s); live connection not tested\n", report.APIURL)
+		} else {
+			fmt.Fprintf(out, "Dashboard: configured (%s); live connection not tested\n", report.APIURL)
+		}
 	} else {
 		fmt.Fprintf(out, "Dashboard: local only (%s)\n", report.APIURL)
 	}
@@ -150,6 +164,7 @@ func printListHealth(out interface{ Write([]byte) (int, error) }, report listHea
 	fmt.Fprintf(out, "Discovered local config servers: %d\n", len(report.DiscoveredServers))
 	fmt.Fprintf(out, "Seen only: %d\n", report.SeenOnlyCount)
 	fmt.Fprintf(out, "Tool manifest: %s\n", report.ToolManifestStatus)
+	fmt.Fprintf(out, "Evidence queue: %s (%d/%d events, %d/%d bytes)\n", report.EventQueue.State, report.EventQueue.PendingEvents, report.EventQueue.MaxEvents, report.EventQueue.PendingBytes, report.EventQueue.MaxBytes)
 	if report.DiscoveryError != "" {
 		fmt.Fprintf(out, "Discovery warning: %s\n", report.DiscoveryError)
 	}
