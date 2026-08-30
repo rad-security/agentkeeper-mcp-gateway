@@ -11,7 +11,26 @@ import (
 	"time"
 )
 
-const policyCacheSchema = "mcp-policy-cache/1"
+const (
+	policyCacheSchema = "mcp-policy-cache/1"
+	policyStateSchema = "mcp-policy-state/1"
+)
+
+// policyStateSnapshot is deliberately separate from the replaceable policy
+// snapshot. It lets an offline restart distinguish a true first boot from a
+// route that had already been assigned Enforce but lost its cached policy.
+type policyStateSnapshot struct {
+	SchemaVersion               string `json:"schema_version"`
+	SignerKeyID                 string `json:"signer_key_id"`
+	MachineID                   string `json:"machine_id"`
+	ClientName                  string `json:"client_name,omitempty"`
+	ConfigSourceHash            string `json:"config_source_hash,omitempty"`
+	RouteRevision               string `json:"route_revision,omitempty"`
+	EffectiveMode               string `json:"effective_mode"`
+	EffectiveAssignmentRevision int64  `json:"effective_assignment_revision"`
+	EstablishedAt               string `json:"established_at"`
+	SignatureBase64             string `json:"signature_base64,omitempty"`
+}
 
 // policyCacheSnapshot is signed locally with the endpoint receipt key after a
 // successful authenticated sync. The signature detects accidental or
@@ -39,6 +58,15 @@ func (c *Client) loadPolicyCache() error {
 
 	info, err := os.Lstat(c.policyCachePath)
 	if os.IsNotExist(err) {
+		c.policyMu.RLock()
+		stateValid := c.policyStateValid
+		c.policyMu.RUnlock()
+		if stateValid {
+			mode, _ := c.currentMode()
+			if strings.EqualFold(mode, "enforce") {
+				return c.rejectPolicyCache(fmt.Errorf("policy snapshot missing after an established Enforce assignment"))
+			}
+		}
 		return nil
 	}
 	if err != nil {
@@ -108,6 +136,71 @@ func (c *Client) loadPolicyCache() error {
 	if !c.now().Before(expiresAt) && c.logger != nil {
 		c.logger.Warn("last-known-good policy expired at %s", expiresAt.UTC().Format(time.RFC3339))
 	}
+	// Upgrade existing valid caches atomically into the independent assignment
+	// state contract. A later cache loss will then fail closed.
+	if snapshot.EffectiveAssignmentRevision > 0 {
+		if err := c.persistPolicyState(); err != nil {
+			return fmt.Errorf("persisting established policy state: %w", err)
+		}
+	}
+	return nil
+}
+
+func (c *Client) loadPolicyState() error {
+	if c.policyStatePath == "" {
+		return nil
+	}
+	info, err := os.Lstat(c.policyStatePath)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return c.rejectPolicyCache(fmt.Errorf("inspecting established policy state: %w", err))
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return c.rejectPolicyCache(fmt.Errorf("refusing non-regular established policy state path"))
+	}
+	data, err := os.ReadFile(c.policyStatePath)
+	if err != nil {
+		return c.rejectPolicyCache(fmt.Errorf("reading established policy state: %w", err))
+	}
+	var state policyStateSnapshot
+	if err := json.Unmarshal(data, &state); err != nil {
+		return c.rejectPolicyCache(fmt.Errorf("parsing established policy state: %w", err))
+	}
+	if state.SchemaVersion != policyStateSchema {
+		return c.rejectPolicyCache(fmt.Errorf("unsupported established policy state schema %q", state.SchemaVersion))
+	}
+	if state.SignerKeyID != c.receiptStore.SignerKeyID() {
+		return c.rejectPolicyCache(fmt.Errorf("established policy state signer does not match endpoint key"))
+	}
+	if state.MachineID == "" || state.MachineID != c.machineID {
+		return c.rejectPolicyCache(fmt.Errorf("established policy state machine identity does not match endpoint"))
+	}
+	if state.ClientName != c.clientName || state.ConfigSourceHash != c.configSourceHash || state.RouteRevision != c.routeRevision {
+		return c.rejectPolicyCache(fmt.Errorf("established policy state route identity does not match Gateway process"))
+	}
+	if state.EffectiveAssignmentRevision <= 0 {
+		return c.rejectPolicyCache(fmt.Errorf("established policy state assignment revision is invalid"))
+	}
+	if _, err := time.Parse(time.RFC3339Nano, state.EstablishedAt); err != nil {
+		return c.rejectPolicyCache(fmt.Errorf("established policy state timestamp is invalid"))
+	}
+	canonical, err := canonicalPolicyState(state)
+	if err != nil || !c.receiptStore.VerifyBytes(canonical, state.SignatureBase64) {
+		return c.rejectPolicyCache(fmt.Errorf("established policy state signature is invalid"))
+	}
+	c.modeMu.Lock()
+	if normalizePolicyMode(state.EffectiveMode) == "enforce" {
+		c.mode = "enforce"
+	} else {
+		c.mode = "audit"
+	}
+	c.modeRevision = state.EffectiveAssignmentRevision
+	c.modeMu.Unlock()
+	c.policyMu.Lock()
+	c.policyStateValid = true
+	c.policyMu.Unlock()
 	return nil
 }
 
@@ -122,6 +215,43 @@ func (c *Client) rejectPolicyCache(err error) error {
 	// this state immediately.
 	c.SetMode("enforce")
 	return fmt.Errorf("last-known-good policy unavailable: %w", err)
+}
+
+func (c *Client) persistPolicyState() error {
+	if c.policyStatePath == "" || c.receiptStore == nil {
+		return nil
+	}
+	mode, revision := c.currentMode()
+	if revision <= 0 {
+		return nil
+	}
+	state := policyStateSnapshot{
+		SchemaVersion:               policyStateSchema,
+		SignerKeyID:                 c.receiptStore.SignerKeyID(),
+		MachineID:                   c.machineID,
+		ClientName:                  c.clientName,
+		ConfigSourceHash:            c.configSourceHash,
+		RouteRevision:               c.routeRevision,
+		EffectiveMode:               modeLabel(mode),
+		EffectiveAssignmentRevision: revision,
+		EstablishedAt:               c.now().UTC().Format(time.RFC3339Nano),
+	}
+	canonical, err := canonicalPolicyState(state)
+	if err != nil {
+		return err
+	}
+	state.SignatureBase64 = c.receiptStore.SignBytes(canonical)
+	data, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := atomicWritePrivate(c.policyStatePath, append(data, '\n')); err != nil {
+		return err
+	}
+	c.policyMu.Lock()
+	c.policyStateValid = true
+	c.policyMu.Unlock()
+	return nil
 }
 
 func (c *Client) persistPolicyCache() error {
@@ -180,6 +310,11 @@ func (c *Client) scopedPolicyCachePath(path string) string {
 func canonicalPolicySnapshot(snapshot policyCacheSnapshot) ([]byte, error) {
 	snapshot.SignatureBase64 = ""
 	return json.Marshal(snapshot)
+}
+
+func canonicalPolicyState(state policyStateSnapshot) ([]byte, error) {
+	state.SignatureBase64 = ""
+	return json.Marshal(state)
 }
 
 func cloneSyncPolicy(policy SyncPolicy) SyncPolicy {

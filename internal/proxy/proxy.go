@@ -57,15 +57,16 @@ type JSONRPCError struct {
 
 // Config holds proxy configuration.
 type Config struct {
-	EnforceMode      bool
-	GatewayVersion   string
-	Detection        telemetry.DetectionConfig
-	DetectionEngine  *detection.Engine
-	Logger           *logging.Logger
-	ReceiptStore     *receipt.Store
-	ClientName       string
-	ConfigSourceHash string
-	RouteRevision    string
+	EnforceMode          bool
+	GatewayVersion       string
+	Detection            telemetry.DetectionConfig
+	DetectionEngine      *detection.Engine
+	Logger               *logging.Logger
+	ReceiptStore         *receipt.Store
+	RequireDurableEvents bool
+	ClientName           string
+	ConfigSourceHash     string
+	RouteRevision        string
 }
 
 // Proxy manages the MCP protocol proxy.
@@ -486,6 +487,9 @@ func (p *Proxy) handleToolsList(msg JSONRPCMessage) (*JSONRPCMessage, error) {
 	cachedTools, nextToolMap = p.cachedNamespacedTools()
 
 	p.setToolMap(nextToolMap)
+	if p.enforceMode() && p.config.RequireDurableEvents && !p.durableEvidenceAvailable() {
+		cachedTools = nil
+	}
 	if p.enforceMode() && p.telemetry != nil {
 		cachedTools = filterToolsForPolicy(cachedTools, nextToolMap, p.telemetry.Policy())
 	}
@@ -1036,6 +1040,27 @@ func (p *Proxy) handleToolsCallContext(ctx context.Context, msg JSONRPCMessage) 
 	if enforceThisCall {
 		effectiveMode = "enforce"
 	}
+	if enforceThisCall && p.config.RequireDurableEvents && !p.durableEvidenceAvailable() {
+		blockedResult := detection.Result{
+			Verdict: detection.VerdictBlock, PatternName: "evidence_queue_unavailable",
+			Severity: "high", Category: "gateway_health",
+			Description: "the local evidence queue cannot accept another durable event",
+		}
+		p.logToolOutcome(serverName, originalName, callParams.Arguments, blockedResult, logging.ToolCallOutcome{
+			CallID: callID, AttemptID: attemptID, Mode: effectiveMode,
+			PolicyDecision: "block", EvaluationStatus: "evidence_unavailable",
+			RequiredDisposition: "deny_before_dispatch", AppliedDisposition: "denied_before_dispatch",
+			FailureReason: "evidence_queue_unavailable",
+		})
+		resultJSON, _ := json.Marshal(map[string]interface{}{
+			"content": []map[string]interface{}{{
+				"type": "text",
+				"text": "Blocked by AgentKeeper: the local evidence queue is unavailable or full. Contact your administrator before retrying.",
+			}},
+			"isError": true,
+		})
+		return &JSONRPCMessage{JSONRPC: "2.0", ID: msg.ID, Result: resultJSON}, nil
+	}
 
 	// --- 1. Policy check ---
 	var finalVerdict string = "pass"
@@ -1303,6 +1328,10 @@ func (p *Proxy) logToolOutcome(serverName, toolName string, params map[string]in
 	}); err != nil && p.config.Logger != nil {
 		p.config.Logger.Warn("could not persist signed application receipt: %v", err)
 	}
+}
+
+func (p *Proxy) durableEvidenceAvailable() bool {
+	return p.config.Logger != nil && p.config.Logger.AcceptingDurableEvents()
 }
 
 func (p *Proxy) manifestEvidence(serverName string, syncedPolicy telemetry.SyncPolicy) (string, string) {
@@ -1776,8 +1805,12 @@ func (p *Proxy) handleBuiltinToolCall(id *json.RawMessage, name string, args map
 		servers := p.manager.ConfiguredNames()
 		sort.Strings(servers)
 		cachedBackendCount, cachedToolCount, degradedBackendCount := p.cachedToolSummary()
-		text = fmt.Sprintf("AgentKeeper MCP Gateway\nMode: %s\nServers: %d configured (%s)\nTools: %d cached from %d backend(s); %d backend(s) degraded; refreshing in background\nDetection: active",
-			mode, len(servers), strings.Join(servers, ", "), cachedToolCount, cachedBackendCount, degradedBackendCount)
+		queue := logging.EventQueueStatus{State: "unavailable"}
+		if p.config.Logger != nil {
+			queue = p.config.Logger.QueueStatus()
+		}
+		text = fmt.Sprintf("AgentKeeper MCP Gateway\nMode: %s\nServers: %d configured (%s)\nTools: %d cached from %d backend(s); %d backend(s) degraded; refreshing in background\nDetection: active\nEvidence queue: %s (%d events, %d bytes)",
+			mode, len(servers), strings.Join(servers, ", "), cachedToolCount, cachedBackendCount, degradedBackendCount, queue.State, queue.PendingEvents, queue.PendingBytes)
 	case "agentkeeper_audit":
 		p.startToolRefresh()
 		servers := p.manager.ConfiguredNames()

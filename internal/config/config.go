@@ -18,6 +18,11 @@ type Config struct {
 	Mode    string `json:"mode" yaml:"mode"` // "audit" or "enforce"
 	Verbose bool   `json:"verbose" yaml:"verbose"`
 	LogPath string `json:"log_path" yaml:"log_path"`
+	// Fleet evidence durability. Enforce deployments can refuse upstream calls
+	// when the local event spool cannot accept another terminal event.
+	RequireDurableEvents bool  `json:"require_durable_events,omitempty" yaml:"require_durable_events,omitempty"`
+	EventQueueMaxEvents  int   `json:"event_queue_max_events,omitempty" yaml:"event_queue_max_events,omitempty"`
+	EventQueueMaxBytes   int64 `json:"event_queue_max_bytes,omitempty" yaml:"event_queue_max_bytes,omitempty"`
 
 	// Detection settings
 	Detection DetectionConfig `json:"detection" yaml:"detection"`
@@ -138,9 +143,11 @@ func CurrentConfigPath() string {
 // DefaultConfig returns the default configuration.
 func DefaultConfig() Config {
 	return Config{
-		Mode:    "audit",
-		Verbose: false,
-		APIURL:  defaultAPIURL,
+		Mode:                "audit",
+		Verbose:             false,
+		APIURL:              defaultAPIURL,
+		EventQueueMaxEvents: 100000,
+		EventQueueMaxBytes:  256 * 1024 * 1024,
 		Detection: DetectionConfig{
 			Threat:        "warn",
 			SensitiveData: "warn",

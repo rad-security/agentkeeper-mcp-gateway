@@ -431,6 +431,73 @@ func TestLastKnownGoodPolicyAndAssignmentSurviveOfflineRestart(t *testing.T) {
 	}
 }
 
+func TestMissingPolicyCacheAfterEstablishedEnforceFailsClosed(t *testing.T) {
+	t.Setenv("AGENTKEEPER_MACHINE_ID", "machine-policy-cache-missing")
+	root := t.TempDir()
+	receiptRoot := filepath.Join(root, "receipts")
+	cachePath := filepath.Join(root, "policy-cache-v1.json")
+	store, err := receipt.NewStore(receiptRoot, "0.2.0-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/v2/mcp/gateways/register":
+			_, _ = w.Write([]byte(`{"ok":true,"gateway_id":"gw-policy-cache","route_assignment":{"desired_mode":"enforce","desired_revision":19}}`))
+		case "/api/v1/mcp/sync":
+			_, _ = w.Write([]byte(`{"ok":true,"gateway_id":"gw-policy-cache","policy":{"mode":"enforce","blocked_tools":{"payments":["transfer"]}}}`))
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+
+	client := NewClient(srv.URL, "test-key", nil)
+	client.SetMode("audit")
+	client.SetRouteContext("claude-code", "sha256:source", "route:19")
+	client.SetReceiptStore(store)
+	if err := client.SetPolicyCache(cachePath); err != nil {
+		t.Fatal(err)
+	}
+	client.sync()
+	if _, err := os.Stat(client.policyStatePath); err != nil {
+		t.Fatalf("established policy state was not persisted: %v", err)
+	}
+	if err := os.Remove(client.policyCachePath); err != nil {
+		t.Fatal(err)
+	}
+	srv.Close()
+
+	restartedStore, err := receipt.NewStore(receiptRoot, "0.2.0-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	restarted := NewClient("http://127.0.0.1:1", "test-key", nil)
+	restarted.SetMode("audit")
+	restarted.SetRouteContext("claude-code", "sha256:source", "route:19")
+	restarted.SetReceiptStore(restartedStore)
+	if err := restarted.SetPolicyCache(cachePath); err == nil {
+		t.Fatal("missing policy snapshot after established Enforce assignment was accepted")
+	}
+	if mode, revision := restarted.EffectiveMode(); mode != "enforce" || revision != 19 {
+		t.Fatalf("missing-cache restart mode=%q revision=%d", mode, revision)
+	}
+	if got := restarted.Policy().BlockedServers; len(got) != 1 || got[0] != "*" {
+		t.Fatalf("missing-cache restart did not fail closed: %+v", restarted.Policy())
+	}
+
+	firstBoot := NewClient("http://127.0.0.1:1", "test-key", nil)
+	firstBoot.SetMode("audit")
+	firstBoot.SetRouteContext("cursor", "sha256:new", "route:new")
+	firstBoot.SetReceiptStore(restartedStore)
+	if err := firstBoot.SetPolicyCache(filepath.Join(root, "fresh-policy-cache.json")); err != nil {
+		t.Fatalf("true first boot should remain Observe: %v", err)
+	}
+	if mode, _ := firstBoot.EffectiveMode(); mode != "observe" {
+		t.Fatalf("true first boot mode=%q, want observe", mode)
+	}
+}
+
 func TestPolicyCacheIsScopedAndBoundToRouteIdentity(t *testing.T) {
 	t.Setenv("AGENTKEEPER_MACHINE_ID", "machine-policy-cache-routes")
 	root := t.TempDir()

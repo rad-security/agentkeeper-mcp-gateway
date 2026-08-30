@@ -53,6 +53,7 @@ are blocked.`,
 		if err != nil {
 			return fmt.Errorf("creating logger: %w", err)
 		}
+		logger.ConfigureQueueLimits(cfg.EventQueueMaxEvents, cfg.EventQueueMaxBytes)
 		defer logger.Close()
 
 		if coworkAutoGuardEnabled() {
@@ -171,21 +172,23 @@ are blocked.`,
 
 		// Create and run proxy
 		p := proxy.NewProxy(proxy.Config{
-			EnforceMode:      cfg.Mode == "enforce",
-			GatewayVersion:   version,
-			Detection:        telemetry.DetectionConfig{Threat: cfg.Detection.Threat, SensitiveData: cfg.Detection.SensitiveData},
-			DetectionEngine:  engine,
-			Logger:           logger,
-			ReceiptStore:     receiptStore,
-			ClientName:       os.Getenv(gatewayentry.EnvClientName),
-			ConfigSourceHash: os.Getenv(gatewayentry.EnvConfigSourceHash),
-			RouteRevision:    os.Getenv(gatewayentry.EnvRouteRevision),
+			EnforceMode:          cfg.Mode == "enforce",
+			GatewayVersion:       version,
+			Detection:            telemetry.DetectionConfig{Threat: cfg.Detection.Threat, SensitiveData: cfg.Detection.SensitiveData},
+			DetectionEngine:      engine,
+			Logger:               logger,
+			ReceiptStore:         receiptStore,
+			RequireDurableEvents: cfg.RequireDurableEvents,
+			ClientName:           os.Getenv(gatewayentry.EnvClientName),
+			ConfigSourceHash:     os.Getenv(gatewayentry.EnvConfigSourceHash),
+			RouteRevision:        os.Getenv(gatewayentry.EnvRouteRevision),
 		}, mgr, tc)
+		dashboardConnected := false
 		if tc != nil {
 			tc.SetModeChangeHandler(func(mode string, _ int64) {
 				p.SetEnforceMode(mode == "enforce")
 			})
-			tc.Start()
+			dashboardConnected = tc.Start()
 			defer tc.Stop()
 		}
 
@@ -202,8 +205,10 @@ are blocked.`,
 		fmt.Fprintf(os.Stderr, "[agentkeeper] %d servers configured, %d detection patterns loaded\n", len(serverConfigs), 36)
 		if hasRuntimeBroker {
 			fmt.Fprintf(os.Stderr, "[agentkeeper] Connected through credentialless AgentKeeper runtime broker\n")
-		} else if hasAPIKey {
+		} else if hasAPIKey && dashboardConnected {
 			fmt.Fprintf(os.Stderr, "[agentkeeper] Connected to dashboard\n")
+		} else if hasAPIKey {
+			fmt.Fprintf(os.Stderr, "[agentkeeper] Dashboard unavailable; continuing with local or last-known-good policy\n")
 		} else {
 			fmt.Fprintf(os.Stderr, "[agentkeeper] Local mode (run 'agentkeeper-mcp-gateway auth login' to connect)\n")
 		}

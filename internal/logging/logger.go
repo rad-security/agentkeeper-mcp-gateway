@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -58,11 +59,33 @@ type Logger struct {
 	logPath string
 	verbose bool
 	// Buffer for batch telemetry upload
-	buffer       []Event
-	bufferMu     sync.Mutex
-	queueDir     string
-	rejectedDir  string
-	durableQueue bool
+	buffer         []Event
+	bufferMu       sync.Mutex
+	bufferDropped  int
+	queueDir       string
+	rejectedDir    string
+	durableQueue   bool
+	queueMu        sync.Mutex
+	queueEvents    int
+	queueBytes     int64
+	queueMaxEvents int
+	queueMaxBytes  int64
+	queueLastError string
+}
+
+// EventQueueStatus is safe to expose through local health output. It contains
+// counts and limits only, never event content.
+type EventQueueStatus struct {
+	State             string `json:"state"`
+	Durable           bool   `json:"durable"`
+	Accepting         bool   `json:"accepting"`
+	PendingEvents     int    `json:"pending_events"`
+	PendingBytes      int64  `json:"pending_bytes"`
+	RejectedEvents    int    `json:"rejected_events"`
+	MemoryOnlyDropped int    `json:"memory_only_dropped"`
+	MaxEvents         int    `json:"max_events"`
+	MaxBytes          int64  `json:"max_bytes"`
+	LastError         string `json:"last_error,omitempty"`
 }
 
 // NewLogger creates a logger writing to the specified path.
@@ -103,13 +126,85 @@ func NewLogger(logPath string, verbose bool) (*Logger, error) {
 
 func newBufferedLogger(file *os.File, logPath string, verbose bool) *Logger {
 	logger := &Logger{
-		file:    file,
-		logPath: logPath,
-		verbose: verbose,
-		buffer:  make([]Event, 0, 100),
+		file:           file,
+		logPath:        logPath,
+		verbose:        verbose,
+		buffer:         make([]Event, 0, 100),
+		queueMaxEvents: 100000,
+		queueMaxBytes:  256 * 1024 * 1024,
 	}
 	logger.initDurableQueue()
 	return logger
+}
+
+// ConfigureQueueLimits applies fleet-managed spool limits. Non-positive values
+// keep the safe defaults so a malformed config cannot make the queue unbounded.
+func (l *Logger) ConfigureQueueLimits(maxEvents int, maxBytes int64) {
+	l.queueMu.Lock()
+	defer l.queueMu.Unlock()
+	if maxEvents > 0 {
+		l.queueMaxEvents = maxEvents
+	}
+	if maxBytes > 0 {
+		l.queueMaxBytes = maxBytes
+	}
+	_ = l.refreshQueueUsageLocked()
+}
+
+// QueueStatus reports whether another event can be durably accepted.
+func (l *Logger) QueueStatus() EventQueueStatus {
+	l.queueMu.Lock()
+	defer l.queueMu.Unlock()
+	if l.durableQueue {
+		if err := l.refreshQueueUsageLocked(); err != nil {
+			l.queueLastError = err.Error()
+		}
+	}
+	return l.queueStatusLocked()
+}
+
+// InspectEventQueue reports on an existing spool without creating files. It is
+// used by fleet health and MDM detection commands when no Gateway process is
+// running.
+func InspectEventQueue(logPath string, maxEvents int, maxBytes int64) EventQueueStatus {
+	if logPath == "" {
+		home, _ := os.UserHomeDir()
+		logPath = filepath.Join(home, ".config", "agentkeeper-mcp-gateway", "events.jsonl")
+	}
+	if maxEvents <= 0 {
+		maxEvents = 100000
+	}
+	if maxBytes <= 0 {
+		maxBytes = 256 * 1024 * 1024
+	}
+	root := filepath.Join(filepath.Dir(logPath), "events-v1")
+	logger := &Logger{
+		queueDir: filepath.Join(root, "queue"), rejectedDir: filepath.Join(root, "rejected"),
+		queueMaxEvents: maxEvents, queueMaxBytes: maxBytes,
+	}
+	if info, err := os.Stat(logger.queueDir); os.IsNotExist(err) {
+		return EventQueueStatus{State: "not_initialized", MaxEvents: maxEvents, MaxBytes: maxBytes}
+	} else if err != nil || !info.IsDir() {
+		message := "event queue path is unavailable"
+		if err != nil {
+			message = err.Error()
+		}
+		return EventQueueStatus{State: "unavailable", MaxEvents: maxEvents, MaxBytes: maxBytes, LastError: message}
+	}
+	logger.durableQueue = true
+	if err := logger.refreshQueueUsageLocked(); err != nil {
+		logger.queueLastError = err.Error()
+	}
+	return logger.queueStatusLocked()
+}
+
+// AcceptingDurableEvents is the hot-path capacity check. It uses counters kept
+// current by queue writes and acknowledgements and avoids rescanning a large
+// outage backlog for every MCP call.
+func (l *Logger) AcceptingDurableEvents() bool {
+	l.queueMu.Lock()
+	defer l.queueMu.Unlock()
+	return l.durableQueue && l.queueEvents < l.queueMaxEvents && l.queueBytes < l.queueMaxBytes && l.queueLastError == ""
 }
 
 // LogToolCall logs an MCP tool call event.
@@ -283,7 +378,7 @@ func (l *Logger) PendingEvents(limit int) ([]Event, bool, error) {
 		}
 		var event Event
 		if decodeErr := json.Unmarshal(data, &event); decodeErr != nil || event.EventID == "" {
-			if renameErr := os.Rename(path, filepath.Join(l.rejectedDir, entry.Name())); renameErr != nil && !os.IsNotExist(renameErr) {
+			if renameErr := l.quarantineQueuedEvent(path, filepath.Join(l.rejectedDir, entry.Name())); renameErr != nil && !os.IsNotExist(renameErr) {
 				return nil, true, fmt.Errorf("quarantining corrupt event %s: %w", entry.Name(), renameErr)
 			}
 			continue
@@ -319,6 +414,8 @@ func (l *Logger) ResolveEvents(statusByEventID map[string]string) error {
 		}
 	}
 	if l.durableQueue {
+		l.queueMu.Lock()
+		defer l.queueMu.Unlock()
 		entries, err := os.ReadDir(l.queueDir)
 		if err != nil {
 			return err
@@ -342,15 +439,20 @@ func (l *Logger) ResolveEvents(statusByEventID map[string]string) error {
 			status := statusByEventID[event.EventID]
 			switch status {
 			case "accepted", "duplicate":
+				info, _ := os.Stat(source)
 				if err := os.Remove(source); err != nil && !os.IsNotExist(err) {
 					return err
 				}
+				l.decrementQueueUsageLocked(info)
 			case "rejected", "conflicted":
+				info, _ := os.Stat(source)
 				if err := os.Rename(source, filepath.Join(l.rejectedDir, entry.Name())); err != nil && !os.IsNotExist(err) {
 					return err
 				}
+				l.decrementQueueUsageLocked(info)
 			}
 		}
+		l.clearCapacityErrorLocked()
 	}
 	if len(terminal) > 0 {
 		l.bufferMu.Lock()
@@ -376,11 +478,14 @@ func (l *Logger) Close() error {
 }
 
 func (l *Logger) writeEvent(event Event) {
+	persisted := false
 	if remoteIngestable(event) && event.EventID == "" {
 		event.EventID = newEventID()
 		if l.durableQueue {
 			if err := l.persistEvent(event); err != nil {
 				fmt.Fprintf(os.Stderr, "[agentkeeper] durable event queue unavailable for %s: %v\n", event.EventID, err)
+			} else {
+				persisted = true
 			}
 		}
 	}
@@ -398,7 +503,11 @@ func (l *Logger) writeEvent(event Event) {
 
 	if remoteIngestable(event) {
 		l.bufferMu.Lock()
-		l.buffer = append(l.buffer, event)
+		if len(l.buffer) < 1000 {
+			l.buffer = append(l.buffer, event)
+		} else if !persisted {
+			l.bufferDropped++
+		}
 		l.bufferMu.Unlock()
 	}
 
@@ -427,6 +536,11 @@ func (l *Logger) initDurableQueue() {
 		}
 	}
 	l.durableQueue = true
+	l.queueMu.Lock()
+	if err := l.refreshQueueUsageLocked(); err != nil {
+		l.queueLastError = err.Error()
+	}
+	l.queueMu.Unlock()
 }
 
 func ensurePrivateDir(path string) error {
@@ -456,8 +570,107 @@ func (l *Logger) persistEvent(event Event) error {
 	if err != nil {
 		return err
 	}
+	l.queueMu.Lock()
+	defer l.queueMu.Unlock()
+	if !l.durableQueue {
+		return fmt.Errorf("durable event queue is unavailable")
+	}
+	if l.queueEvents >= l.queueMaxEvents || l.queueBytes+int64(len(data)+1) > l.queueMaxBytes {
+		l.queueLastError = fmt.Sprintf("event queue capacity exceeded: events=%d/%d bytes=%d/%d", l.queueEvents, l.queueMaxEvents, l.queueBytes, l.queueMaxBytes)
+		return fmt.Errorf("%s", l.queueLastError)
+	}
 	name := fmt.Sprintf("%020d-%s.json", time.Now().UTC().UnixNano(), event.EventID)
-	return atomicWriteEvent(filepath.Join(l.queueDir, name), append(data, '\n'))
+	payload := append(data, '\n')
+	if err := atomicWriteEvent(filepath.Join(l.queueDir, name), payload); err != nil {
+		l.queueLastError = err.Error()
+		return err
+	}
+	l.queueEvents++
+	l.queueBytes += int64(len(payload))
+	l.clearCapacityErrorLocked()
+	return nil
+}
+
+func (l *Logger) refreshQueueUsageLocked() error {
+	entries, err := os.ReadDir(l.queueDir)
+	if err != nil {
+		return err
+	}
+	events := 0
+	var bytes int64
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		events++
+		bytes += info.Size()
+	}
+	l.queueEvents = events
+	l.queueBytes = bytes
+	return nil
+}
+
+func (l *Logger) queueStatusLocked() EventQueueStatus {
+	status := EventQueueStatus{
+		State: "healthy", Durable: l.durableQueue, PendingEvents: l.queueEvents,
+		PendingBytes: l.queueBytes, MaxEvents: l.queueMaxEvents, MaxBytes: l.queueMaxBytes,
+		LastError: l.queueLastError,
+	}
+	if entries, err := os.ReadDir(l.rejectedDir); err == nil {
+		for _, entry := range entries {
+			if !entry.IsDir() && filepath.Ext(entry.Name()) == ".json" {
+				status.RejectedEvents++
+			}
+		}
+	}
+	status.Accepting = status.Durable && status.PendingEvents < status.MaxEvents && status.PendingBytes < status.MaxBytes && status.LastError == ""
+	l.bufferMu.Lock()
+	status.MemoryOnlyDropped = l.bufferDropped
+	l.bufferMu.Unlock()
+	if !status.Durable {
+		status.State = "unavailable"
+	} else if status.PendingEvents >= status.MaxEvents || status.PendingBytes >= status.MaxBytes {
+		status.State = "full"
+	} else if status.PendingEvents*100 >= status.MaxEvents*80 || status.PendingBytes*100 >= status.MaxBytes*80 {
+		status.State = "pressure"
+	} else if status.LastError != "" {
+		status.State = "degraded"
+	}
+	return status
+}
+
+func (l *Logger) quarantineQueuedEvent(source, target string) error {
+	l.queueMu.Lock()
+	defer l.queueMu.Unlock()
+	info, _ := os.Stat(source)
+	if err := os.Rename(source, target); err != nil {
+		return err
+	}
+	l.decrementQueueUsageLocked(info)
+	return nil
+}
+
+func (l *Logger) decrementQueueUsageLocked(info os.FileInfo) {
+	if info == nil {
+		return
+	}
+	if l.queueEvents > 0 {
+		l.queueEvents--
+	}
+	l.queueBytes -= info.Size()
+	if l.queueBytes < 0 {
+		l.queueBytes = 0
+	}
+}
+
+func (l *Logger) clearCapacityErrorLocked() {
+	if strings.HasPrefix(l.queueLastError, "event queue capacity exceeded:") && l.queueEvents < l.queueMaxEvents && l.queueBytes < l.queueMaxBytes {
+		l.queueLastError = ""
+	}
 }
 
 func atomicWriteEvent(path string, data []byte) error {

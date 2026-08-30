@@ -163,7 +163,7 @@ func TestListHealthUsesUniversalRPMReconciliationGuidance(t *testing.T) {
 		t.Fatalf("exit %d, stderr: %s", code, stderr)
 	}
 	for _, want := range []string{
-		"Dashboard: connected (managed runtime broker via https://www.agentkeeper.dev)",
+		"Dashboard: configured (managed runtime broker via https://www.agentkeeper.dev); live connection not tested",
 		"Seen only: 1",
 		"sudo agentkeeper reconcile --source operator --json",
 	} {

@@ -320,6 +320,29 @@ The gateway is designed to work under a fleet config-management tool (Kandji, An
 
 The file-wins-over-env rule is deliberate — rotate the API key by re-rendering the config file, not by setting a shell env var that silently shadows the real config.
 
+**Enterprise evidence durability:**
+
+```json
+{
+  "mode": "enforce",
+  "require_durable_events": true,
+  "event_queue_max_events": 100000,
+  "event_queue_max_bytes": 268435456
+}
+```
+
+The bounded owner-only event spool is replayed after restart. When
+`require_durable_events` is enabled, Enforce mode hides and denies upstream
+tools before dispatch if the spool is unavailable or full. Observe mode keeps
+the developer workflow available and reports the degraded queue through
+`list --health` and the `agentkeeper_status` built-in tool.
+
+An established control-plane assignment is stored separately from the policy
+snapshot. If a route that was previously assigned Enforce restarts offline and
+its policy snapshot is missing, the Gateway fails closed instead of treating
+the machine as a first boot. The state and policy files are route-bound,
+owner-only, and signed with the endpoint receipt key.
+
 **Checking the resolved state:**
 
 ```bash
@@ -331,6 +354,10 @@ $ agentkeeper-mcp-gateway config show
 ```
 
 `config show` prints the resolved path and labels every overridable field as `file`, `env`, or `default`.
+
+`list --health` distinguishes dashboard credentials that are configured from a
+live connection, and reports event-spool pressure without reading event
+content.
 
 **Sample systemd unit (Linux):**
 
