@@ -61,3 +61,14 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Preserve the legacy latest channel for existing installations
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LEGACY_LATEST_TAG: v0.1.21
+        run: |
+          set -euo pipefail
+          release_id="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${LEGACY_LATEST_TAG}" --jq .id)"
+          gh api --method PATCH \
+            "repos/${GITHUB_REPOSITORY}/releases/${release_id}" \
+            -f make_latest=true >/dev/null
+          test "$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq .tag_name)" = "${LEGACY_LATEST_TAG}"
