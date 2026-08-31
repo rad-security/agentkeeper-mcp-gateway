@@ -50,6 +50,10 @@ signs:
 # tags continue to publish as ordinary releases.
 release:
   prerelease: auto
+  # Enterprise installs are explicitly pinned to an approved tag and digest.
+  # Keeping new releases out of GitHub's mutable `latest` pointer prevents a
+  # legacy `releases/latest` installer from discovering them automatically.
+  make_latest: false
 
 # Homebrew tap is out of scope for v0.1.0 — tap repo does not exist.
 # Re-enable once rad-security/homebrew-tap is created (see parent plan §4 Non-Goals).
