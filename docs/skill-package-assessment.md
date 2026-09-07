@@ -1,0 +1,15 @@
+# Bounded skill package assessment
+
+`agentkeeper-mcp-gateway assess-skill DIRECTORY` emits metadata-only JSON. It is an explicit read-only operation; it does not modify hooks, upload material, execute a skill or block its use. Existing scan-inventory behavior is unchanged in this increment.
+
+The assessor reads instructions, bundled scripts and resources, rather than scoring only the legacy 300-byte gateway preview or 500-byte Inventory Lite preview. Defaults: 1,000 files, depth 8, 2 MiB/file, 20 MiB total, 200 findings and a 10-second scan budget. Partial work, skipped binaries, invalid filenames, unreadable files and exhausted budgets remain explicit. A limit is not evidence that a package is safe. Filesystem calls may still be delayed by the operating system; this is not a kernel I/O timeout guarantee.
+
+The deterministic SHA-256 manifest includes relative path, size, executable bit and content hash for every read regular file. Its format version is separate from the rule catalog version, so rule upgrades do not change artifact identity. Binary bytes contribute to the digest but are not semantically assessed. Incomplete digests are omitted, never represented by an apparently complete hash.
+
+On macOS and Linux, traversal is descriptor-relative with no-follow opens. Package symlinks and special files are skipped with incomplete evidence. A swapped parent path cannot redirect an already-open directory handle. Windows retains legacy discovery and explicitly reports the new secure assessment as unsupported pending a verified Windows implementation.
+
+Rule IDs cover instruction override, dependency source changes, remote/encoded execution, sensitive-file transfer, credential-file reads, destructive operations, security-control tampering and hidden direction controls. Findings are reviewable behavior indicators, not malware convictions. Shell use, URLs, ordinary installation and words such as token/password do not accumulate arbitrary scores. Explicitly negated and quoted defensive examples are distinguished; semantic obfuscation and indirect references can still evade a static scanner. This does not establish competitive parity or pre-load enforcement.
+
+Validation: full existing Go suite passed; assessor race tests passed; Windows package test cross-compilation passed. Fixtures cover malicious content after line 500, script-only risks, benign/defensive controls, changes to resources/names/mode, file/depth/byte/finding limits, binary incompleteness, symlink escape and directory-swap attempts, FIFO safety and canceled scans. A native macOS CLI fixture with two files and 11,256 bytes detected instruction override and dependency-source override in 274 ms on the initial measured run, without emitting the matched contents.
+
+Next integration steps: source adapters, the shared inventory v2 contract, existing runtime scheduling, durable sequencing/spooling, dashboard version evidence, risk-review lifecycle and independently verified skill enforcement. Do not publish a broad endpoint release from this library-only milestone.
