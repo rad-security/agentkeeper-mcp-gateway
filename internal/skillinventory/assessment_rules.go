@@ -1,6 +1,7 @@
 package skillinventory
 
 import (
+	"context"
 	"regexp"
 	"strings"
 )
@@ -22,23 +23,37 @@ var skillAssessmentRules = []skillAssessmentRule{
 	{"encoded_execution", "high", "medium", regexp.MustCompile(`(?i)(\b(eval|exec|iex)\b.{0,250}(base64|b64decode|fromhex)|\bbase64\b.{0,120}(-d|--decode).{0,80}\|\s*(ba|z)?sh\b|powershell\b.{0,120}-(enc|encodedcommand)\b)`)},
 	{"sensitive_file_transfer", "high", "medium", regexp.MustCompile(`(?i)\b(curl|wget|requests\.(post|put))\b.{0,300}(--data(-binary|-raw)?\s+@|--upload-file\s+|-F\s+[^\s]*@|open\s*\().{0,100}(\.env\b|\.ssh\b|credentials\b|id_rsa\b|id_ed25519\b)`)},
 	{"credential_file_read", "medium", "medium", regexp.MustCompile(`(?i)\b(cat|read|open|Get-Content)\b.{0,100}(\.ssh[/\\](id_rsa|id_ed25519)|\.aws[/\\]credentials|\.env\b)`)},
-	{"destructive_operation", "high", "medium", regexp.MustCompile(`(?i)\brm\s+(-[a-z]*r[a-z]*\s+-[a-z]*f[a-z]*|-[a-z]*f[a-z]*r[a-z]*|-[a-z]*r[a-z]*f[a-z]*)\s+(/(\s|$|\*)|~(/|\s|$)|\$HOME\b)|\b(mkfs(\.[a-z0-9]+)?|format\s+[a-z]:)\b`)},
+	{"destructive_operation", "high", "medium", regexp.MustCompile(`(?i)\brm\s+(-[a-z]*r[a-z]*\s+-[a-z]*f[a-z]*|-[a-z]*f[a-z]*r[a-z]*|-[a-z]*r[a-z]*f[a-z]*|--recursive\s+--force|--force\s+--recursive)\s+["']?(/(\s|$|\*|["'])|~(/|\s|$)|\$HOME\b)|\b(mkfs(\.[a-z0-9]+)?|format\s+[a-z]:)\b`)},
 	{"security_control_tamper", "high", "medium", regexp.MustCompile(`(?i)\b(disable|remove|delete|unset|bypass|stop)\b.{0,100}\b(agentkeeper|security\s+hooks?|audit\s+log(?:ging)?|runtime\s+shield|EDR)\b`)},
 	{"hidden_direction_controls", "medium", "high", regexp.MustCompile(`[\x{202A}-\x{202E}\x{2066}-\x{2069}\x{200B}\x{200C}\x{200D}]`)},
 }
 
-func assessSkillText(path, content string, maxFindings int) ([]SkillFinding, bool) {
+func assessSkillText(ctx context.Context, path, content string, maxFindings int) ([]SkillFinding, bool) {
 	findings := []SkillFinding{}
 	lines := strings.Split(content, "\n")
 	seen := map[string]bool{}
 	for i, line := range lines {
+		if ctx.Err() != nil {
+			return findings, false
+		}
 		trimmed := strings.TrimSpace(line)
 		// Explicit negation and quoted defensive examples are not directives.
 		// Do not skip fenced code: SKILL.md often asks an agent to run it.
 		lower := strings.ToLower(trimmed)
 		defensive := strings.HasPrefix(trimmed, ">") || strings.HasPrefix(lower, "do not ") || strings.HasPrefix(lower, "never ") || strings.HasPrefix(lower, "avoid ")
+		// Join a small adjacent context so wrapped directives and normal shell
+		// continuations cannot trivially evade a line boundary. Attribute only
+		// matches starting on this line; later matches are handled on their line.
+		window := line
+		for j := i + 1; j < len(lines) && j <= i+3 && len(window)+len(lines[j]) < 4096; j++ {
+			window += " " + lines[j]
+		}
 		for _, rule := range skillAssessmentRules {
-			if seen[rule.id] || !rule.pattern.MatchString(line) {
+			if seen[rule.id] {
+				continue
+			}
+			match := rule.pattern.FindStringIndex(window)
+			if match == nil || match[0] >= len(line) {
 				continue
 			}
 			if defensive && rule.id != "hidden_direction_controls" {

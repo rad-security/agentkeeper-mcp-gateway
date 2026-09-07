@@ -202,7 +202,7 @@ func AssessPackage(ctx context.Context, root string, limits AssessmentLimits) Pa
 					mark("binary_content_unassessed", false)
 					continue
 				}
-				findings, truncated := assessSkillText(rel, string(data), limits.MaxFindings-len(a.Findings))
+				findings, truncated := assessSkillText(ctx, rel, string(data), limits.MaxFindings-len(a.Findings))
 				a.Findings = append(a.Findings, findings...)
 				if truncated {
 					mark("finding_limit", false)
