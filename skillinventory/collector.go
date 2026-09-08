@@ -15,6 +15,8 @@ type Collection = internal.CollectionV2
 type Source = internal.SourceV2
 type Observation = internal.ObservationV2
 type Envelope = internal.EnvelopeV2
+type Assessment = internal.PackageAssessment
+type Finding = internal.SkillFinding
 
 // Collect reads only recognized skill sources under the requested user/project
 // root. Call from a background collector, never from the tool evaluation path.
