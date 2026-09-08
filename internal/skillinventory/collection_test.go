@@ -38,7 +38,7 @@ func TestCollectionSourceSeparationAndPrivacy(t *testing.T) {
 	writeCollectionFile(t, filepath.Join(sessions, "account/org/local_test/transcripts/skills/hidden/SKILL.md"), "# must not enumerate")
 	writeCollectionFile(t, filepath.Join(home, ".claude/plugins/cache/vendor/plugin/1/skills/same/SKILL.md"), "# cached")
 	result := collectFixture(t, home)
-	if len(result.Observations) != 5 {
+	if len(observationsForSurface(result, "claude_code", "cowork")) != 5 {
 		t.Fatalf("expected five distinct observations, got %d", len(result.Observations))
 	}
 	sources := map[string]SourceV2{}
@@ -153,7 +153,7 @@ func TestCollectionMetadataRemainsAfterAssessmentBudget(t *testing.T) {
 	home := assessmentFixture(t, files)
 	writeCollectionFile(t, filepath.Join(home, ".claude/skills/first/oversized.txt"), strings.Repeat("a", (2<<20)+1))
 	result := collectFixture(t, home)
-	if len(result.Observations) != 2 || result.Sources[0].Status != "complete" {
+	if len(observationsForSurface(result, "claude_code")) != 2 || result.Sources[0].Status != "complete" {
 		t.Fatal("assessment failure lost later inventory")
 	}
 	if result.Observations[0].Assessment.Status != "partial" || result.Observations[0].Assessment.Risk == "low" || result.Observations[1].Assessment.Status != "complete" {
@@ -205,7 +205,7 @@ func TestCollectionCursorPreventsAssessmentStarvation(t *testing.T) {
 		writeCollectionFile(t, filepath.Join(home, fmt.Sprintf(".claude/skills/a-large/resources/%04d.txt", i)), "routine")
 	}
 	first := collectFixture(t, home)
-	if len(first.Observations) != 2 || first.Observations[1].Assessment.Status != "not_assessed" || first.NextAssessmentOffset != 1 {
+	if len(observationsForSurface(first, "claude_code")) != 2 || first.Observations[1].Assessment.Status != "not_assessed" || first.NextAssessmentOffset != 1 {
 		t.Fatalf("unexpected initial budget/cursor: %+v", first)
 	}
 	second, err := CollectV2FromCursor(context.Background(), ScanOptions{Home: home}, first.NextAssessmentOffset)
@@ -231,4 +231,22 @@ func TestCollectionKnownPathsDoNotEnumerateUnrelatedFiles(t *testing.T) {
 	if !visited || source.Status != "complete" || entries != 12000 {
 		t.Fatal("known path listed unrelated session files")
 	}
+}
+
+func observationsForSurface(result CollectionV2, surfaces ...string) []ObservationV2 {
+	roots := map[string]bool{}
+	for _, source := range result.Sources {
+		for _, surface := range surfaces {
+			if source.Surface == surface {
+				roots[source.RootID] = true
+			}
+		}
+	}
+	observations := []ObservationV2{}
+	for _, observation := range result.Observations {
+		if roots[observation.RootID] {
+			observations = append(observations, observation)
+		}
+	}
+	return observations
 }

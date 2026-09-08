@@ -21,7 +21,19 @@ func enumerateSource(ctx context.Context, dir *os.File, rel, pattern []string, r
 		visit(rel, dir)
 		return
 	}
-	if recursive && len(rel) >= 2 && rel[len(rel)-2] == "skills" {
+	if recursive && source.SourceClass == "persistent_standalone" && len(rel) > 0 {
+		file, err := openAssessmentChild(dir, "SKILL.md", false)
+		if err == nil {
+			file.Close()
+			visit(rel, dir)
+			return // Package resources are assessed, never inventoried as skills.
+		}
+		if !os.IsNotExist(err) {
+			markSource(source, "skill_file_unavailable")
+			return
+		}
+	}
+	if recursive && source.SourceClass != "persistent_standalone" && len(rel) >= 2 && rel[len(rel)-2] == "skills" {
 		visit(rel, dir)
 		return
 	}
