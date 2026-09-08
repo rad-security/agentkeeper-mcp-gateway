@@ -25,6 +25,13 @@ func Collect(ctx context.Context, opts ScanOptions, assessmentOffset int) (Colle
 	return internal.CollectV2FromCursor(ctx, opts, assessmentOffset)
 }
 
+// CollectWithAssessmentHints prioritizes new/changed metadata on selected
+// background passes. Alternate priority-applied passes with ordinary passes to
+// preserve rotation fairness. Persist returned hints locally, never as approvals.
+func CollectWithAssessmentHints(ctx context.Context, opts ScanOptions, assessmentOffset int, previous map[string]string, prioritize bool) (Collection, error) {
+	return internal.CollectV2WithAssessmentHints(ctx, opts, assessmentOffset, previous, prioritize)
+}
+
 // Probe returns a bounded metadata change hint for install/SKILL.md changes.
 // Resource-file content changes still require periodic full-package assessment.
 // A probe fingerprint is never suitable for approval or enforcement decisions.

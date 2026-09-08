@@ -95,3 +95,13 @@ authoritative inventory.
 This is a scheduling hint, not package identity or tamper-proof monitoring.
 Resource-only edits are found by periodic full-package assessment. No immediate
 resource-change or invocation-time enforcement guarantee is made by this probe.
+
+## Priority assessment for background native consumers
+
+`skillinventory.CollectWithAssessmentHints` accepts the saved assessment cursor, up to 1,000 opaque local hints, and an explicit priority-pass switch. New or changed SKILL.md metadata is assessed before unchanged candidates on a priority pass, within the existing shared file, byte, and time budgets. Scanner-version changes invalidate the hints. Resource-only changes still require periodic full collection.
+
+The result returns `AssessmentHints`, `PriorityApplied`, and `AssessmentPending` as local scheduling state. These fields are deliberately excluded from inventory envelopes. A hint records a stable bounded assessment attempt, including a partial assessment; it is neither a package digest, a safety verdict, nor an approval. Changed/unavailable/deadline reads remain eligible for retry. Unassessed changes keep their previous hint and cannot be mistaken for completed work.
+
+The ordinary cursor advances only across candidates actually visited at that cursor. If a large new package exhausts a priority pass, the normal cursor is preserved. Consumers must follow a priority-applied pass with an ordinary pass and retain state across restarts. Pending changes and the follow-up ordinary pass should use the existing bounded background catch-up cadence; completed work returns to periodic reconciliation. This API does not run on the tool invocation path and does not change the older Collect/Probe/Chunk contracts.
+
+Validation includes new and modified malicious skills behind an unchanged 1,000-file package, preservation of the normal cursor after a large priority package, pending-change retention, invalid/oversized hint rejection, transport exclusion, and the complete gateway race suite. Native scheduling, signed artifact publication, installed service behavior and end-to-end discovery latency require separate acceptance.
