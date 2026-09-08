@@ -35,6 +35,7 @@ func DefaultAssessmentLimits() AssessmentLimits {
 // PackageAssessment deliberately contains no file contents or matched secrets.
 // A digest describes bytes, never their safety. Partial assessment is not clean.
 type PackageAssessment struct {
+	SkillMDHash   string         `json:"-"` // copied to observation metadata, never a package identity
 	Version       string         `json:"version"`
 	Status        string         `json:"status"`        // complete, partial, failed
 	DigestStatus  string         `json:"digest_status"` // complete, incomplete
@@ -65,6 +66,12 @@ type manifestEntry struct {
 // It never follows package symlinks, executes code, imports modules or uses the
 // network. Call asynchronously from inventory work, never on a tool hot path.
 func AssessPackage(ctx context.Context, root string, limits AssessmentLimits) PackageAssessment {
+	return assessPackage(ctx, func() (*os.File, error) { return openAssessmentRoot(root) }, limits)
+}
+
+// opener must return an independently owned, freshly opened directory handle.
+// Collectors use this to keep traversal under the original source descriptor.
+func assessPackage(ctx context.Context, opener func() (*os.File, error), limits AssessmentLimits) PackageAssessment {
 	a := PackageAssessment{Version: AssessmentVersion, Status: "complete", DigestStatus: "complete", Risk: "unknown", Findings: []SkillFinding{}, Reasons: []string{}}
 	if limits.MaxFiles <= 0 || limits.MaxDepth < 0 || limits.MaxFileBytes <= 0 || limits.MaxTotalBytes <= 0 || limits.MaxFindings <= 0 || limits.Timeout <= 0 {
 		a.Status, a.DigestStatus = "failed", "incomplete"
@@ -85,7 +92,7 @@ func AssessPackage(ctx context.Context, root string, limits AssessmentLimits) Pa
 		}
 		a.Reasons = append(a.Reasons, reason)
 	}
-	dir, err := openAssessmentRoot(root)
+	dir, err := opener()
 	if err != nil {
 		a.Status, a.DigestStatus = "failed", "incomplete"
 		a.Reasons = append(a.Reasons, "root_unavailable_or_unsupported")
@@ -197,6 +204,9 @@ func AssessPackage(ctx context.Context, root string, limits AssessmentLimits) Pa
 				a.FilesScanned++
 				a.BytesScanned += int64(len(data))
 				hash := sha256.Sum256(data)
+				if rel == "SKILL.md" {
+					a.SkillMDHash = hex.EncodeToString(hash[:])
+				}
 				manifest = append(manifest, manifestEntry{rel, int64(len(data)), info.Mode()&0111 != 0, hex.EncodeToString(hash[:])})
 				if !utf8.Valid(data) || strings.IndexByte(string(data), 0) >= 0 {
 					mark("binary_content_unassessed", false)
