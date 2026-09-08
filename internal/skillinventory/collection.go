@@ -34,14 +34,18 @@ type ObservationV2 struct {
 	Assessment  PackageAssessment `json:"assessment"`
 }
 type CollectionV2 struct {
-	MetadataProbe        bool            `json:"metadata_probe"`
-	ChangeFingerprint    string          `json:"change_fingerprint"`
-	MetadataComplete     bool            `json:"metadata_complete"`
-	NextAssessmentOffset int             `json:"next_assessment_offset"`
-	StartedAt            string          `json:"started_at"`
-	CompletedAt          string          `json:"completed_at"`
-	Sources              []SourceV2      `json:"sources"`
-	Observations         []ObservationV2 `json:"observations"`
+	// Local scheduling hints only. ChunkCollection deliberately excludes these.
+	AssessmentHints      map[string]string `json:"assessment_hints,omitempty"`
+	PriorityApplied      bool              `json:"priority_applied,omitempty"`
+	AssessmentPending    bool              `json:"assessment_pending,omitempty"`
+	MetadataProbe        bool              `json:"metadata_probe"`
+	ChangeFingerprint    string            `json:"change_fingerprint"`
+	MetadataComplete     bool              `json:"metadata_complete"`
+	NextAssessmentOffset int               `json:"next_assessment_offset"`
+	StartedAt            string            `json:"started_at"`
+	CompletedAt          string            `json:"completed_at"`
+	Sources              []SourceV2        `json:"sources"`
+	Observations         []ObservationV2   `json:"observations"`
 }
 
 type sourceSpec struct {
@@ -73,7 +77,7 @@ func CollectV2(ctx context.Context, opts ScanOptions) (CollectionV2, error) {
 // Coordinators retain NextAssessmentOffset between passes so a bounded scan
 // eventually assesses every observed package instead of starving later sources.
 func CollectV2FromCursor(ctx context.Context, opts ScanOptions, assessmentOffset int) (CollectionV2, error) {
-	return collectV2(ctx, opts, assessmentOffset, false)
+	return collectV2(ctx, opts, assessmentOffset, false, nil)
 }
 
 // ProbeV2 reads source manifests and filesystem metadata, never skill bodies.
@@ -81,10 +85,10 @@ func CollectV2FromCursor(ctx context.Context, opts ScanOptions, assessmentOffset
 func ProbeV2(ctx context.Context, opts ScanOptions) (CollectionV2, error) {
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
-	return collectV2(ctx, opts, 0, true)
+	return collectV2(ctx, opts, 0, true, nil)
 }
 
-func collectV2(ctx context.Context, opts ScanOptions, assessmentOffset int, metadataOnly bool) (CollectionV2, error) {
+func collectV2(ctx context.Context, opts ScanOptions, assessmentOffset int, metadataOnly bool, plan *assessmentPlan) (CollectionV2, error) {
 	home := opts.Home
 	if home == "" {
 		var err error
@@ -242,8 +246,19 @@ func collectV2(ctx context.Context, opts ScanOptions, assessmentOffset int, meta
 		assessmentOffset %= len(candidates)
 		result.NextAssessmentOffset = assessmentOffset
 	}
-	for step := range candidates {
-		index := (assessmentOffset + step) % len(candidates)
+	order, keys, hints, priority := assessmentOrder(result.Sources, candidates, assessmentOffset, plan)
+	observations := make([]ObservationV2, len(candidates))
+	visited := make([]bool, len(candidates))
+	advanced := 0
+	if plan != nil {
+		result.AssessmentHints = make(map[string]string)
+		for _, key := range keys {
+			if previous := plan.previous[key]; previous != "" {
+				result.AssessmentHints[key] = previous
+			}
+		}
+	}
+	for _, index := range order {
 		candidate := candidates[index]
 		handle := handles[candidate.source]
 		rel := candidate.rel
@@ -259,7 +274,11 @@ func collectV2(ctx context.Context, opts ScanOptions, assessmentOffset int, meta
 			observation.Assessment = notAssessed("metadata_probe")
 		}
 		if !metadataOnly && ctx.Err() == nil && remaining.MaxFiles > 0 && remaining.MaxTotalBytes > 0 {
-			result.NextAssessmentOffset = (index + 1) % len(candidates)
+			visited[index] = true
+			for advanced < len(candidates) && visited[result.NextAssessmentOffset] {
+				result.NextAssessmentOffset = (result.NextAssessmentOffset + 1) % len(candidates)
+				advanced++
+			}
 			opener := func() (*os.File, error) { return openCandidate(handle.root, candidate) }
 			if handle.spec.class == "session_upload" {
 				observation.Assessment, observation.SkillMDHash = assessUploadedSkill(ctx, opener, remaining)
@@ -269,42 +288,39 @@ func collectV2(ctx context.Context, opts ScanOptions, assessmentOffset int, meta
 			}
 			remaining.MaxFiles -= observation.Assessment.FilesScanned
 			remaining.MaxTotalBytes -= observation.Assessment.BytesScanned
+			if plan != nil {
+				result.PriorityApplied = result.PriorityApplied || priority[index]
+				if stableAssessmentAttempt(observation.Assessment) {
+					result.AssessmentHints[keys[index]] = hints[index]
+				}
+			}
 		}
-		result.Observations = append(result.Observations, observation)
+		observations[index] = observation
+	}
+	// Keep observation order compatible with ordinary cursor-based collection.
+	for step := range candidates {
+		result.Observations = append(result.Observations, observations[(assessmentOffset+step)%len(candidates)])
+	}
+	if plan != nil {
+		for index, key := range keys {
+			if result.AssessmentHints[key] != hints[index] {
+				result.AssessmentPending = true
+				break
+			}
+		}
 	}
 	result.CompletedAt = time.Now().UTC().Format(time.RFC3339Nano)
 	return result, nil
 }
 
 func metadataFingerprint(sources []SourceV2, candidates []packageCandidate) string {
-	type entry struct {
-		Root     string
-		Location string
-		Plugin   string
-		Size     int64
-		Mode     uint32
-		Modified int64
-		Identity map[string]json.RawMessage
-	}
-	entries := make([]entry, 0, len(candidates))
+	entries := make([]metadataEntry, 0, len(candidates))
 	for _, candidate := range candidates {
-		// Exclude access time: assessing a file must not trigger a rescan loop.
-		// Inode and change time distinguish atomic replacements and ordinary
-		// writes that restore mtime. This remains a hint, never byte attestation.
-		raw, _ := json.Marshal(candidate.skillInfo.Sys())
-		var stat map[string]json.RawMessage
-		_ = json.Unmarshal(raw, &stat)
-		identity := map[string]json.RawMessage{}
-		for _, key := range []string{"Dev", "Ino", "Ctim", "Ctimespec", "Ctime", "Ctimensec"} {
-			if value, ok := stat[key]; ok {
-				identity[key] = value
-			}
-		}
-		entries = append(entries, entry{sources[candidate.source].RootID, opaqueID(strings.Join(candidate.rel, "/")), candidate.pluginID, candidate.skillInfo.Size(), uint32(candidate.skillInfo.Mode()), candidate.skillInfo.ModTime().UnixNano(), identity})
+		entries = append(entries, candidateMetadata(sources, candidate))
 	}
 	encoded, _ := json.Marshal(struct {
 		Sources []SourceV2
-		Entries []entry
+		Entries []metadataEntry
 	}{sources, entries})
 	return opaqueID(string(encoded))
 }
