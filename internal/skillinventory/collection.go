@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-const CollectorVersion = "skill-sources-v1"
+const CollectorVersion = "skill-sources-v2"
 
 type SourceV2 struct {
 	RootID      string   `json:"root_id"`
@@ -355,10 +355,11 @@ func collectionSources(home, cwd string) []sourceSpec {
 	}
 	app := coworkAppSupportDir(home)
 	sessions := filepath.Join(app, "local-agent-mode-sessions")
-	return append(specs,
+	specs = append(specs,
 		sourceSpec{filepath.Join(sessions, "skills-plugin"), "cowork", "persistent_plugin", "present", nil, true},
 		sourceSpec{sessions, "cowork", "session_copy", "session", [][]string{{"*", "*", "local_*", ".claude", "skills", "*"}}, false},
 		sourceSpec{sessions, "cowork", "session_upload", "session", [][]string{{"*", "*", "local_*", "uploads"}}, false},
 		sourceSpec{app, "cowork", "account_only", "present", nil, false},
 	)
+	return append(specs, crossAgentSources(home, cwd)...)
 }

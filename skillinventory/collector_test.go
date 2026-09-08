@@ -30,7 +30,7 @@ func TestNativeConsumerCanCollectAndChunkWithoutCommandInitialization(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(chunks) != 1 || len(chunks[0].Observations) != 1 || chunks[0].Observations[0].Assessment.Status != "complete" {
+	if len(chunks) != 1 || len(chunks[0].Observations) != 3 || chunks[0].Observations[0].Assessment.Status != "complete" {
 		t.Fatal("collector adapter lost package evidence")
 	}
 }
