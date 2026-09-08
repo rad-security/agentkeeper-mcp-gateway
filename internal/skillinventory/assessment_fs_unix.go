@@ -73,3 +73,12 @@ func openAssessmentChild(parent *os.File, name string, directory bool) (*os.File
 	}
 	return f, nil
 }
+
+func reopenAssessmentDir(parent *os.File) (*os.File, error) {
+	// dup would share ReadDir offsets; openat creates a fresh file description.
+	fd, err := unix.Openat(int(parent.Fd()), ".", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, err
+	}
+	return os.NewFile(uintptr(fd), parent.Name()), nil
+}
