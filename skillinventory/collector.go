@@ -25,6 +25,13 @@ func Collect(ctx context.Context, opts ScanOptions, assessmentOffset int) (Colle
 	return internal.CollectV2FromCursor(ctx, opts, assessmentOffset)
 }
 
+// Probe returns a bounded metadata change hint for install/SKILL.md changes.
+// Resource-file content changes still require periodic full-package assessment.
+// A probe fingerprint is never suitable for approval or enforcement decisions.
+func Probe(ctx context.Context, opts ScanOptions) (Collection, error) {
+	return internal.ProbeV2(ctx, opts)
+}
+
 // Chunk preserves all observations while respecting the server's byte/record
 // limits. The caller owns durable epoch/sequence, replay and acknowledgements.
 func Chunk(collection Collection, epoch string, sequence int64, scanID string) ([]Envelope, error) {

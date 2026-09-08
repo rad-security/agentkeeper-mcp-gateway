@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -33,6 +34,9 @@ type ObservationV2 struct {
 	Assessment  PackageAssessment `json:"assessment"`
 }
 type CollectionV2 struct {
+	MetadataProbe        bool            `json:"metadata_probe"`
+	ChangeFingerprint    string          `json:"change_fingerprint"`
+	MetadataComplete     bool            `json:"metadata_complete"`
 	NextAssessmentOffset int             `json:"next_assessment_offset"`
 	StartedAt            string          `json:"started_at"`
 	CompletedAt          string          `json:"completed_at"`
@@ -51,10 +55,11 @@ type sourceHandle struct {
 	result *SourceV2
 }
 type packageCandidate struct {
-	source   int
-	rel      []string
-	info     os.FileInfo
-	pluginID string
+	source    int
+	rel       []string
+	info      os.FileInfo
+	pluginID  string
+	skillInfo os.FileInfo
 }
 
 // CollectV2 enumerates only recognized skill locations. It never reads chat
@@ -68,6 +73,18 @@ func CollectV2(ctx context.Context, opts ScanOptions) (CollectionV2, error) {
 // Coordinators retain NextAssessmentOffset between passes so a bounded scan
 // eventually assesses every observed package instead of starving later sources.
 func CollectV2FromCursor(ctx context.Context, opts ScanOptions, assessmentOffset int) (CollectionV2, error) {
+	return collectV2(ctx, opts, assessmentOffset, false)
+}
+
+// ProbeV2 reads source manifests and filesystem metadata, never skill bodies.
+// It is a change hint for scheduling, not content identity or a safety verdict.
+func ProbeV2(ctx context.Context, opts ScanOptions) (CollectionV2, error) {
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	return collectV2(ctx, opts, 0, true)
+}
+
+func collectV2(ctx context.Context, opts ScanOptions, assessmentOffset int, metadataOnly bool) (CollectionV2, error) {
 	home := opts.Home
 	if home == "" {
 		var err error
@@ -78,7 +95,7 @@ func CollectV2FromCursor(ctx context.Context, opts ScanOptions, assessmentOffset
 	}
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	result := CollectionV2{StartedAt: time.Now().UTC().Format(time.RFC3339Nano), Sources: []SourceV2{}, Observations: []ObservationV2{}}
+	result := CollectionV2{MetadataProbe: metadataOnly, StartedAt: time.Now().UTC().Format(time.RFC3339Nano), Sources: []SourceV2{}, Observations: []ObservationV2{}}
 	specs := collectionSources(home, opts.CWD)
 	unique := map[string]bool{}
 	deduplicated := []sourceSpec{}
@@ -165,7 +182,12 @@ func CollectV2FromCursor(ctx context.Context, opts ScanOptions, assessmentOffset
 				markSource(source, "skill_file_unavailable")
 				return
 			}
+			skillInfo, statErr := file.Stat()
 			file.Close()
+			if statErr != nil {
+				markSource(source, "skill_file_unavailable")
+				return
+			}
 			info, err := dir.Stat()
 			if err != nil {
 				markSource(source, "directory_unavailable")
@@ -175,7 +197,7 @@ func CollectV2FromCursor(ctx context.Context, opts ScanOptions, assessmentOffset
 			if len(rel) >= 2 {
 				pluginID = plugins[strings.Join(rel[:len(rel)-2], "/")]
 			}
-			candidates = append(candidates, packageCandidate{i, append([]string{}, rel...), info, pluginID})
+			candidates = append(candidates, packageCandidate{i, append([]string{}, rel...), info, pluginID, skillInfo})
 		}
 		if spec.recursive {
 			enumerateSource(ctx, root, nil, nil, true, source, &entries, visit)
@@ -199,6 +221,20 @@ func CollectV2FromCursor(ctx context.Context, opts ScanOptions, assessmentOffset
 		return strings.Join(candidates[i].rel, "/") < strings.Join(candidates[j].rel, "/")
 	})
 	remaining := DefaultAssessmentLimits()
+	for i := range result.Sources {
+		sort.Strings(result.Sources[i].Reasons)
+	}
+	result.MetadataComplete = ctx.Err() == nil
+	for _, source := range result.Sources {
+		for _, reason := range source.Reasons {
+			if reason == "entry_limit" || reason == "observation_limit" || reason == "scan_deadline" || reason == "depth_limit" {
+				result.MetadataComplete = false
+			}
+		}
+	}
+	if result.MetadataComplete {
+		result.ChangeFingerprint = metadataFingerprint(result.Sources, candidates)
+	}
 	if assessmentOffset < 0 {
 		assessmentOffset = 0
 	}
@@ -219,7 +255,10 @@ func CollectV2FromCursor(ctx context.Context, opts ScanOptions, assessmentOffset
 		if handle.spec.class == "session_upload" {
 			observation.SkillName = "Uploaded skill"
 		}
-		if ctx.Err() == nil && remaining.MaxFiles > 0 && remaining.MaxTotalBytes > 0 {
+		if metadataOnly {
+			observation.Assessment = notAssessed("metadata_probe")
+		}
+		if !metadataOnly && ctx.Err() == nil && remaining.MaxFiles > 0 && remaining.MaxTotalBytes > 0 {
 			result.NextAssessmentOffset = (index + 1) % len(candidates)
 			opener := func() (*os.File, error) { return openCandidate(handle.root, candidate) }
 			if handle.spec.class == "session_upload" {
@@ -235,6 +274,39 @@ func CollectV2FromCursor(ctx context.Context, opts ScanOptions, assessmentOffset
 	}
 	result.CompletedAt = time.Now().UTC().Format(time.RFC3339Nano)
 	return result, nil
+}
+
+func metadataFingerprint(sources []SourceV2, candidates []packageCandidate) string {
+	type entry struct {
+		Root     string
+		Location string
+		Plugin   string
+		Size     int64
+		Mode     uint32
+		Modified int64
+		Identity map[string]json.RawMessage
+	}
+	entries := make([]entry, 0, len(candidates))
+	for _, candidate := range candidates {
+		// Exclude access time: assessing a file must not trigger a rescan loop.
+		// Inode and change time distinguish atomic replacements and ordinary
+		// writes that restore mtime. This remains a hint, never byte attestation.
+		raw, _ := json.Marshal(candidate.skillInfo.Sys())
+		var stat map[string]json.RawMessage
+		_ = json.Unmarshal(raw, &stat)
+		identity := map[string]json.RawMessage{}
+		for _, key := range []string{"Dev", "Ino", "Ctim", "Ctimespec", "Ctime", "Ctimensec"} {
+			if value, ok := stat[key]; ok {
+				identity[key] = value
+			}
+		}
+		entries = append(entries, entry{sources[candidate.source].RootID, opaqueID(strings.Join(candidate.rel, "/")), candidate.pluginID, candidate.skillInfo.Size(), uint32(candidate.skillInfo.Mode()), candidate.skillInfo.ModTime().UnixNano(), identity})
+	}
+	encoded, _ := json.Marshal(struct {
+		Sources []SourceV2
+		Entries []entry
+	}{sources, entries})
+	return opaqueID(string(encoded))
 }
 
 func opaqueID(parts ...string) string {

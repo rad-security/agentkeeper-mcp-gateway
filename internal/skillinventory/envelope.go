@@ -30,6 +30,9 @@ var inventoryUUID = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-
 // records and encoded bytes, and never drops observations to fit transport.
 // Epoch/sequence are supplied by the durable coordinator, not wall clock time.
 func ChunkCollection(collection CollectionV2, epoch string, sequence int64, scanID string) ([]EnvelopeV2, error) {
+	if collection.MetadataProbe {
+		return nil, fmt.Errorf("metadata probe cannot be uploaded as inventory")
+	}
 	if !inventoryUUID.MatchString(epoch) || !inventoryUUID.MatchString(scanID) || sequence < 1 || sequence > 9007199254740991 {
 		return nil, fmt.Errorf("invalid scan identity")
 	}
