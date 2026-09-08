@@ -12,6 +12,7 @@ func newCollectSkillInventoryCommand() *cobra.Command {
 	var cwd string
 	var offset int
 	var wirePreview bool
+	var metadataOnly bool
 	command := &cobra.Command{
 		Use:   "collect-skill-inventory",
 		Short: "Inspect versioned skill inventory locally without uploading content",
@@ -20,7 +21,16 @@ func newCollectSkillInventoryCommand() *cobra.Command {
 			if offset < 0 {
 				return fmt.Errorf("assessment offset must not be negative")
 			}
-			result, err := skillinventory.CollectV2FromCursor(cmd.Context(), skillinventory.ScanOptions{CWD: cwd}, offset)
+			if metadataOnly && wirePreview {
+				return fmt.Errorf("metadata probes are local scheduling hints, not wire reports")
+			}
+			var result skillinventory.CollectionV2
+			var err error
+			if metadataOnly {
+				result, err = skillinventory.ProbeV2(cmd.Context(), skillinventory.ScanOptions{CWD: cwd})
+			} else {
+				result, err = skillinventory.CollectV2FromCursor(cmd.Context(), skillinventory.ScanOptions{CWD: cwd}, offset)
+			}
 			if err != nil {
 				return err
 			}
@@ -56,6 +66,7 @@ func newCollectSkillInventoryCommand() *cobra.Command {
 	command.Flags().StringVar(&cwd, "cwd", "", "Explicit project directory to include alongside user and Cowork sources")
 	command.Flags().IntVar(&offset, "assessment-offset", 0, "Resume bounded package assessment at this local cursor")
 	command.Flags().BoolVar(&wirePreview, "wire-preview", false, "Emit metadata-only wire chunks with ephemeral scan IDs; never uploads or advances durable collector state")
+	command.Flags().BoolVar(&metadataOnly, "metadata-only", false, "Probe source and SKILL.md metadata without reading skill bodies; local scheduling hint only")
 	return command
 }
 

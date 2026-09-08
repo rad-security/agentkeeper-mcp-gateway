@@ -80,3 +80,18 @@ state, acknowledgement recovery, UI projections, notifications, approved-version
 grants, or blocking. Those need the native coordinator, server feature gate and
 end-to-end proof described in the product PRD. Symlink-based sources and
 unrecognized layouts remain explicit coverage gaps, not certified support.
+
+## Rapid change hints
+
+`collect-skill-inventory --metadata-only` and the public `Probe` function enumerate
+recognized locations with a two-second context budget. They read bounded plugin
+manifests and SKILL.md filesystem metadata, never skill bodies. A stable opaque
+fingerprint lets the native coordinator debounce installs and SKILL.md changes
+without opening thousands of persistent filesystem watches. Atime is excluded
+so assessment reads do not trigger an endless scan loop. Incomplete enumeration
+cannot emit a usable fingerprint. Probe results cannot be chunked or uploaded as
+authoritative inventory.
+
+This is a scheduling hint, not package identity or tamper-proof monitoring.
+Resource-only edits are found by periodic full-package assessment. No immediate
+resource-change or invocation-time enforcement guarantee is made by this probe.
