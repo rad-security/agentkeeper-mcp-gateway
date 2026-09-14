@@ -42,7 +42,7 @@ jobs:
           git merge-base --is-ancestor HEAD origin/main
           go test -race -timeout 5m ./...
           go build -trimpath -o "${RUNNER_TEMP}/agentkeeper-mcp-gateway-linux-amd64" .
-          capabilities="$(${RUNNER_TEMP}/agentkeeper-mcp-gateway-linux-amd64 enterprise-capabilities --json)"
+          capabilities="$("${RUNNER_TEMP}/agentkeeper-mcp-gateway-linux-amd64" enterprise-capabilities --json)"
           jq -e '
             .schema_version == 1 and
             .runtime_socket_auth.supported == true and
@@ -55,20 +55,28 @@ jobs:
             .managed_routing.remove_managed_flag == "--remove-managed-routing" and
             .inventory.dry_run == true
           ' <<<"${capabilities}"
+      - name: Record the existing stable release channel
+        id: stable-channel
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          stable_tag="$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq .tag_name)"
+          test -n "${stable_tag}"
+          printf 'tag=%s\n' "${stable_tag}" >> "${GITHUB_OUTPUT}"
       - uses: goreleaser/goreleaser-action@v6
         with:
           version: "~> v2"
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - name: Preserve the legacy latest channel for existing installations
+      - name: Verify the existing stable release channel is unchanged
         env:
           GH_TOKEN: ${{ github.token }}
-          LEGACY_LATEST_TAG: v0.1.21
+          STABLE_TAG: ${{ steps.stable-channel.outputs.tag }}
         run: |
           set -euo pipefail
-          release_id="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${LEGACY_LATEST_TAG}" --jq .id)"
-          gh api --method PATCH \
-            "repos/${GITHUB_REPOSITORY}/releases/${release_id}" \
-            -f make_latest=true >/dev/null
-          test "$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq .tag_name)" = "${LEGACY_LATEST_TAG}"
+          # GoReleaser uses make_latest: false. A validation release must never
+          # move the customer channel, including resetting it to a historic tag.
+          # Fail visibly on concurrent channel changes; do not overwrite them.
+          test "$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq .tag_name)" = "${STABLE_TAG}"
