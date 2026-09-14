@@ -43,12 +43,13 @@ const GatewayServerName = "agentkeeper-mcp-gateway"
 // map. It is a superset — stdio servers use Command/Args/Env; HTTP/SSE-style
 // servers use Type/URL/Headers. We round-trip whatever we find.
 type ServerEntry struct {
-	Command string            `json:"command,omitempty"`
-	Args    []string          `json:"args,omitempty"`
-	Env     map[string]string `json:"env,omitempty"`
-	Type    string            `json:"type,omitempty"`
-	URL     string            `json:"url,omitempty"`
-	Headers map[string]string `json:"headers,omitempty"`
+	Extra   map[string]json.RawMessage `json:"-"`
+	Command string                     `json:"command,omitempty"`
+	Args    []string                   `json:"args,omitempty"`
+	Env     map[string]string          `json:"env,omitempty"`
+	Type    string                     `json:"type,omitempty"`
+	URL     string                     `json:"url,omitempty"`
+	Headers map[string]string          `json:"headers,omitempty"`
 }
 
 // NamedServer pairs an entry with the key it lived under in the IDE config.
@@ -234,7 +235,7 @@ func (a *Adapter) Plan() (Plan, error) {
 		if name == GatewayServerName || isGatewayCommandEntry(entry) {
 			continue
 		}
-		if nativeauth.RequiresNativeClientAuth(entry.Type, entry.URL, entry.Headers) {
+		if len(entry.Extra) > 0 || nativeauth.RequiresNativeClientAuth(entry.Type, entry.URL, entry.Headers) {
 			p.NativeKept = append(p.NativeKept, NamedServer{Name: name, Entry: entry})
 			continue
 		}

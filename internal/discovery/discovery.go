@@ -36,6 +36,7 @@ const (
 	RouteabilityCoworkRemoteMCP       = "cowork_remote_mcp_routable"
 	RouteabilityRemoteNotLocal        = "cowork_remote_connector_not_local_routable"
 	RouteabilityNativeClientAuth      = "native_client_auth_required"
+	RouteabilityNativeClientFeatures  = "native_client_features_required"
 	RouteabilityUnknownRequiresReview = "cowork_unknown_requires_review"
 )
 
@@ -472,7 +473,7 @@ func MigrateClaudeJSONProjects(dryRun bool) (MigrationPlan, error) {
 				}
 				continue
 			}
-			if s.Routeability == RouteabilityNativeClientAuth {
+			if s.Routeability == RouteabilityNativeClientAuth || s.Routeability == RouteabilityNativeClientFeatures {
 				preserveByProject[project] = append(preserveByProject[project], s)
 				plan.NativeKept = append(plan.NativeKept, s)
 				continue
@@ -945,7 +946,7 @@ func migrateMCPFile(path, client, scope, sourceKind, routeability string, dryRun
 			}
 			continue
 		}
-		if s.Routeability == RouteabilityNativeClientAuth {
+		if s.Routeability == RouteabilityNativeClientAuth || s.Routeability == RouteabilityNativeClientFeatures {
 			nativeKept = append(nativeKept, s)
 			continue
 		}
@@ -1283,6 +1284,12 @@ func routeabilityForEntry(entry config.ServerEntry, defaultRouteability string) 
 	if defaultRouteability == RouteabilityRemoteNotLocal {
 		return defaultRouteability, false
 	}
+	if nativeauth.RequiresNativeClientAuth(entry.Transport, entry.URL, entry.Headers) {
+		return RouteabilityNativeClientAuth, false
+	}
+	if len(entry.Extra) > 0 || entry.Type != "" && entry.Type != "http" && entry.Type != "stdio" {
+		return RouteabilityNativeClientFeatures, false
+	}
 	switch normalizeTransport(entry) {
 	case "http":
 		if strings.TrimSpace(entry.URL) == "" {
@@ -1322,7 +1329,7 @@ func allRoutedOrNativeKept(servers []DiscoveredServer) bool {
 		return false
 	}
 	for _, s := range servers {
-		if s.RouteState == RouteRouted || s.Routeability == RouteabilityNativeClientAuth {
+		if s.RouteState == RouteRouted || (s.Routeability == RouteabilityNativeClientAuth || s.Routeability == RouteabilityNativeClientFeatures) {
 			continue
 		}
 		return false

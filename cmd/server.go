@@ -37,11 +37,18 @@ are blocked.`,
 		enforce, _ := cmd.Flags().GetBool("enforce")
 		verbose, _ := cmd.Root().PersistentFlags().GetBool("verbose")
 
-		// Load config
+		// An explicitly selected configuration is authoritative. Refuse a
+		// missing/unreadable/malformed selection before any startup mutations;
+		// serving an empty default inventory would misleadingly appear healthy.
+		selectedConfig := config.CurrentConfigPath()
+		if configPath != "" || os.Getenv("AGENTKEEPER_CONFIG") != "" {
+			if _, err := os.Stat(selectedConfig); err != nil {
+				return fmt.Errorf("cannot start MCP Gateway: reading selected configuration %q: %w", selectedConfig, err)
+			}
+		}
 		cfg, err := config.Load()
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "[agentkeeper] warning: config load error: %v, using defaults\n", err)
-			cfg = config.DefaultConfig()
+			return fmt.Errorf("cannot start MCP Gateway: loading configuration %q: %w", selectedConfig, err)
 		}
 
 		if enforce {
@@ -93,29 +100,32 @@ are blocked.`,
 			receiptRoot = filepath.Join(filepath.Dir(cfg.LogPath), "receipts-v2")
 		}
 		receiptStore, receiptErr := receipt.NewStore(receiptRoot, version)
+		if receiptStore != nil {
+			receiptStore.ConfigureQueueLimits(cfg.EventQueueMaxEvents, cfg.EventQueueMaxBytes)
+		}
 		if receiptErr != nil {
 			logger.Warn("signed application receipts unavailable: %v", receiptErr)
 		}
+		// Offline mode authority is independent of current credentials. Losing
+		// authentication or receipt storage must not reset established Enforce.
+		authorityClient := tc
+		if authorityClient == nil {
+			authorityClient = telemetry.NewClient("", "", logger)
+		}
+		authorityClient.SetMode(cfg.Mode)
+		authorityClient.SetVersion(version)
+		authorityClient.SetRouteContext(os.Getenv(gatewayentry.EnvClientName), os.Getenv(gatewayentry.EnvConfigSourceHash), os.Getenv(gatewayentry.EnvRouteRevision))
+		authorityClient.SetReceiptStore(receiptStore)
+		policyCachePath := filepath.Join(filepath.Dir(receiptRoot), "policy-cache-v1.json")
+		if err := authorityClient.SetPolicyCache(policyCachePath); err != nil {
+			logger.Warn("last-known-good policy unavailable: %v", err)
+		}
+		if restoredMode, _ := authorityClient.EffectiveMode(); restoredMode == "enforce" {
+			cfg.Mode = "enforce"
+		} else {
+			cfg.Mode = "audit"
+		}
 		if tc != nil {
-			tc.SetMode(cfg.Mode)
-			tc.SetVersion(version)
-			tc.SetRouteContext(
-				os.Getenv(gatewayentry.EnvClientName),
-				os.Getenv(gatewayentry.EnvConfigSourceHash),
-				os.Getenv(gatewayentry.EnvRouteRevision),
-			)
-			if receiptStore != nil {
-				tc.SetReceiptStore(receiptStore)
-				policyCachePath := filepath.Join(filepath.Dir(receiptRoot), "policy-cache-v1.json")
-				if err := tc.SetPolicyCache(policyCachePath); err != nil {
-					logger.Warn("last-known-good policy unavailable: %v", err)
-				}
-				if restoredMode, _ := tc.EffectiveMode(); restoredMode == "enforce" {
-					cfg.Mode = "enforce"
-				} else {
-					cfg.Mode = "audit"
-				}
-			}
 
 			// Build server info for registration
 			tc.SetServers(telemetryServerInfosFromConfig(cfg))
@@ -182,7 +192,7 @@ are blocked.`,
 			ClientName:           os.Getenv(gatewayentry.EnvClientName),
 			ConfigSourceHash:     os.Getenv(gatewayentry.EnvConfigSourceHash),
 			RouteRevision:        os.Getenv(gatewayentry.EnvRouteRevision),
-		}, mgr, tc)
+		}, mgr, authorityClient)
 		dashboardConnected := false
 		if tc != nil {
 			tc.SetModeChangeHandler(func(mode string, _ int64) {
@@ -190,6 +200,9 @@ are blocked.`,
 			})
 			dashboardConnected = tc.Start()
 			defer tc.Stop()
+		}
+		if !authorityClient.ModeAuthorityReady() {
+			return fmt.Errorf("%w: reconnect this route for an acknowledged mode assignment; existing customer configuration was preserved", telemetry.ErrModeAuthorityUnavailable)
 		}
 
 		// Report the mode after the synchronous startup sync. This keeps the

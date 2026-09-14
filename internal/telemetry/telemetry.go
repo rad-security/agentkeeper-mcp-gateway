@@ -81,38 +81,40 @@ type EvaluateResult struct {
 
 // Client handles batch event upload and gateway registration with the AgentKeeper API.
 type Client struct {
-	apiURL           string
-	apiKey           string
-	runtimeSocket    string
-	hostname         string
-	machineID        string
-	mode             string
-	modeRevision     int64
-	modeMu           sync.RWMutex
-	modeChange       func(mode string, revision int64)
-	gatewayVersion   string
-	servers          []ServerInfo
-	discovered       []DiscoveredServerInfo
-	discover         func() []DiscoveredServerInfo
-	gatewayID        string
-	logger           *logging.Logger
-	done             chan struct{}
-	cachedPolicy     SyncPolicy
-	policyMu         sync.RWMutex
-	receiptStore     *receipt.Store
-	clientName       string
-	configSourceHash string
-	routeRevision    string
-	policyCachePath  string
-	policyStatePath  string
-	policyCacheTTL   time.Duration
-	policySyncedAt   time.Time
-	policyExpiresAt  time.Time
-	policyValid      bool
-	policyCacheBad   bool
-	policyStateValid bool
-	policyCacheMu    sync.Mutex
-	now              func() time.Time
+	apiURL                   string
+	apiKey                   string
+	runtimeSocket            string
+	hostname                 string
+	machineID                string
+	mode                     string
+	modeRevision             int64
+	startupEnforce           bool
+	modeAuthorityUnavailable bool
+	modeMu                   sync.RWMutex
+	modeChange               func(mode string, revision int64)
+	gatewayVersion           string
+	servers                  []ServerInfo
+	discovered               []DiscoveredServerInfo
+	discover                 func() []DiscoveredServerInfo
+	gatewayID                string
+	logger                   *logging.Logger
+	done                     chan struct{}
+	cachedPolicy             SyncPolicy
+	policyMu                 sync.RWMutex
+	receiptStore             *receipt.Store
+	clientName               string
+	configSourceHash         string
+	routeRevision            string
+	policyCachePath          string
+	policyStatePath          string
+	policyCacheTTL           time.Duration
+	policySyncedAt           time.Time
+	policyExpiresAt          time.Time
+	policyValid              bool
+	policyCacheBad           bool
+	policyStateValid         bool
+	policyCacheMu            sync.Mutex
+	now                      func() time.Time
 }
 
 // NewRuntimeClient uses the local machine broker for all connected telemetry.
@@ -152,6 +154,7 @@ func (c *Client) SetMode(mode string) {
 	c.modeMu.Lock()
 	defer c.modeMu.Unlock()
 	c.mode = mode
+	c.startupEnforce = strings.EqualFold(mode, "enforce")
 }
 
 // SetModeChangeHandler applies a control-plane assignment to the live proxy.
@@ -186,6 +189,21 @@ func (c *Client) applyAssignedMode(mode string, revision int64) {
 		return
 	}
 	c.modeMu.Lock()
+	// An already acknowledged revision is authoritative. A delayed response
+	// must not roll a route back, and one revision cannot name two modes.
+	if revision <= c.modeRevision {
+		c.modeMu.Unlock()
+		return
+	}
+	// Persist the new authority before acknowledging/applying it. A failed
+	// write keeps the prior verified mode and revision, allowing a later retry.
+	if err := c.persistPolicyStateValues(mode, revision); err != nil {
+		c.modeMu.Unlock()
+		if c.logger != nil {
+			c.logger.Warn("could not persist assigned Gateway authority: %v", err)
+		}
+		return
+	}
 	handler := c.modeChange
 	if mode == "observe" {
 		c.mode = "audit"
@@ -193,6 +211,7 @@ func (c *Client) applyAssignedMode(mode string, revision int64) {
 		c.mode = "enforce"
 	}
 	c.modeRevision = revision
+	c.modeAuthorityUnavailable = false
 	c.modeMu.Unlock()
 	if handler != nil {
 		handler(mode, revision)
@@ -232,15 +251,15 @@ func (c *Client) SetPolicyCache(path string) error {
 	if c.policyCachePath == "" {
 		return nil
 	}
-	if c.receiptStore == nil {
-		return fmt.Errorf("policy cache requires the durable receipt signer")
-	}
 	c.policyCachePath = c.scopedPolicyCachePath(c.policyCachePath)
 	c.policyStatePath = c.policyCachePath + ".state"
-	if err := c.loadPolicyState(); err != nil {
-		return err
+	if c.receiptStore == nil {
+		c.modeMu.Lock()
+		c.modeAuthorityUnavailable = !c.startupEnforce
+		c.modeMu.Unlock()
+		return fmt.Errorf("%w: policy cache requires the durable receipt signer", ErrModeAuthorityUnavailable)
 	}
-	return c.loadPolicyCache()
+	return c.restoreModeAndPolicy()
 }
 
 func (c *Client) SetRouteContext(clientName, configSourceHash, routeRevision string) {
@@ -320,6 +339,11 @@ func (c *Client) Policy() SyncPolicy {
 // Returns nil on timeout, network error, or non-200 response (caller
 // should fall back to embedded detection).
 func (c *Client) Evaluate(serverName, toolName string, params map[string]interface{}, callID, attemptID string) *EvaluateResult {
+	// Offline clients still supply verified policy/mode to the proxy without
+	// attempting a remote evaluation or claiming a cloud connection.
+	if c.apiURL == "" && c.runtimeSocket == "" {
+		return nil
+	}
 	currentMode, _ := c.currentMode()
 	payload := map[string]interface{}{
 		"server_name":    serverName,

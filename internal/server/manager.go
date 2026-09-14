@@ -474,23 +474,7 @@ func (s *Server) ListTools() ([]interface{}, error) {
 }
 
 func (s *Server) ListToolsContext(ctx context.Context) ([]interface{}, error) {
-	if err := s.InitializeContext(ctx); err != nil {
-		return nil, err
-	}
-	if !s.SupportsCapability("tools") {
-		return []interface{}{}, nil
-	}
-	resp, err := s.CallContext(ctx, "tools/list", nil)
-	if err != nil {
-		return nil, err
-	}
-	var result struct {
-		Tools []interface{} `json:"tools"`
-	}
-	if err := json.Unmarshal(resp, &result); err != nil {
-		return nil, err
-	}
-	return result.Tools, nil
+	return s.listPagesContext(ctx, "tools/list", "tools", "tools")
 }
 
 // ListResources calls resources/list on the server.
@@ -499,23 +483,7 @@ func (s *Server) ListResources() ([]interface{}, error) {
 }
 
 func (s *Server) ListResourcesContext(ctx context.Context) ([]interface{}, error) {
-	if err := s.InitializeContext(ctx); err != nil {
-		return nil, err
-	}
-	if !s.SupportsCapability("resources") {
-		return []interface{}{}, nil
-	}
-	resp, err := s.CallContext(ctx, "resources/list", nil)
-	if err != nil {
-		return nil, err
-	}
-	var result struct {
-		Resources []interface{} `json:"resources"`
-	}
-	if err := json.Unmarshal(resp, &result); err != nil {
-		return nil, err
-	}
-	return result.Resources, nil
+	return s.listPagesContext(ctx, "resources/list", "resources", "resources")
 }
 
 // ListResourceTemplates calls resources/templates/list only for backends that
@@ -525,23 +493,7 @@ func (s *Server) ListResourceTemplates() ([]interface{}, error) {
 }
 
 func (s *Server) ListResourceTemplatesContext(ctx context.Context) ([]interface{}, error) {
-	if err := s.InitializeContext(ctx); err != nil {
-		return nil, err
-	}
-	if !s.SupportsCapability("resources") {
-		return []interface{}{}, nil
-	}
-	resp, err := s.CallContext(ctx, "resources/templates/list", nil)
-	if err != nil {
-		return nil, err
-	}
-	var result struct {
-		ResourceTemplates []interface{} `json:"resourceTemplates"`
-	}
-	if err := json.Unmarshal(resp, &result); err != nil {
-		return nil, err
-	}
-	return result.ResourceTemplates, nil
+	return s.listPagesContext(ctx, "resources/templates/list", "resourceTemplates", "resources")
 }
 
 // ListPrompts calls prompts/list on the server.
@@ -550,23 +502,7 @@ func (s *Server) ListPrompts() ([]interface{}, error) {
 }
 
 func (s *Server) ListPromptsContext(ctx context.Context) ([]interface{}, error) {
-	if err := s.InitializeContext(ctx); err != nil {
-		return nil, err
-	}
-	if !s.SupportsCapability("prompts") {
-		return []interface{}{}, nil
-	}
-	resp, err := s.CallContext(ctx, "prompts/list", nil)
-	if err != nil {
-		return nil, err
-	}
-	var result struct {
-		Prompts []interface{} `json:"prompts"`
-	}
-	if err := json.Unmarshal(resp, &result); err != nil {
-		return nil, err
-	}
-	return result.Prompts, nil
+	return s.listPagesContext(ctx, "prompts/list", "prompts", "prompts")
 }
 
 // Call sends a JSON-RPC request and waits for the response.
@@ -738,6 +674,17 @@ func (s *Server) callHTTPContext(ctx context.Context, method string, params json
 	}
 
 	result, err := s.postHTTPContext(ctx, msg, id, true, timeoutForMethod(method))
+	var statusError *httpStatusError
+	if method != "initialize" && errors.As(err, &statusError) && statusError.Status == http.StatusNotFound {
+		// Expiry invalidates the session for the NEXT independent request. Never
+		// replay an action automatically: its downstream completion is uncertain.
+		s.initMu.Lock()
+		s.sessionMu.Lock()
+		s.sessionID = ""
+		s.sessionMu.Unlock()
+		s.initialized = false
+		s.initMu.Unlock()
+	}
 	if err != nil && ctx.Err() != nil {
 		s.sendCancellation(id, ctx.Err())
 	}
@@ -807,9 +754,9 @@ func (s *Server) postHTTPContext(ctx context.Context, msg map[string]interface{}
 			}
 		}
 		if challenge := strings.TrimSpace(resp.Header.Get("WWW-Authenticate")); challenge != "" {
-			return nil, fmt.Errorf("HTTP %d from %s (%s)", resp.StatusCode, s.config.URL, challenge)
+			return nil, &httpStatusError{Status: resp.StatusCode, Message: fmt.Sprintf("HTTP %d from %s (%s)", resp.StatusCode, s.config.URL, challenge)}
 		}
-		return nil, fmt.Errorf("HTTP %d from %s", resp.StatusCode, s.config.URL)
+		return nil, &httpStatusError{Status: resp.StatusCode, Message: fmt.Sprintf("HTTP %d from %s", resp.StatusCode, s.config.URL)}
 	}
 	if strings.Contains(contentType, "text/event-stream") {
 		return readSSEResult(resp.Body, id, s.notify)
@@ -1311,4 +1258,59 @@ func (s *Server) failPending(err error) {
 	for _, ch := range pending {
 		ch <- rpcResponse{err: err}
 	}
+}
+
+type httpStatusError struct {
+	Status  int
+	Message string
+}
+
+func (e *httpStatusError) Error() string { return e.Message }
+
+func (s *Server) listPagesContext(ctx context.Context, method, key, capability string) ([]interface{}, error) {
+	ctx, cancel := context.WithTimeout(ctx, backendDiscoveryTimeout)
+	defer cancel()
+	if err := s.InitializeContext(ctx); err != nil {
+		return nil, err
+	}
+	if !s.SupportsCapability(capability) {
+		return []interface{}{}, nil
+	}
+	all := make([]interface{}, 0)
+	seen := make(map[string]bool)
+	var params json.RawMessage
+	for page := 0; page < 100; page++ {
+		response, err := s.CallContext(ctx, method, params)
+		if err != nil {
+			return nil, err
+		}
+		var result map[string]json.RawMessage
+		if err := json.Unmarshal(response, &result); err != nil {
+			return nil, err
+		}
+		var items []interface{}
+		if raw := result[key]; len(raw) > 0 {
+			if err := json.Unmarshal(raw, &items); err != nil {
+				return nil, fmt.Errorf("invalid %s page: %w", method, err)
+			}
+		}
+		if len(all)+len(items) > 10000 {
+			return nil, fmt.Errorf("%s exceeded bounded inventory size", method)
+		}
+		all = append(all, items...)
+		raw, hasCursor := result["nextCursor"]
+		if !hasCursor || string(raw) == "null" {
+			return all, nil
+		}
+		var cursor string
+		if json.Unmarshal(raw, &cursor) != nil {
+			return nil, fmt.Errorf("invalid %s pagination cursor", method)
+		}
+		if seen[cursor] {
+			return nil, fmt.Errorf("%s repeated a pagination cursor", method)
+		}
+		seen[cursor] = true
+		params, _ = json.Marshal(map[string]json.RawMessage{"cursor": raw})
+	}
+	return nil, fmt.Errorf("%s exceeded bounded page count", method)
 }

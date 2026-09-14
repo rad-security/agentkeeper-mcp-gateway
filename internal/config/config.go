@@ -54,13 +54,15 @@ type DetectionConfig struct {
 
 // ServerEntry is a server in the config file.
 type ServerEntry struct {
-	Name      string            `json:"name" yaml:"name"`
-	Command   string            `json:"command" yaml:"command"`
-	Args      []string          `json:"args,omitempty" yaml:"args,omitempty"`
-	Env       map[string]string `json:"env,omitempty" yaml:"env,omitempty"`
-	Transport string            `json:"transport,omitempty" yaml:"transport,omitempty"`
-	URL       string            `json:"url,omitempty" yaml:"url,omitempty"`
-	Headers   map[string]string `json:"headers,omitempty" yaml:"headers,omitempty"`
+	Type      string                     `json:"type,omitempty"`
+	Extra     map[string]json.RawMessage `json:"-"`
+	Name      string                     `json:"name,omitempty" yaml:"name"`
+	Command   string                     `json:"command,omitempty" yaml:"command"`
+	Args      []string                   `json:"args,omitempty" yaml:"args,omitempty"`
+	Env       map[string]string          `json:"env,omitempty" yaml:"env,omitempty"`
+	Transport string                     `json:"transport,omitempty" yaml:"transport,omitempty"`
+	URL       string                     `json:"url,omitempty" yaml:"url,omitempty"`
+	Headers   map[string]string          `json:"headers,omitempty" yaml:"headers,omitempty"`
 }
 
 // Server is an alias for ServerEntry for backward compatibility.

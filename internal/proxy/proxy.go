@@ -8,7 +8,6 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -81,24 +80,25 @@ type Proxy struct {
 	mu        sync.Mutex
 	modeMu    sync.RWMutex
 	// Map from namespaced tool name to server name
-	toolMap           map[string]string
-	poisonedTools     map[string]detection.Result
-	resourceMap       map[string]resourceRoute
-	resourceTemplates []resourceTemplateRoute
-	promptMap         map[string]string
-	toolCache         map[string][]interface{}
-	emptyToolLists    map[string]int
-	toolStatus        map[string]toolRefreshStatus
-	toolRefreshMu     sync.Mutex
-	toolRefreshDone   chan struct{}
-	clientReady       bool
-	activeToolsList   int
-	pendingListNote   bool
-	writeMu           sync.Mutex
-	outputMu          sync.RWMutex
-	output            io.Writer
-	inflightMu        sync.Mutex
-	inflight          map[string]context.CancelFunc
+	toolMap            map[string]string
+	poisonedTools      map[string]detection.Result
+	resourceMap        map[string]resourceRoute
+	resourceContentMap map[string]resourceRoute
+	resourceTemplates  []resourceTemplateRoute
+	promptMap          map[string]string
+	toolCache          map[string][]interface{}
+	emptyToolLists     map[string]int
+	toolStatus         map[string]toolRefreshStatus
+	toolRefreshMu      sync.Mutex
+	toolRefreshDone    chan struct{}
+	clientReady        bool
+	activeToolsList    int
+	pendingListNote    bool
+	writeMu            sync.Mutex
+	outputMu           sync.RWMutex
+	output             io.Writer
+	inflightMu         sync.Mutex
+	inflight           map[string]context.CancelFunc
 }
 
 type toolRefreshStatus struct {
@@ -242,7 +242,7 @@ func (p *Proxy) run(input io.Reader, writer io.Writer) error {
 			p.handleClientCancellation(msg.Params)
 			continue
 		}
-		if msg.Method == "tools/call" && msg.ID != nil {
+		if (msg.Method == "tools/call" || msg.Method == "resources/read" || msg.Method == "prompts/get") && msg.ID != nil {
 			ctx, cancel := context.WithCancel(p.proxyContext())
 			key := rpcIDKey(msg.ID)
 			p.inflightMu.Lock()
@@ -346,11 +346,11 @@ func (p *Proxy) handleMessageContext(ctx context.Context, msg JSONRPCMessage) (*
 	case "resources/templates/list":
 		return p.handleResourceTemplatesList(msg)
 	case "resources/read":
-		return p.handleResourcesRead(msg)
+		return p.handleResourcesReadContext(ctx, msg)
 	case "prompts/list":
 		return p.handlePromptsList(msg)
 	case "prompts/get":
-		return p.handlePromptsGet(msg)
+		return p.handlePromptsGetContext(ctx, msg)
 	case "ping":
 		resultJSON := json.RawMessage(`{}`)
 		return &JSONRPCMessage{JSONRPC: "2.0", ID: msg.ID, Result: resultJSON}, nil
@@ -390,7 +390,7 @@ func (p *Proxy) handleBackendLifecycle(serverName, state string, lifecycleErr er
 	delete(p.toolCache, serverName)
 	delete(p.emptyToolLists, serverName)
 	for name := range p.poisonedTools {
-		if strings.HasPrefix(name, serverName+"__") {
+		if strings.HasPrefix(name, publicMCPName(serverName, "")) {
 			delete(p.poisonedTools, name)
 		}
 	}
@@ -523,7 +523,7 @@ func filterToolsForPolicy(tools []interface{}, toolMap map[string]string, synced
 		}
 		namespacedName, _ := tm["name"].(string)
 		serverName := toolMap[namespacedName]
-		originalName := strings.TrimPrefix(namespacedName, serverName+"__")
+		originalName := originalMCPName(serverName, namespacedName)
 		if policy.Evaluate(synced, serverName, originalName, nil).Verdict == "block" {
 			continue
 		}
@@ -639,7 +639,7 @@ func (p *Proxy) logToolDescriptionDetections(serverName string, tools []interfac
 		desc := toolDescriptionFromMap(tm)
 		results := p.config.DetectionEngine.EvaluateToolDescriptions([]detection.ToolDescription{desc})
 		for _, r := range results {
-			found[serverName+"__"+desc.Name] = r
+			found[publicMCPName(serverName, desc.Name)] = r
 		}
 	}
 	newFindings := make(map[string]detection.Result)
@@ -650,7 +650,7 @@ func (p *Proxy) logToolDescriptionDetections(serverName string, tools []interfac
 		}
 	}
 	for name := range p.poisonedTools {
-		if strings.HasPrefix(name, serverName+"__") {
+		if strings.HasPrefix(name, publicMCPName(serverName, "")) {
 			delete(p.poisonedTools, name)
 		}
 	}
@@ -660,7 +660,7 @@ func (p *Proxy) logToolDescriptionDetections(serverName string, tools []interfac
 	p.mu.Unlock()
 	if p.config.Logger != nil {
 		for name, result := range newFindings {
-			p.config.Logger.LogDetection(serverName, strings.TrimPrefix(name, serverName+"__"), result)
+			p.config.Logger.LogDetection(serverName, originalMCPName(serverName, name), result)
 		}
 	}
 }
@@ -966,7 +966,7 @@ func appendNamespacedTools(allTools *[]interface{}, toolMap map[string]string, s
 			continue
 		}
 		originalName := fmt.Sprintf("%v", tm["name"])
-		namespacedName := serverName + "__" + originalName
+		namespacedName := publicMCPName(serverName, originalName)
 		tm["name"] = namespacedName
 		toolMap[namespacedName] = serverName
 		*allTools = append(*allTools, tm)
@@ -1032,7 +1032,7 @@ func (p *Proxy) handleToolsCallContext(ctx context.Context, msg JSONRPCMessage) 
 	}
 
 	// Strip the namespace prefix to get the original tool name
-	originalName := strings.TrimPrefix(callParams.Name, serverName+"__")
+	originalName := originalMCPName(serverName, callParams.Name)
 	callID := newEvidenceID("call")
 	attemptID := newEvidenceID("attempt")
 	enforceThisCall := p.enforceMode()
@@ -1331,7 +1331,14 @@ func (p *Proxy) logToolOutcome(serverName, toolName string, params map[string]in
 }
 
 func (p *Proxy) durableEvidenceAvailable() bool {
-	return p.config.Logger != nil && p.config.Logger.AcceptingDurableEvents()
+	if p.config.Logger == nil || !p.config.Logger.AcceptingDurableEvents() {
+		return false
+	}
+	if p.config.ReceiptStore != nil {
+		status, err := p.config.ReceiptStore.QueueStatus()
+		return err == nil && status.Accepting
+	}
+	return true
 }
 
 func (p *Proxy) manifestEvidence(serverName string, syncedPolicy telemetry.SyncPolicy) (string, string) {
@@ -1393,20 +1400,25 @@ func (p *Proxy) handleResourcesList(msg JSONRPCMessage) (*JSONRPCMessage, error)
 }
 
 func (p *Proxy) handleResourcesRead(msg JSONRPCMessage) (*JSONRPCMessage, error) {
-	var params struct {
-		URI string `json:"uri"`
-	}
-	if err := json.Unmarshal(msg.Params, &params); err != nil || params.URI == "" {
+	return p.handleResourcesReadContext(p.proxyContext(), msg)
+}
+func (p *Proxy) handleResourcesReadContext(ctx context.Context, msg JSONRPCMessage) (*JSONRPCMessage, error) {
+	var params map[string]json.RawMessage
+	var requestedURI string
+	if err := json.Unmarshal(msg.Params, &params); err != nil || json.Unmarshal(params["uri"], &requestedURI) != nil || requestedURI == "" {
 		return nil, fmt.Errorf("invalid resources/read params")
 	}
 	p.mu.Lock()
-	route, ok := p.resourceMap[params.URI]
+	route, ok := p.resourceMap[requestedURI]
+	if !ok {
+		route, ok = p.resourceContentMap[requestedURI]
+	}
 	p.mu.Unlock()
 	if !ok {
 		_, routes := p.loadResources()
 		p.mu.Lock()
 		p.resourceMap = routes
-		route, ok = routes[params.URI]
+		route, ok = routes[requestedURI]
 		p.mu.Unlock()
 	}
 	if !ok {
@@ -1419,8 +1431,8 @@ func (p *Proxy) handleResourcesRead(msg JSONRPCMessage) (*JSONRPCMessage, error)
 			p.resourceTemplates = templates
 			p.mu.Unlock()
 		}
-		if templateRoute, resolved := resolveResourceTemplateRoute(params.URI, templates); resolved {
-			route = resourceRoute{ServerName: templateRoute.ServerName, OriginalURI: params.URI}
+		if templateRoute, resolved := resolveResourceTemplateRoute(requestedURI, templates); resolved {
+			route = resourceRoute{ServerName: templateRoute.ServerName, OriginalURI: requestedURI}
 			ok = true
 		}
 	}
@@ -1431,12 +1443,36 @@ func (p *Proxy) handleResourcesRead(msg JSONRPCMessage) (*JSONRPCMessage, error)
 	if srv == nil {
 		return nil, fmt.Errorf("server not available: %s", route.ServerName)
 	}
-	forwardParams, _ := json.Marshal(map[string]interface{}{"uri": route.OriginalURI})
-	response, err := srv.Call("resources/read", forwardParams)
-	if err != nil {
-		return nil, fmt.Errorf("reading resource from %s: %w", route.ServerName, err)
+	params["uri"], _ = json.Marshal(route.OriginalURI)
+	forwardParams, _ := json.Marshal(params)
+	enforceThisCall := p.enforceMode()
+	if err := srv.InitializeContext(ctx); err != nil {
+		return p.contentCallFailure(msg.ID, route.ServerName, "resources/read", enforceThisCall, false, err), nil
 	}
-	return p.inspectContentResult(msg.ID, route.ServerName, "resources/read", response)
+	response, err := srv.CallContext(ctx, "resources/read", forwardParams)
+	if err != nil {
+		return p.contentCallFailure(msg.ID, route.ServerName, "resources/read", enforceThisCall, true, err), nil
+	}
+	if !validResourceResult(response) {
+		return p.invalidResourceResponse(msg.ID, route.ServerName, enforceThisCall), nil
+	}
+	result, err := p.inspectContentResultMode(msg.ID, route.ServerName, "resources/read", response, enforceThisCall)
+	if err != nil || result == nil || result.Error != nil || string(result.Result) != string(response) || requestedURI == route.OriginalURI {
+		return result, err
+	}
+	// Return resource identities in the same namespace used by resources/list.
+	// Inspect the original content first and never replace a withheld result.
+	clientResponse, contentRoutes := namespaceResourceContents(response, route.ServerName)
+	result.Result = clientResponse
+	p.mu.Lock()
+	if p.resourceContentMap == nil {
+		p.resourceContentMap = make(map[string]resourceRoute)
+	}
+	for uri, contentRoute := range contentRoutes {
+		p.resourceContentMap[uri] = contentRoute
+	}
+	p.mu.Unlock()
+	return result, nil
 }
 
 func (p *Proxy) loadResources() ([]interface{}, map[string]resourceRoute) {
@@ -1489,13 +1525,13 @@ func (p *Proxy) loadResources() ([]interface{}, map[string]resourceRoute) {
 			if originalURI == "" {
 				continue
 			}
-			virtualURI := "agentkeeper://resource/" + base64.RawURLEncoding.EncodeToString([]byte(name)) + "/" + base64.RawURLEncoding.EncodeToString([]byte(originalURI))
+			virtualURI := namespacedResourceURI(name, originalURI)
 			copy := make(map[string]interface{}, len(resource)+1)
 			for key, entry := range resource {
 				copy[key] = entry
 			}
 			copy["uri"] = virtualURI
-			copy["_meta"] = map[string]interface{}{"agentkeeper": map[string]interface{}{"server": name, "original_uri": originalURI}}
+			copy["_meta"] = resourceMetadata(copy["_meta"], map[string]interface{}{"server": name, "original_uri": originalURI})
 			all = append(all, copy)
 			routes[virtualURI] = resourceRoute{ServerName: name, OriginalURI: originalURI}
 		}
@@ -1567,9 +1603,9 @@ func (p *Proxy) loadResourceTemplates() ([]interface{}, []resourceTemplateRoute)
 				copy[key] = entry
 			}
 			if originalName, _ := copy["name"].(string); originalName != "" {
-				copy["name"] = name + "__" + originalName
+				copy["name"] = publicMCPName(name, originalName)
 			}
-			copy["_meta"] = map[string]interface{}{"agentkeeper": map[string]interface{}{"server": name, "original_uri_template": originalTemplate}}
+			copy["_meta"] = resourceMetadata(copy["_meta"], map[string]interface{}{"server": name, "original_uri_template": originalTemplate})
 			all = append(all, copy)
 			routes = append(routes, resourceTemplateRoute{ServerName: name, Template: originalTemplate, Matcher: matcher})
 		}
@@ -1634,6 +1670,9 @@ func (p *Proxy) handlePromptsList(msg JSONRPCMessage) (*JSONRPCMessage, error) {
 }
 
 func (p *Proxy) handlePromptsGet(msg JSONRPCMessage) (*JSONRPCMessage, error) {
+	return p.handlePromptsGetContext(p.proxyContext(), msg)
+}
+func (p *Proxy) handlePromptsGetContext(ctx context.Context, msg JSONRPCMessage) (*JSONRPCMessage, error) {
 	var params map[string]interface{}
 	if err := json.Unmarshal(msg.Params, &params); err != nil {
 		return nil, fmt.Errorf("invalid prompts/get params")
@@ -1652,17 +1691,21 @@ func (p *Proxy) handlePromptsGet(msg JSONRPCMessage) (*JSONRPCMessage, error) {
 	if !ok {
 		return nil, fmt.Errorf("unknown prompt: %s", namespacedName)
 	}
-	params["name"] = strings.TrimPrefix(namespacedName, serverName+"__")
+	params["name"] = originalMCPName(serverName, namespacedName)
 	forwardParams, _ := json.Marshal(params)
 	srv := p.manager.Get(serverName)
 	if srv == nil {
 		return nil, fmt.Errorf("server not available: %s", serverName)
 	}
-	response, err := srv.Call("prompts/get", forwardParams)
-	if err != nil {
-		return nil, fmt.Errorf("getting prompt from %s: %w", serverName, err)
+	enforceThisCall := p.enforceMode()
+	if err := srv.InitializeContext(ctx); err != nil {
+		return p.contentCallFailure(msg.ID, serverName, "prompts/get", enforceThisCall, false, err), nil
 	}
-	return p.inspectContentResult(msg.ID, serverName, "prompts/get", response)
+	response, err := srv.CallContext(ctx, "prompts/get", forwardParams)
+	if err != nil {
+		return p.contentCallFailure(msg.ID, serverName, "prompts/get", enforceThisCall, true, err), nil
+	}
+	return p.inspectContentResultMode(msg.ID, serverName, "prompts/get", response, enforceThisCall)
 }
 
 func (p *Proxy) loadPrompts() ([]interface{}, map[string]string) {
@@ -1715,7 +1758,7 @@ func (p *Proxy) loadPrompts() ([]interface{}, map[string]string) {
 			if originalName == "" {
 				continue
 			}
-			namespacedName := name + "__" + originalName
+			namespacedName := publicMCPName(name, originalName)
 			copy := make(map[string]interface{}, len(prompt))
 			for key, entry := range prompt {
 				copy[key] = entry
@@ -1729,7 +1772,9 @@ func (p *Proxy) loadPrompts() ([]interface{}, map[string]string) {
 }
 
 func (p *Proxy) inspectContentResult(id *json.RawMessage, serverName, method string, response json.RawMessage) (*JSONRPCMessage, error) {
-	enforceThisCall := p.enforceMode()
+	return p.inspectContentResultMode(id, serverName, method, response, p.enforceMode())
+}
+func (p *Proxy) inspectContentResultMode(id *json.RawMessage, serverName, method string, response json.RawMessage, enforceThisCall bool) (*JSONRPCMessage, error) {
 	result := detection.Result{Verdict: detection.VerdictPass}
 	if p.config.DetectionEngine != nil {
 		result = p.config.DetectionEngine.EvaluateToolResponse(serverName, method, string(response))
@@ -1762,12 +1807,8 @@ func (p *Proxy) inspectContentResult(id *json.RawMessage, serverName, method str
 		outcome.ResultReturned = false
 		outcome.ResponseWithheld = true
 		p.logToolOutcome(serverName, method, nil, result, outcome)
-		blocked := map[string]interface{}{
-			"content": []map[string]interface{}{{"type": "text", "text": "Blocked by AgentKeeper: upstream content was withheld."}},
-			"isError": true,
-		}
-		blockedJSON, _ := json.Marshal(blocked)
-		return &JSONRPCMessage{JSONRPC: "2.0", ID: id, Result: blockedJSON}, nil
+		// Resources and prompts do not use the tools/call isError envelope.
+		return &JSONRPCMessage{JSONRPC: "2.0", ID: id, Error: &JSONRPCError{Code: -32003, Message: "Blocked by AgentKeeper: upstream content was withheld."}}, nil
 	}
 	p.logToolOutcome(serverName, method, nil, result, outcome)
 	return &JSONRPCMessage{JSONRPC: "2.0", ID: id, Result: response}, nil
@@ -1811,6 +1852,13 @@ func (p *Proxy) handleBuiltinToolCall(id *json.RawMessage, name string, args map
 		}
 		text = fmt.Sprintf("AgentKeeper MCP Gateway\nMode: %s\nServers: %d configured (%s)\nTools: %d cached from %d backend(s); %d backend(s) degraded; refreshing in background\nDetection: active\nEvidence queue: %s (%d events, %d bytes)",
 			mode, len(servers), strings.Join(servers, ", "), cachedToolCount, cachedBackendCount, degradedBackendCount, queue.State, queue.PendingEvents, queue.PendingBytes)
+		if p.config.ReceiptStore != nil {
+			if status, err := p.config.ReceiptStore.QueueStatus(); err == nil {
+				text += fmt.Sprintf("\nReceipt queue: %d/%d receipts, %d/%d bytes; accepting=%t", status.Events, status.MaxEvents, status.Bytes, status.MaxBytes, status.Accepting)
+			} else {
+				text += "\nReceipt queue: unavailable"
+			}
+		}
 	case "agentkeeper_audit":
 		p.startToolRefresh()
 		servers := p.manager.ConfiguredNames()
@@ -1869,4 +1917,33 @@ func (p *Proxy) cachedToolSummary() (backendCount int, toolCount int, degradedBa
 		}
 	}
 	return backendCount, toolCount, degradedBackendCount
+}
+
+// Escape the delimiter inside both segments. This is reversible and prevents
+// distinct server/tool pairs from silently selecting the same upstream target.
+// Escape only ambiguous underscore runs/boundaries, and the escape character.
+// Ordinary names such as list_accounts retain their existing public identity.
+func encodeMCPSegment(value string) string {
+	var encoded strings.Builder
+	for i := 0; i < len(value); i++ {
+		switch {
+		case value[i] == '.':
+			encoded.WriteString(".d")
+		case value[i] == '_' && (i == 0 || i == len(value)-1 || value[i-1] == '_' || value[i+1] == '_'):
+			encoded.WriteString(".u")
+		default:
+			encoded.WriteByte(value[i])
+		}
+	}
+	return encoded.String()
+}
+func publicMCPName(serverName, originalName string) string {
+	return encodeMCPSegment(serverName) + "__" + encodeMCPSegment(originalName)
+}
+func originalMCPName(serverName, publicName string) string {
+	prefix := publicMCPName(serverName, "")
+	if strings.HasPrefix(publicName, prefix) {
+		return strings.NewReplacer(".u", "_", ".d", ".").Replace(strings.TrimPrefix(publicName, prefix))
+	}
+	return strings.TrimPrefix(publicName, serverName+"__")
 }
