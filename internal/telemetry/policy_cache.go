@@ -4,7 +4,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"github.com/rad-security/agentkeeper-mcp-gateway/internal/fslock"
 	"os"
 	"path/filepath"
 	"strings"
@@ -29,6 +31,7 @@ type policyStateSnapshot struct {
 	EffectiveMode               string `json:"effective_mode"`
 	EffectiveAssignmentRevision int64  `json:"effective_assignment_revision"`
 	EstablishedAt               string `json:"established_at"`
+	AssignmentOrigin            string `json:"assignment_origin,omitempty"`
 	SignatureBase64             string `json:"signature_base64,omitempty"`
 }
 
@@ -118,9 +121,18 @@ func (c *Client) loadPolicyCache() error {
 	if snapshot.GatewayID != "" {
 		c.gatewayID = snapshot.GatewayID
 	}
-	currentMode, _ := c.currentMode()
+	currentMode, currentRevision := c.currentMode()
 	restoredMode := normalizePolicyMode(snapshot.EffectiveMode)
-	if strings.EqualFold(currentMode, "enforce") {
+	restoredRevision := snapshot.EffectiveAssignmentRevision
+	c.policyMu.RLock()
+	stateValid := c.policyStateValid
+	c.policyMu.RUnlock()
+	if stateValid && currentRevision >= restoredRevision {
+		// Assignment state is persisted before its replaceable policy cache.
+		// A crash between those writes must not resurrect the older mode.
+		restoredMode = normalizePolicyMode(currentMode)
+		restoredRevision = currentRevision
+	} else if strings.EqualFold(currentMode, "enforce") {
 		// Never let a cached Observe snapshot weaken an explicitly configured
 		// Enforce startup.
 		restoredMode = "enforce"
@@ -131,7 +143,7 @@ func (c *Client) loadPolicyCache() error {
 	} else {
 		c.mode = "audit"
 	}
-	c.modeRevision = snapshot.EffectiveAssignmentRevision
+	c.modeRevision = restoredRevision
 	c.modeMu.Unlock()
 	if !c.now().Before(expiresAt) && c.logger != nil {
 		c.logger.Warn("last-known-good policy expired at %s", expiresAt.UTC().Format(time.RFC3339))
@@ -146,11 +158,13 @@ func (c *Client) loadPolicyCache() error {
 	return nil
 }
 
-func (c *Client) loadPolicyState() error {
-	if c.policyStatePath == "" {
+func (c *Client) loadPolicyState() error { return c.loadPolicyStateFrom(c.policyStatePath) }
+
+func (c *Client) loadPolicyStateFrom(path string) error {
+	if path == "" {
 		return nil
 	}
-	info, err := os.Lstat(c.policyStatePath)
+	info, err := os.Lstat(path)
 	if os.IsNotExist(err) {
 		return nil
 	}
@@ -160,7 +174,7 @@ func (c *Client) loadPolicyState() error {
 	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
 		return c.rejectPolicyCache(fmt.Errorf("refusing non-regular established policy state path"))
 	}
-	data, err := os.ReadFile(c.policyStatePath)
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return c.rejectPolicyCache(fmt.Errorf("reading established policy state: %w", err))
 	}
@@ -180,7 +194,7 @@ func (c *Client) loadPolicyState() error {
 	if state.ClientName != c.clientName || state.ConfigSourceHash != c.configSourceHash || state.RouteRevision != c.routeRevision {
 		return c.rejectPolicyCache(fmt.Errorf("established policy state route identity does not match Gateway process"))
 	}
-	if state.EffectiveAssignmentRevision <= 0 {
+	if state.EffectiveAssignmentRevision < 0 || state.EffectiveAssignmentRevision == 0 && (state.AssignmentOrigin != "initial_observe" || state.EffectiveMode != "observe") {
 		return c.rejectPolicyCache(fmt.Errorf("established policy state assignment revision is invalid"))
 	}
 	if _, err := time.Parse(time.RFC3339Nano, state.EstablishedAt); err != nil {
@@ -190,8 +204,19 @@ func (c *Client) loadPolicyState() error {
 	if err != nil || !c.receiptStore.VerifyBytes(canonical, state.SignatureBase64) {
 		return c.rejectPolicyCache(fmt.Errorf("established policy state signature is invalid"))
 	}
+	c.policyMu.RLock()
+	established := c.policyStateValid
+	c.policyMu.RUnlock()
 	c.modeMu.Lock()
-	if normalizePolicyMode(state.EffectiveMode) == "enforce" {
+	if state.EffectiveMode != "observe" && state.EffectiveMode != "enforce" {
+		c.modeMu.Unlock()
+		return fmt.Errorf("invalid established mode")
+	}
+	if state.EffectiveAssignmentRevision < c.modeRevision || established && state.EffectiveAssignmentRevision == c.modeRevision {
+		c.modeMu.Unlock()
+		return nil
+	}
+	if normalizePolicyMode(state.EffectiveMode) == "enforce" || c.startupEnforce {
 		c.mode = "enforce"
 	} else {
 		c.mode = "audit"
@@ -210,10 +235,8 @@ func (c *Client) rejectPolicyCache(err error) error {
 	c.policyValid = false
 	c.cachedPolicy = SyncPolicy{}
 	c.policyMu.Unlock()
-	// A cache exists but cannot be trusted. Start the proxy in Enforce with the
-	// wildcard fail-closed policy; a successful authenticated sync can replace
-	// this state immediately.
-	c.SetMode("enforce")
+	// Corrupt classification data is not authority to change a route's mode.
+	// Policy() still fails closed when verified/configured mode is Enforce.
 	return fmt.Errorf("last-known-good policy unavailable: %w", err)
 }
 
@@ -222,8 +245,31 @@ func (c *Client) persistPolicyState() error {
 		return nil
 	}
 	mode, revision := c.currentMode()
+	return c.persistPolicyStateValues(mode, revision)
+}
+
+func (c *Client) persistPolicyStateValues(mode string, revision int64) error {
+	if c.policyStatePath == "" {
+		return nil
+	}
+	if c.receiptStore == nil {
+		return fmt.Errorf("cannot persist mode authority without durable signer")
+	}
 	if revision <= 0 {
 		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(c.policyStatePath), 0700); err != nil {
+		return err
+	}
+	release, err := fslock.Acquire(c.policyStatePath + ".lock")
+	if err != nil {
+		return err
+	}
+	defer release()
+	for _, path := range []string{c.policyStatePath + ".authority", c.policyStatePath} {
+		if prior, err := c.verifiedAuthority(path); err == nil && (prior.EffectiveAssignmentRevision > revision || prior.EffectiveAssignmentRevision == revision && prior.EffectiveMode != modeLabel(mode)) {
+			return fmt.Errorf("refusing stale/conflicting assignment revision %d; verified authority is %s revision %d", revision, prior.EffectiveMode, prior.EffectiveAssignmentRevision)
+		}
 	}
 	state := policyStateSnapshot{
 		SchemaVersion:               policyStateSchema,
@@ -243,6 +289,10 @@ func (c *Client) persistPolicyState() error {
 	state.SignatureBase64 = c.receiptStore.SignBytes(canonical)
 	data, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
+		return err
+	}
+	// The independent authority is written before replaceable state/cache.
+	if err := atomicWritePrivate(c.policyStatePath+".authority", append(data, '\n')); err != nil {
 		return err
 	}
 	if err := atomicWritePrivate(c.policyStatePath, append(data, '\n')); err != nil {
@@ -392,4 +442,122 @@ func normalizePolicyMode(value string) string {
 		return "enforce"
 	}
 	return "observe"
+}
+
+var ErrModeAuthorityUnavailable = errors.New("Gateway route mode authority is unavailable")
+
+// ModeAuthorityReady permits a fresh authenticated assignment to recover an
+// ambiguous legacy route, but never serves traffic under a guessed mode.
+func (c *Client) ModeAuthorityReady() bool {
+	c.modeMu.RLock()
+	defer c.modeMu.RUnlock()
+	return !c.modeAuthorityUnavailable
+}
+
+func (c *Client) restoreModeAndPolicy() error {
+	authorityPath := c.policyStatePath + ".authority"
+	_, stateStat := os.Lstat(c.policyStatePath)
+	_, authorityStat := os.Lstat(authorityPath)
+	stateExists := !os.IsNotExist(stateStat) || !os.IsNotExist(authorityStat)
+	authorityErr := c.loadPolicyStateFrom(authorityPath)
+	stateErr := c.loadPolicyState()
+	cacheErr := c.loadPolicyCache()
+	c.policyMu.RLock()
+	stateValid, cacheValid := c.policyStateValid, c.policyValid
+	c.policyMu.RUnlock()
+	c.modeMu.Lock()
+	ambiguous := stateExists && !stateValid && !cacheValid && !c.startupEnforce
+	c.modeAuthorityUnavailable = ambiguous
+	c.modeMu.Unlock()
+	if ambiguous {
+		return fmt.Errorf("%w: neither persisted assignment nor cache can be verified; reconnect for an acknowledged assignment before retrying", ErrModeAuthorityUnavailable)
+	}
+	if !stateExists && !stateValid && !cacheValid {
+		mode, _ := c.currentMode()
+		if modeLabel(mode) == "observe" {
+			if err := c.persistInitialObserveAuthority(authorityPath); err != nil {
+				c.modeMu.Lock()
+				c.modeAuthorityUnavailable = true
+				c.modeMu.Unlock()
+				return fmt.Errorf("%w: %v", ErrModeAuthorityUnavailable, err)
+			}
+		}
+	}
+	if cacheErr != nil {
+		return cacheErr
+	}
+	if stateErr != nil {
+		return stateErr
+	}
+	return authorityErr
+}
+
+func (c *Client) persistInitialObserveAuthority(path string) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return err
+	}
+	release, err := fslock.Acquire(c.policyStatePath + ".lock")
+	if err != nil {
+		return err
+	}
+	defer release()
+	// Another client process may have established an assignment since startup
+	// inspected these files. Initial Observe must never overwrite that authority.
+	for _, candidate := range []string{path, c.policyStatePath} {
+		if _, err := os.Lstat(candidate); err == nil {
+			if _, err := c.verifiedAuthority(candidate); err != nil {
+				return fmt.Errorf("concurrent mode authority cannot be verified: %w", err)
+			}
+			return c.loadPolicyStateFrom(candidate)
+		} else if !os.IsNotExist(err) {
+			return err
+		}
+	}
+	state := policyStateSnapshot{SchemaVersion: policyStateSchema, SignerKeyID: c.receiptStore.SignerKeyID(), MachineID: c.machineID, ClientName: c.clientName, ConfigSourceHash: c.configSourceHash, RouteRevision: c.routeRevision, EffectiveMode: "observe", EffectiveAssignmentRevision: 0, EstablishedAt: c.now().UTC().Format(time.RFC3339Nano), AssignmentOrigin: "initial_observe"}
+	canonical, err := canonicalPolicyState(state)
+	if err != nil {
+		return err
+	}
+	state.SignatureBase64 = c.receiptStore.SignBytes(canonical)
+	data, err := json.Marshal(state)
+	if err != nil {
+		return err
+	}
+	if err := atomicWritePrivate(path, append(data, '\n')); err != nil {
+		return fmt.Errorf("persisting initial Observe authority: %w", err)
+	}
+	c.policyMu.Lock()
+	c.policyStateValid = true
+	c.policyMu.Unlock()
+	return nil
+}
+
+// Used under the process-shared assignment lock before replacing authority.
+func (c *Client) verifiedAuthority(path string) (policyStateSnapshot, error) {
+	var state policyStateSnapshot
+	info, err := os.Lstat(path)
+	if err != nil {
+		return state, err
+	}
+	if !info.Mode().IsRegular() {
+		return state, fmt.Errorf("non-regular authority")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return state, err
+	}
+	if err = json.Unmarshal(data, &state); err != nil {
+		return state, err
+	}
+	if state.SchemaVersion != policyStateSchema || state.SignerKeyID != c.receiptStore.SignerKeyID() || state.MachineID != c.machineID || state.ClientName != c.clientName || state.ConfigSourceHash != c.configSourceHash || state.RouteRevision != c.routeRevision || (state.EffectiveMode != "observe" && state.EffectiveMode != "enforce") || state.EffectiveAssignmentRevision < 0 || state.EffectiveAssignmentRevision == 0 && (state.EffectiveMode != "observe" || state.AssignmentOrigin != "initial_observe") {
+		return state, fmt.Errorf("authority identity or assignment invalid")
+	}
+	if _, err = time.Parse(time.RFC3339Nano, state.EstablishedAt); err != nil {
+		return state, err
+	}
+	canonical, err := canonicalPolicyState(state)
+	if err != nil || !c.receiptStore.VerifyBytes(canonical, state.SignatureBase64) {
+		return state, fmt.Errorf("authority signature invalid")
+	}
+	return state, nil
 }

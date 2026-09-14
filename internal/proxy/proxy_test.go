@@ -709,7 +709,7 @@ func TestContentEnforcementHonorsLocalPolicyWithoutTelemetry(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s returned error: %v", method, err)
 		}
-		if response == nil || !strings.Contains(string(response.Result), `"isError":true`) {
+		if response == nil || response.Error == nil || response.Error.Code != -32003 || len(response.Result) != 0 {
 			t.Fatalf("%s did not withhold malicious content without telemetry: %+v", method, response)
 		}
 	}

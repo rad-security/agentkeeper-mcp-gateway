@@ -11,7 +11,9 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"github.com/rad-security/agentkeeper-mcp-gateway/internal/fslock"
 	"os"
 	"path/filepath"
 	"sort"
@@ -91,16 +93,19 @@ type keyFile struct {
 }
 
 type Store struct {
-	mu              sync.Mutex
-	root            string
-	queueDir        string
-	rejectedDir     string
-	artifactVersion string
-	bootID          string
-	sequence        uint64
-	privateKey      ed25519.PrivateKey
-	publicKey       ed25519.PublicKey
-	signerKeyID     string
+	mu                 sync.Mutex
+	root               string
+	queueDir           string
+	rejectedDir        string
+	artifactVersion    string
+	bootID             string
+	sequence           uint64
+	privateKey         ed25519.PrivateKey
+	publicKey          ed25519.PublicKey
+	signerKeyID        string
+	maxEvents          int
+	maxBytes           int64
+	usageRepairRunning bool
 }
 
 func NewStore(root, artifactVersion string) (*Store, error) {
@@ -108,7 +113,8 @@ func NewStore(root, artifactVersion string) (*Store, error) {
 		return nil, fmt.Errorf("receipt store root is required")
 	}
 	store := &Store{
-		root:            root,
+		root:      root,
+		maxEvents: 100000, maxBytes: 256 * 1024 * 1024,
 		queueDir:        filepath.Join(root, "queue"),
 		rejectedDir:     filepath.Join(root, "rejected"),
 		artifactVersion: artifactVersion,
@@ -123,6 +129,16 @@ func NewStore(root, artifactVersion string) (*Store, error) {
 		return nil, err
 	}
 	store.sequence = store.loadSequence()
+	// Reconcile once at startup. Normal enqueue cost is independent of backlog.
+	release, err := fslock.Acquire(filepath.Join(root, "queue.lock"))
+	if err != nil {
+		return nil, err
+	}
+	_, err = store.reconcileQueueUsage()
+	release()
+	if err != nil {
+		return nil, err
+	}
 	return store, nil
 }
 
@@ -148,6 +164,14 @@ func (s *Store) Enqueue(input Input) (Envelope, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	release, err := fslock.Acquire(filepath.Join(s.root, "queue.lock"))
+	if err != nil {
+		return Envelope{}, err
+	}
+	defer release()
+	if sequence := s.loadSequence(); sequence > s.sequence {
+		s.sequence = sequence
+	}
 	s.sequence++
 	envelope := Envelope{
 		SchemaVersion:       SchemaVersion,
@@ -190,6 +214,14 @@ func (s *Store) Enqueue(input Input) (Envelope, error) {
 	if err != nil {
 		return Envelope{}, err
 	}
+	usage, err := s.queueUsage()
+	if err != nil {
+		s.scheduleUsageRepair()
+		return Envelope{}, err
+	}
+	if usage.Events >= s.maxEvents || usage.Bytes+int64(len(data)+1) > s.maxBytes {
+		return Envelope{}, fmt.Errorf("receipt queue capacity exceeded: events=%d/%d bytes=%d/%d", usage.Events, s.maxEvents, usage.Bytes, s.maxBytes)
+	}
 	filename := fmt.Sprintf("%020d-%s.json", envelope.Sequence, envelope.ReceiptID)
 	if err := atomicWrite(filepath.Join(s.queueDir, filename), append(data, '\n'), 0o600); err != nil {
 		return Envelope{}, fmt.Errorf("persisting receipt: %w", err)
@@ -197,32 +229,81 @@ func (s *Store) Enqueue(input Input) (Envelope, error) {
 	if err := atomicWrite(filepath.Join(s.root, "sequence"), []byte(strconv.FormatUint(s.sequence, 10)+"\n"), 0o600); err != nil {
 		return Envelope{}, fmt.Errorf("persisting receipt sequence: %w", err)
 	}
+	usage.Events++
+	usage.Bytes += int64(len(data) + 1)
+	if err := s.saveQueueUsage(usage); err != nil {
+		return envelope, fmt.Errorf("persisting receipt usage: %w", err)
+	}
 	return envelope, nil
 }
 
 func (s *Store) Peek(limit int) ([]Envelope, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	release, err := fslock.Acquire(filepath.Join(s.root, "queue.lock"))
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	usage, err := s.reconcileQueueUsage()
+	if err != nil {
+		return nil, err
+	}
+	changed := false
+	defer func() {
+		if changed {
+			_ = s.saveQueueUsage(usage)
+		}
+	}()
 	entries, err := os.ReadDir(s.queueDir)
 	if err != nil {
 		return nil, err
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
-	if limit <= 0 || limit > len(entries) {
-		limit = len(entries)
+	if limit <= 0 {
+		limit = 100
 	}
 	receipts := make([]Envelope, 0, limit)
-	for _, entry := range entries[:limit] {
+	for _, entry := range entries {
+		if len(receipts) >= limit {
+			break
+		}
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
 			continue
 		}
-		data, readErr := os.ReadFile(filepath.Join(s.queueDir, entry.Name()))
-		if readErr != nil {
-			return nil, readErr
+		path := filepath.Join(s.queueDir, entry.Name())
+		info, err := os.Lstat(path)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		if !info.Mode().IsRegular() || info.Size() > 1024*1024 {
+			if err := s.quarantine(path); err != nil {
+				return nil, err
+			}
+			usage.Events--
+			usage.Bytes -= info.Size()
+			changed = true
+			continue
+		}
+		data, err := os.ReadFile(path)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return nil, err
 		}
 		var envelope Envelope
-		if decodeErr := json.Unmarshal(data, &envelope); decodeErr != nil {
-			return nil, decodeErr
+		if json.Unmarshal(data, &envelope) != nil || envelope.ReceiptID == "" || !Verify(envelope, s.publicKey) {
+			if err := s.quarantine(path); err != nil {
+				return nil, err
+			}
+			usage.Events--
+			usage.Bytes -= info.Size()
+			changed = true
+			continue
 		}
 		receipts = append(receipts, envelope)
 	}
@@ -234,6 +315,21 @@ func (s *Store) Peek(limit int) ([]Envelope, error) {
 func (s *Store) Resolve(statusByReceiptID map[string]string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	release, err := fslock.Acquire(filepath.Join(s.root, "queue.lock"))
+	if err != nil {
+		return err
+	}
+	defer release()
+	usage, err := s.reconcileQueueUsage()
+	if err != nil {
+		return err
+	}
+	changed := false
+	defer func() {
+		if changed {
+			_ = s.saveQueueUsage(usage)
+		}
+	}()
 	entries, err := os.ReadDir(s.queueDir)
 	if err != nil {
 		return err
@@ -248,16 +344,29 @@ func (s *Store) Resolve(statusByReceiptID map[string]string) error {
 		}
 		status := statusByReceiptID[parts[1]]
 		source := filepath.Join(s.queueDir, entry.Name())
+		if status != "accepted" && status != "duplicate" && status != "rejected" && status != "conflicted" {
+			continue
+		}
+		info, err := os.Lstat(source)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
 		switch status {
 		case "accepted", "duplicate":
 			if err := os.Remove(source); err != nil && !os.IsNotExist(err) {
 				return err
 			}
 		case "rejected", "conflicted":
-			if err := os.Rename(source, filepath.Join(s.rejectedDir, entry.Name())); err != nil {
+			if err := s.quarantine(source); err != nil {
 				return err
 			}
 		}
+		usage.Events--
+		usage.Bytes -= info.Size()
+		changed = true
 	}
 	return nil
 }
@@ -291,6 +400,11 @@ func Verify(envelope Envelope, publicKey ed25519.PublicKey) bool {
 }
 
 func (s *Store) loadOrCreateKey() error {
+	release, err := fslock.Acquire(filepath.Join(s.root, "signing-key.lock"))
+	if err != nil {
+		return fmt.Errorf("acquiring signing-key lock: %w", err)
+	}
+	defer release()
 	path := filepath.Join(s.root, "signing-key.json")
 	if err := s.loadKey(path); err == nil {
 		return nil
@@ -343,6 +457,13 @@ func (s *Store) loadKeyAfterConcurrentCreate(path string) error {
 }
 
 func (s *Store) loadKey(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("receipt signing key is not a regular file")
+	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return err
@@ -355,6 +476,9 @@ func (s *Store) loadKey(path string) error {
 	privateKey, privErr := base64.StdEncoding.DecodeString(saved.PrivateKeyBase64)
 	if pubErr != nil || privErr != nil || len(publicKey) != ed25519.PublicKeySize || len(privateKey) != ed25519.PrivateKeySize {
 		return fmt.Errorf("receipt signing key is invalid")
+	}
+	if saved.Algorithm != "ed25519" || !bytes.Equal(ed25519.PrivateKey(privateKey).Public().(ed25519.PublicKey), publicKey) {
+		return fmt.Errorf("receipt signing key pair is inconsistent")
 	}
 	s.publicKey = ed25519.PublicKey(publicKey)
 	s.privateKey = ed25519.PrivateKey(privateKey)
@@ -438,4 +562,161 @@ func randomID(prefix string) string {
 		return fmt.Sprintf("%s-%d", prefix, time.Now().UTC().UnixNano())
 	}
 	return prefix + "-" + hex.EncodeToString(raw[:])
+}
+
+type QueueUsage struct {
+	Events    int
+	Bytes     int64
+	MaxEvents int
+	MaxBytes  int64
+	Accepting bool
+}
+
+func (s *Store) ConfigureQueueLimits(events int, bytes int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if events > 0 {
+		s.maxEvents = events
+	}
+	if bytes > 0 {
+		s.maxBytes = bytes
+	}
+}
+
+// Receipts are immutable files. The owner-only usage record is updated under
+// queue.lock after every mutation and bound to the directory modification time.
+// A crash or external add/remove invalidates it; action paths fail telemetry
+// promptly and repair in the background, never scan a large backlog inline.
+type usageRecord struct {
+	Events            int
+	Bytes             int64
+	DirectoryModified int64
+}
+
+var errUsageStale = errors.New("receipt usage needs reconciliation")
+
+func (s *Store) queueUsage() (QueueUsage, error) {
+	usage := QueueUsage{MaxEvents: s.maxEvents, MaxBytes: s.maxBytes}
+	info, err := os.Stat(s.queueDir)
+	if err != nil {
+		return usage, err
+	}
+	data, err := os.ReadFile(filepath.Join(s.root, "queue-usage.json"))
+	if err != nil {
+		return usage, errUsageStale
+	}
+	var saved usageRecord
+	if json.Unmarshal(data, &saved) != nil || saved.Events < 0 || saved.Bytes < 0 || saved.DirectoryModified != info.ModTime().UnixNano() {
+		return usage, errUsageStale
+	}
+	usage.Events = saved.Events
+	usage.Bytes = saved.Bytes
+	usage.Accepting = usage.Events < s.maxEvents && usage.Bytes < s.maxBytes
+	return usage, nil
+}
+func (s *Store) saveQueueUsage(usage QueueUsage) error {
+	info, err := os.Stat(s.queueDir)
+	if err != nil {
+		return err
+	}
+	data, err := json.Marshal(usageRecord{Events: usage.Events, Bytes: usage.Bytes, DirectoryModified: info.ModTime().UnixNano()})
+	if err != nil {
+		return err
+	}
+	return atomicWrite(filepath.Join(s.root, "queue-usage.json"), data, 0600)
+}
+func (s *Store) reconcileQueueUsage() (QueueUsage, error) {
+	if usage, err := s.queueUsage(); err == nil {
+		return usage, nil
+	}
+	usage := QueueUsage{MaxEvents: s.maxEvents, MaxBytes: s.maxBytes}
+	entries, err := os.ReadDir(s.queueDir)
+	if err != nil {
+		return usage, err
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		info, err := entry.Info()
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return usage, err
+		}
+		usage.Events++
+		usage.Bytes += info.Size()
+	}
+	usage.Accepting = usage.Events < s.maxEvents && usage.Bytes < s.maxBytes
+	return usage, s.saveQueueUsage(usage)
+}
+
+// Caller holds s.mu. A single background worker per Store reconciles after
+// unexpected changes. Cross-process locking prevents stale counts overwriting
+// another IDE's receipts. Lock acquisition always has a fixed deadline.
+func (s *Store) scheduleUsageRepair() {
+	if s.usageRepairRunning {
+		return
+	}
+	s.usageRepairRunning = true
+	repair := &Store{root: s.root, queueDir: s.queueDir, maxEvents: s.maxEvents, maxBytes: s.maxBytes}
+	go func() {
+		release, err := fslock.Acquire(filepath.Join(s.root, "queue.lock"))
+		if err == nil {
+			_, _ = repair.reconcileQueueUsage()
+			release()
+		}
+		s.mu.Lock()
+		s.usageRepairRunning = false
+		s.mu.Unlock()
+	}()
+}
+func (s *Store) QueueStatus() (QueueUsage, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	release, err := fslock.Acquire(filepath.Join(s.root, "queue.lock"))
+	if err != nil {
+		return QueueUsage{}, err
+	}
+	defer release()
+	usage, err := s.queueUsage()
+	if err != nil {
+		s.scheduleUsageRepair()
+	}
+	return usage, err
+}
+func (s *Store) quarantine(path string) error {
+	if err := os.Rename(path, filepath.Join(s.rejectedDir, filepath.Base(path))); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	// Terminal corrupt/rejected artifacts are diagnostic retention, never active
+	// receipts. Keep at most 1000 files / 32 MiB; pending valid receipts are not evicted.
+	entries, err := os.ReadDir(s.rejectedDir)
+	if err != nil {
+		return err
+	}
+	var bytes int64
+	for _, entry := range entries {
+		if info, err := entry.Info(); err == nil {
+			bytes += info.Size()
+		}
+	}
+	for index, entry := range entries {
+		if len(entries)-index <= 1000 && bytes <= 32*1024*1024 {
+			break
+		}
+		if entry.IsDir() {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		if err := os.Remove(filepath.Join(s.rejectedDir, entry.Name())); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		bytes -= info.Size()
+	}
+	return nil
 }

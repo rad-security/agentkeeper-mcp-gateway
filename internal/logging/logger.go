@@ -54,10 +54,11 @@ type ToolCallOutcome struct {
 
 // Logger writes structured events to a JSONL file.
 type Logger struct {
-	file    *os.File
-	mu      sync.Mutex
-	logPath string
-	verbose bool
+	file        *os.File
+	mu          sync.Mutex
+	logPath     string
+	verbose     bool
+	logMaxBytes int64
 	// Buffer for batch telemetry upload
 	buffer         []Event
 	bufferMu       sync.Mutex
@@ -129,6 +130,7 @@ func newBufferedLogger(file *os.File, logPath string, verbose bool) *Logger {
 		file:           file,
 		logPath:        logPath,
 		verbose:        verbose,
+		logMaxBytes:    16 * 1024 * 1024,
 		buffer:         make([]Event, 0, 100),
 		queueMaxEvents: 100000,
 		queueMaxBytes:  256 * 1024 * 1024,
@@ -470,6 +472,8 @@ func (l *Logger) ResolveEvents(statusByEventID map[string]string) error {
 
 // Close closes the log file.
 func (l *Logger) Close() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	if l.file == nil {
 		return nil
 	}
@@ -494,12 +498,13 @@ func (l *Logger) writeEvent(event Event) {
 		return
 	}
 
+	l.mu.Lock()
 	if l.file != nil {
-		l.mu.Lock()
-		l.file.Write(data)
-		l.file.Write([]byte("\n"))
-		l.mu.Unlock()
+		if err := l.writeBoundedLog(append(data, '\n')); err != nil {
+			fmt.Fprintf(os.Stderr, "[agentkeeper] local diagnostic log unavailable: %v\n", err)
+		}
 	}
+	l.mu.Unlock()
 
 	if remoteIngestable(event) {
 		l.bufferMu.Lock()

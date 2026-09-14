@@ -585,8 +585,8 @@ func TestPolicyCacheIsScopedAndBoundToRouteIdentity(t *testing.T) {
 	if err := swapped.SetPolicyCache(baseCachePath); err == nil {
 		t.Fatal("signed cache from a different route identity was accepted")
 	}
-	if mode, _ := swapped.EffectiveMode(); mode != "enforce" {
-		t.Fatalf("route-identity mismatch restored mode=%q, want fail-closed enforce", mode)
+	if mode, _ := swapped.EffectiveMode(); mode != "observe" {
+		t.Fatalf("route-identity mismatch must preserve verified Observe assignment; got %q", mode)
 	}
 }
 
