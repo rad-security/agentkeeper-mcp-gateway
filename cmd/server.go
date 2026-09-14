@@ -37,11 +37,18 @@ are blocked.`,
 		enforce, _ := cmd.Flags().GetBool("enforce")
 		verbose, _ := cmd.Root().PersistentFlags().GetBool("verbose")
 
-		// Load config
+		// An explicitly selected configuration is authoritative. Refuse a
+		// missing/unreadable/malformed selection before any startup mutations;
+		// serving an empty default inventory would misleadingly appear healthy.
+		selectedConfig := config.CurrentConfigPath()
+		if configPath != "" || os.Getenv("AGENTKEEPER_CONFIG") != "" {
+			if _, err := os.Stat(selectedConfig); err != nil {
+				return fmt.Errorf("cannot start MCP Gateway: reading selected configuration %q: %w", selectedConfig, err)
+			}
+		}
 		cfg, err := config.Load()
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "[agentkeeper] warning: config load error: %v, using defaults\n", err)
-			cfg = config.DefaultConfig()
+			return fmt.Errorf("cannot start MCP Gateway: loading configuration %q: %w", selectedConfig, err)
 		}
 
 		if enforce {
