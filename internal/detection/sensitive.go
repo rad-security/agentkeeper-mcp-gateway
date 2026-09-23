@@ -46,7 +46,7 @@ func compileSensitiveDataPatterns() []Pattern {
 			Severity:    "critical",
 			Description: "Possible credit card number detected",
 			Category:    "sensitive_data",
-			Regex:       regexp.MustCompile(`\b[0-9]{4}[- ]?[0-9]{4}[- ]?[0-9]{4}[- ]?[0-9]{1,4}\b`),
+			Regex:       regexp.MustCompile(`\b[0-9](?:[- ]?[0-9]){12,18}\b`),
 		},
 		{
 			Name:        "ssn",
@@ -70,4 +70,36 @@ func compileSensitiveDataPatterns() []Pattern {
 			Regex:       regexp.MustCompile(`eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}`),
 		},
 	}
+}
+
+// validCardNumber rejects numeric identifiers that merely have a card-like length.
+// Luhn is validation of a candidate, not proof that a card is issued or active.
+func validCardNumber(candidate string) bool {
+	var digits []int
+	nonzero := false
+	for _, c := range candidate {
+		if c == ' ' || c == '-' {
+			continue
+		}
+		if c < '0' || c > '9' {
+			return false
+		}
+		digits = append(digits, int(c-'0'))
+		nonzero = nonzero || c != '0'
+	}
+	if len(digits) < 13 || len(digits) > 19 || !nonzero {
+		return false
+	}
+	sum := 0
+	for i, doubled := len(digits)-1, false; i >= 0; i, doubled = i-1, !doubled {
+		n := digits[i]
+		if doubled {
+			n *= 2
+			if n > 9 {
+				n -= 9
+			}
+		}
+		sum += n
+	}
+	return sum%10 == 0
 }

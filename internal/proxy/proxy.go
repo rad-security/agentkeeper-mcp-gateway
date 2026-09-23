@@ -183,8 +183,23 @@ func verdictRank(v string) int {
 
 // Run starts the proxy, reading from stdin and writing to stdout.
 func (p *Proxy) Run() error {
+	return p.RunContext(context.Background())
+}
+
+// RunContext lets termination interrupt the input wait even when the native
+// client keeps its stdin pipe open. Closing os.Stdin itself can block while a
+// platform read is in progress, so cancellation closes our owned pipe instead.
+func (p *Proxy) RunContext(ctx context.Context) error {
 	defer p.Close()
-	return p.run(os.Stdin, os.Stdout)
+	input, pump := io.Pipe()
+	defer input.Close()
+	go func() {
+		_, err := io.Copy(pump, os.Stdin)
+		_ = pump.CloseWithError(err)
+	}()
+	stop := context.AfterFunc(ctx, func() { _ = input.CloseWithError(ctx.Err()) })
+	defer stop()
+	return p.run(input, os.Stdout)
 }
 
 // Close cancels background discovery and waits for it to leave backend pipes
@@ -1191,6 +1206,7 @@ func (p *Proxy) handleToolsCallContext(ctx context.Context, msg JSONRPCMessage) 
 	// --- 5. Forward to backend server ---
 	srv := p.manager.Get(serverName)
 	if srv == nil {
+
 		p.logToolOutcome(serverName, originalName, callParams.Arguments, finalResult, logging.ToolCallOutcome{
 			CallID: callID, AttemptID: attemptID, Mode: effectiveMode,
 			PolicyDecision: finalVerdict, EvaluationStatus: evaluationStatus,
@@ -1230,6 +1246,18 @@ func (p *Proxy) handleToolsCallContext(ctx context.Context, msg JSONRPCMessage) 
 				Dispatched: true, ResultReceived: false, ResultReturned: false, FailureReason: "client_cancelled",
 			})
 			return &JSONRPCMessage{JSONRPC: "2.0", ID: msg.ID, Error: &JSONRPCError{Code: -32800, Message: "Request cancelled"}}, nil
+		}
+		var upstreamError *server.RPCError
+		if errors.As(err, &upstreamError) {
+			// The provider answered with an application error; this is a returned
+			// response, not a failed dispatch. Preserve code, message and data.
+			p.logToolOutcome(serverName, originalName, callParams.Arguments, finalResult, logging.ToolCallOutcome{
+				CallID: callID, AttemptID: attemptID, Mode: effectiveMode,
+				PolicyDecision: finalVerdict, EvaluationStatus: evaluationStatus,
+				DecisionID: decisionID, RequiredDisposition: "forward", AppliedDisposition: "result_returned",
+				Dispatched: true, ResultReceived: true, ResultReturned: true, FailureReason: "upstream_rpc_error",
+			})
+			return &JSONRPCMessage{JSONRPC: "2.0", ID: msg.ID, Error: &JSONRPCError{Code: upstreamError.Code, Message: upstreamError.Message, Data: upstreamError.Data}}, nil
 		}
 		p.logToolOutcome(serverName, originalName, callParams.Arguments, finalResult, logging.ToolCallOutcome{
 			CallID: callID, AttemptID: attemptID, Mode: effectiveMode,

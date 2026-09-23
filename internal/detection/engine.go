@@ -130,7 +130,17 @@ func (e *Engine) EvaluateToolDescriptions(tools []ToolDescription) []Result {
 
 func (e *Engine) checkSensitiveData(content string) Result {
 	for _, pat := range e.sensitivePatterns {
-		if pat.Regex.MatchString(content) {
+		matched := pat.Regex.MatchString(content)
+		if matched && pat.Name == "credit_card" {
+			matched = false
+			for _, candidate := range pat.Regex.FindAllString(content, -1) {
+				if validCardNumber(candidate) {
+					matched = true
+					break
+				}
+			}
+		}
+		if matched {
 			return Result{
 				Verdict:     VerdictWarn,
 				PatternName: pat.Name,

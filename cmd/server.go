@@ -1,11 +1,14 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/config"
@@ -226,8 +229,41 @@ are blocked.`,
 			fmt.Fprintf(os.Stderr, "[agentkeeper] Local mode (run 'agentkeeper-mcp-gateway auth login' to connect)\n")
 		}
 
-		return p.Run()
+		return runProxyWithSignals(p)
 	},
+}
+
+// Let ordinary native-client termination follow the same cancellation and durable
+// terminal-receipt path as stdin EOF. A forced kill cannot establish an outcome.
+func runProxyWithSignals(p *proxy.Proxy) error {
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(signals)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	interrupted := make(chan struct{})
+	go func() {
+		select {
+		case <-signals:
+			close(interrupted)
+			// Bound shutdown even if a filesystem or downstream write never completes.
+			// Timeout exits unsuccessfully; it must not fabricate a terminal receipt.
+			timer := time.AfterFunc(5*time.Second, func() { os.Exit(1) })
+			defer timer.Stop()
+			cancel()
+			<-done
+		case <-done:
+		}
+	}()
+	err := p.RunContext(ctx) // Run closes/cancels the proxy before returning.
+	close(done)
+	select {
+	case <-interrupted:
+		return nil
+	default:
+		return err
+	}
 }
 
 func serverConfigsFromConfig(cfg config.Config) []server.ServerConfig {
