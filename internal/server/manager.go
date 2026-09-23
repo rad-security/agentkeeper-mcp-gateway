@@ -29,6 +29,16 @@ const (
 	backendStopGracePeriod  = 2 * time.Second
 )
 
+// RPCError is a valid upstream JSON-RPC error response. Keep its structured
+// fields distinct from transport failures so clients retain provider error codes.
+type RPCError struct {
+	Code    int             `json:"code"`
+	Message string          `json:"message"`
+	Data    json.RawMessage `json:"data,omitempty"`
+}
+
+func (e *RPCError) Error() string { return e.Message }
+
 // ServerConfig defines a backend MCP server.
 type ServerConfig struct {
 	Name      string            `json:"name"`
@@ -398,9 +408,14 @@ func (m *Manager) StopAll() {
 	}
 	m.servers = make(map[string]*Server)
 	m.mu.Unlock()
+	// Give all owned backends the same grace window. Sequential waits make
+	// ordinary shutdown grow by two seconds per EOF-resistant provider.
+	var stopping sync.WaitGroup
 	for _, srv := range servers {
-		srv.stop()
+		stopping.Add(1)
+		go func(srv *Server) { defer stopping.Done(); srv.stop() }(srv)
 	}
+	stopping.Wait()
 }
 
 func (s *Server) stop() {
@@ -1151,6 +1166,10 @@ func readSSEResult(r io.Reader, id int64, notify func(string, json.RawMessage)) 
 		if err == nil {
 			return result, nil
 		}
+		var upstreamError *RPCError
+		if errors.As(err, &upstreamError) {
+			return nil, upstreamError
+		}
 	}
 	if err := scanner.Err(); err != nil {
 		return nil, err
@@ -1162,10 +1181,7 @@ func parseJSONRPCResult(data []byte, id int64) (json.RawMessage, error) {
 	var msg struct {
 		ID     *int64          `json:"id"`
 		Result json.RawMessage `json:"result"`
-		Error  *struct {
-			Code    int    `json:"code"`
-			Message string `json:"message"`
-		} `json:"error"`
+		Error  *RPCError       `json:"error"`
 	}
 	if err := json.Unmarshal(data, &msg); err != nil {
 		return nil, err
@@ -1174,7 +1190,7 @@ func parseJSONRPCResult(data []byte, id int64) (json.RawMessage, error) {
 		return nil, fmt.Errorf("unexpected JSON-RPC response id %d, want %d", *msg.ID, id)
 	}
 	if msg.Error != nil {
-		return nil, fmt.Errorf("%s", msg.Error.Message)
+		return nil, msg.Error
 	}
 	if msg.Result == nil {
 		return json.RawMessage(`{}`), nil
@@ -1217,10 +1233,7 @@ func (s *Server) dispatchRPCPayload(payload []byte) {
 		Method string          `json:"method"`
 		Params json.RawMessage `json:"params"`
 		Result json.RawMessage `json:"result"`
-		Error  *struct {
-			Code    int    `json:"code"`
-			Message string `json:"message"`
-		} `json:"error"`
+		Error  *RPCError       `json:"error"`
 	}
 	if err := json.Unmarshal(payload, &msg); err != nil {
 		return
@@ -1241,7 +1254,7 @@ func (s *Server) dispatchRPCPayload(payload []byte) {
 		return
 	}
 	if msg.Error != nil {
-		ch <- rpcResponse{err: fmt.Errorf("%s", msg.Error.Message)}
+		ch <- rpcResponse{err: msg.Error}
 		return
 	}
 	if msg.Result == nil {

@@ -183,8 +183,23 @@ func verdictRank(v string) int {
 
 // Run starts the proxy, reading from stdin and writing to stdout.
 func (p *Proxy) Run() error {
+	return p.RunContext(context.Background())
+}
+
+// RunContext lets termination interrupt the input wait even when the native
+// client keeps its stdin pipe open. Closing os.Stdin itself can block while a
+// platform read is in progress, so cancellation closes our owned pipe instead.
+func (p *Proxy) RunContext(ctx context.Context) error {
 	defer p.Close()
-	return p.run(os.Stdin, os.Stdout)
+	input, pump := io.Pipe()
+	defer input.Close()
+	go func() {
+		_, err := io.Copy(pump, os.Stdin)
+		_ = pump.CloseWithError(err)
+	}()
+	stop := context.AfterFunc(ctx, func() { _ = pump.CloseWithError(ctx.Err()) })
+	defer stop()
+	return p.run(input, os.Stdout)
 }
 
 // Close cancels background discovery and waits for it to leave backend pipes
@@ -1191,6 +1206,7 @@ func (p *Proxy) handleToolsCallContext(ctx context.Context, msg JSONRPCMessage) 
 	// --- 5. Forward to backend server ---
 	srv := p.manager.Get(serverName)
 	if srv == nil {
+
 		p.logToolOutcome(serverName, originalName, callParams.Arguments, finalResult, logging.ToolCallOutcome{
 			CallID: callID, AttemptID: attemptID, Mode: effectiveMode,
 			PolicyDecision: finalVerdict, EvaluationStatus: evaluationStatus,
@@ -1230,6 +1246,33 @@ func (p *Proxy) handleToolsCallContext(ctx context.Context, msg JSONRPCMessage) 
 				Dispatched: true, ResultReceived: false, ResultReturned: false, FailureReason: "client_cancelled",
 			})
 			return &JSONRPCMessage{JSONRPC: "2.0", ID: msg.ID, Error: &JSONRPCError{Code: -32800, Message: "Request cancelled"}}, nil
+		}
+		var upstreamError *server.RPCError
+		if errors.As(err, &upstreamError) {
+			// Error message/data are provider-controlled response content too.
+			rawError, _ := json.Marshal(upstreamError)
+			if p.config.DetectionEngine != nil {
+				result := p.config.DetectionEngine.EvaluateToolResponse(serverName, originalName, string(rawError))
+				result = applyDetectionPolicy(result, syncPolicy, p.config.Detection)
+				if verdictRank(string(result.Verdict)) > verdictRank(finalVerdict) {
+					finalVerdict, finalResult = string(result.Verdict), result
+				}
+			}
+			outcome := logging.ToolCallOutcome{
+				CallID: callID, AttemptID: attemptID, Mode: effectiveMode,
+				PolicyDecision: finalVerdict, EvaluationStatus: evaluationStatus,
+				DecisionID: decisionID, RequiredDisposition: "forward", AppliedDisposition: "result_returned",
+				Dispatched: true, ResultReceived: true, ResultReturned: true, FailureReason: "upstream_rpc_error",
+			}
+			if finalVerdict == "block" && enforceThisCall {
+				outcome.RequiredDisposition, outcome.AppliedDisposition = "withhold_result", "result_withheld"
+				outcome.ResultReturned, outcome.ResponseWithheld = false, true
+			}
+			p.logToolOutcome(serverName, originalName, callParams.Arguments, finalResult, outcome)
+			if outcome.ResponseWithheld {
+				return &JSONRPCMessage{JSONRPC: "2.0", ID: msg.ID, Error: &JSONRPCError{Code: -32003, Message: "Blocked by AgentKeeper: upstream error content was withheld."}}, nil
+			}
+			return &JSONRPCMessage{JSONRPC: "2.0", ID: msg.ID, Error: &JSONRPCError{Code: upstreamError.Code, Message: upstreamError.Message, Data: upstreamError.Data}}, nil
 		}
 		p.logToolOutcome(serverName, originalName, callParams.Arguments, finalResult, logging.ToolCallOutcome{
 			CallID: callID, AttemptID: attemptID, Mode: effectiveMode,
