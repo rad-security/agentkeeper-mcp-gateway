@@ -197,7 +197,7 @@ func (p *Proxy) RunContext(ctx context.Context) error {
 		_, err := io.Copy(pump, os.Stdin)
 		_ = pump.CloseWithError(err)
 	}()
-	stop := context.AfterFunc(ctx, func() { _ = input.CloseWithError(ctx.Err()) })
+	stop := context.AfterFunc(ctx, func() { _ = pump.CloseWithError(ctx.Err()) })
 	defer stop()
 	return p.run(input, os.Stdout)
 }
