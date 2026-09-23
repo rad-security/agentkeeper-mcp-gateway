@@ -408,9 +408,14 @@ func (m *Manager) StopAll() {
 	}
 	m.servers = make(map[string]*Server)
 	m.mu.Unlock()
+	// Give all owned backends the same grace window. Sequential waits make
+	// ordinary shutdown grow by two seconds per EOF-resistant provider.
+	var stopping sync.WaitGroup
 	for _, srv := range servers {
-		srv.stop()
+		stopping.Add(1)
+		go func(srv *Server) { defer stopping.Done(); srv.stop() }(srv)
 	}
+	stopping.Wait()
 }
 
 func (s *Server) stop() {

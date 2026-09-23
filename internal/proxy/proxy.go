@@ -1249,14 +1249,29 @@ func (p *Proxy) handleToolsCallContext(ctx context.Context, msg JSONRPCMessage) 
 		}
 		var upstreamError *server.RPCError
 		if errors.As(err, &upstreamError) {
-			// The provider answered with an application error; this is a returned
-			// response, not a failed dispatch. Preserve code, message and data.
-			p.logToolOutcome(serverName, originalName, callParams.Arguments, finalResult, logging.ToolCallOutcome{
+			// Error message/data are provider-controlled response content too.
+			rawError, _ := json.Marshal(upstreamError)
+			if p.config.DetectionEngine != nil {
+				result := p.config.DetectionEngine.EvaluateToolResponse(serverName, originalName, string(rawError))
+				result = applyDetectionPolicy(result, syncPolicy, p.config.Detection)
+				if verdictRank(string(result.Verdict)) > verdictRank(finalVerdict) {
+					finalVerdict, finalResult = string(result.Verdict), result
+				}
+			}
+			outcome := logging.ToolCallOutcome{
 				CallID: callID, AttemptID: attemptID, Mode: effectiveMode,
 				PolicyDecision: finalVerdict, EvaluationStatus: evaluationStatus,
 				DecisionID: decisionID, RequiredDisposition: "forward", AppliedDisposition: "result_returned",
 				Dispatched: true, ResultReceived: true, ResultReturned: true, FailureReason: "upstream_rpc_error",
-			})
+			}
+			if finalVerdict == "block" && enforceThisCall {
+				outcome.RequiredDisposition, outcome.AppliedDisposition = "withhold_result", "result_withheld"
+				outcome.ResultReturned, outcome.ResponseWithheld = false, true
+			}
+			p.logToolOutcome(serverName, originalName, callParams.Arguments, finalResult, outcome)
+			if outcome.ResponseWithheld {
+				return &JSONRPCMessage{JSONRPC: "2.0", ID: msg.ID, Error: &JSONRPCError{Code: -32003, Message: "Blocked by AgentKeeper: upstream error content was withheld."}}, nil
+			}
 			return &JSONRPCMessage{JSONRPC: "2.0", ID: msg.ID, Error: &JSONRPCError{Code: upstreamError.Code, Message: upstreamError.Message, Data: upstreamError.Data}}, nil
 		}
 		p.logToolOutcome(serverName, originalName, callParams.Arguments, finalResult, logging.ToolCallOutcome{

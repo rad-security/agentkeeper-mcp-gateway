@@ -134,7 +134,7 @@ func (e *Engine) checkSensitiveData(content string) Result {
 		if matched && pat.Name == "credit_card" {
 			matched = false
 			for _, candidate := range pat.Regex.FindAllString(content, -1) {
-				if validCardNumber(candidate) {
+				if validCardCandidate(candidate) {
 					matched = true
 					break
 				}

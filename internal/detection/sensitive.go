@@ -103,3 +103,18 @@ func validCardNumber(candidate string) bool {
 	}
 	return sum%10 == 0
 }
+
+// A greedy candidate can include a following CVV separated by whitespace.
+// Consider complete delimited PANs as well, without truncating a contiguous
+// longer numeric identifier into a shorter, accidentally valid number.
+func validCardCandidate(candidate string) bool {
+	if validCardNumber(candidate) {
+		return true
+	}
+	for i, c := range candidate {
+		if (c == ' ' || c == '-') && validCardNumber(candidate[:i]) {
+			return true
+		}
+	}
+	return false
+}

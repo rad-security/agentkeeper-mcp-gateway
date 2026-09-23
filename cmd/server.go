@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
@@ -37,6 +38,8 @@ the gateway logs all tool calls and flags suspicious activity without
 blocking. In enforce mode, tool calls that violate security policies
 are blocked.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
+		lifecycle := newServerLifecycle()
+		defer lifecycle.Stop() // Registered first: guard all later deferred cleanup.
 		enforce, _ := cmd.Flags().GetBool("enforce")
 		verbose, _ := cmd.Root().PersistentFlags().GetBool("verbose")
 
@@ -229,38 +232,53 @@ are blocked.`,
 			fmt.Fprintf(os.Stderr, "[agentkeeper] Local mode (run 'agentkeeper-mcp-gateway auth login' to connect)\n")
 		}
 
-		return runProxyWithSignals(p)
+		return lifecycle.Run(p)
 	},
 }
 
-// Let ordinary native-client termination follow the same cancellation and durable
-// terminal-receipt path as stdin EOF. A forced kill cannot establish an outcome.
-func runProxyWithSignals(p *proxy.Proxy) error {
-	signals := make(chan os.Signal, 1)
-	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
-	defer signal.Stop(signals)
+// Keep the termination bound active through proxy, backend and logger cleanup.
+// A forced kill still cannot establish an upstream outcome.
+type serverLifecycle struct {
+	ctx         context.Context
+	cancel      context.CancelFunc
+	signals     chan os.Signal
+	done        chan struct{}
+	interrupted chan struct{}
+}
+
+func newServerLifecycle() *serverLifecycle {
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	done := make(chan struct{})
-	interrupted := make(chan struct{})
+	l := &serverLifecycle{ctx: ctx, cancel: cancel, signals: make(chan os.Signal, 1), done: make(chan struct{}), interrupted: make(chan struct{})}
+	signal.Notify(l.signals, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		select {
-		case <-signals:
-			close(interrupted)
-			// Bound shutdown even if a filesystem or downstream write never completes.
-			// Timeout exits unsuccessfully; it must not fabricate a terminal receipt.
+		case <-l.signals:
+			close(l.interrupted)
+			// Timeout is unsuccessful and never fabricates a terminal receipt.
 			timer := time.AfterFunc(5*time.Second, func() { os.Exit(1) })
 			defer timer.Stop()
-			cancel()
-			<-done
-		case <-done:
+			l.cancel()
+			<-l.done
+		case <-l.done:
 		}
 	}()
-	err := p.RunContext(ctx) // Run closes/cancels the proxy before returning.
-	close(done)
+	return l
+}
+
+func (l *serverLifecycle) Stop() {
+	signal.Stop(l.signals)
+	l.cancel()
+	close(l.done)
+}
+
+func (l *serverLifecycle) Run(p *proxy.Proxy) error {
+	err := p.RunContext(l.ctx)
 	select {
-	case <-interrupted:
-		return nil
+	case <-l.interrupted:
+		if errors.Is(err, context.Canceled) {
+			return nil
+		}
+		return err
 	default:
 		return err
 	}
