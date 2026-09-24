@@ -118,6 +118,9 @@ are blocked.`,
 		if authorityClient == nil {
 			authorityClient = telemetry.NewClient("", "", logger)
 		}
+		// The local mode (config "mode" or --enforce) is a request. A verified,
+		// revisioned route assignment from the control plane is authoritative.
+		requestedMode := cfg.Mode
 		authorityClient.SetMode(cfg.Mode)
 		authorityClient.SetVersion(version)
 		authorityClient.SetRouteContext(os.Getenv(gatewayentry.EnvClientName), os.Getenv(gatewayentry.EnvConfigSourceHash), os.Getenv(gatewayentry.EnvRouteRevision))
@@ -225,14 +228,14 @@ are blocked.`,
 
 		// Report the mode after the synchronous startup sync. This keeps the
 		// operator-visible message aligned with the mode the proxy will actually
-		// apply, while the proxy still cannot serve traffic until p.Run below.
-		mode := "audit"
-		if tc != nil {
-			mode, _ = tc.EffectiveMode()
-		} else if cfg.Mode == "enforce" {
-			mode = "enforce"
+		// apply (the same mode sent to the dashboard and stamped on receipts),
+		// while the proxy still cannot serve traffic until p.Run below.
+		mode, revision := authorityClient.EffectiveMode()
+		if note := telemetry.LocalModeRequestNote(requestedMode, mode, revision); note != "" {
+			fmt.Fprintf(os.Stderr, "[agentkeeper] MCP Gateway v%s starting in %s mode; %s\n", version, mode, note)
+		} else {
+			fmt.Fprintf(os.Stderr, "[agentkeeper] MCP Gateway v%s starting in %s mode\n", version, mode)
 		}
-		fmt.Fprintf(os.Stderr, "[agentkeeper] MCP Gateway v%s starting in %s mode\n", version, mode)
 		fmt.Fprintf(os.Stderr, "[agentkeeper] %d servers configured, %d detection patterns loaded\n", len(serverConfigs), 36)
 		if hasRuntimeBroker {
 			fmt.Fprintf(os.Stderr, "[agentkeeper] Connected through credentialless AgentKeeper runtime broker\n")

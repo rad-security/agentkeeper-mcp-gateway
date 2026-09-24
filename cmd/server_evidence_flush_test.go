@@ -91,6 +91,23 @@ type evidenceAPI struct {
 	receipts []map[string]interface{}
 	events   []map[string]interface{}
 	release  chan struct{}
+	// Optional per-route assignment returned by registration, and the
+	// effective mode/revision each registration reported (dashboard ACK input).
+	assignedMode     string
+	assignedRevision int64
+	registrations    []map[string]interface{}
+}
+
+func (a *evidenceAPI) assign(mode string, revision int64) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.assignedMode, a.assignedRevision = mode, revision
+}
+
+func (a *evidenceAPI) registrationSnapshot() []map[string]interface{} {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]map[string]interface{}(nil), a.registrations...)
 }
 
 func (a *evidenceAPI) snapshot() (receipts, events []map[string]interface{}) {
@@ -111,6 +128,14 @@ func newEvidenceAPI(t *testing.T, ackDelay time.Duration, hang bool) *evidenceAP
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
 		case "/api/v2/mcp/gateways/register":
+			api.mu.Lock()
+			api.registrations = append(api.registrations, body)
+			mode, revision := api.assignedMode, api.assignedRevision
+			api.mu.Unlock()
+			if revision > 0 {
+				fmt.Fprintf(w, `{"ok":true,"gateway_id":"11111111-1111-4111-8111-111111111111","route_assignment":{"desired_mode":%q,"desired_revision":%d}}`, mode, revision)
+				return
+			}
 			_, _ = w.Write([]byte(`{"ok":true,"gateway_id":"11111111-1111-4111-8111-111111111111"}`))
 		case "/api/v1/mcp/sync":
 			_, _ = w.Write([]byte(`{"ok":true,"gateway_id":"11111111-1111-4111-8111-111111111111","policy":{"mode":"audit"}}`))

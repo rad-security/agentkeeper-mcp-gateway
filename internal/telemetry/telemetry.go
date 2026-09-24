@@ -571,6 +571,16 @@ func (c *Client) syncV2() bool {
 	return true
 }
 
+// LocalModeRequestNote explains, once at startup, why a local enforce request
+// (config "mode": "enforce" or --enforce) is not the effective mode: a verified
+// control-plane assignment with a revision is authoritative for the route.
+func LocalModeRequestNote(requestedMode, effectiveMode string, revision int64) string {
+	if modeLabel(requestedMode) != "enforce" || modeLabel(effectiveMode) != "observe" || revision <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("local config requests enforce but this route's assignment is observe r%d — promote the route in the AgentKeeper dashboard to enforce", revision)
+}
+
 func modeLabel(mode string) string {
 	if strings.EqualFold(mode, "enforce") {
 		return "enforce"
