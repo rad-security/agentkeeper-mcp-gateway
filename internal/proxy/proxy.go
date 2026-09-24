@@ -1960,6 +1960,22 @@ func (p *Proxy) inspectContentResultMode(id *json.RawMessage, serverName, method
 	return &JSONRPCMessage{JSONRPC: "2.0", ID: id, Result: response}, nil
 }
 
+// builtinToolAnnotations marks a Gateway built-in as read-only. Neither
+// built-in invokes an upstream tool or changes configuration: agentkeeper_status
+// reads in-memory Gateway and queue state, and agentkeeper_audit reads the
+// cached manifests after triggering the same background tools/list refresh
+// that tools/list performs. Without readOnlyHint, clients such as Cursor
+// classify them as writes that need approval.
+func builtinToolAnnotations(title string) map[string]interface{} {
+	return map[string]interface{}{
+		"title":           title,
+		"readOnlyHint":    true,
+		"destructiveHint": false,
+		"idempotentHint":  true,
+		"openWorldHint":   false,
+	}
+}
+
 func (p *Proxy) getBuiltinTools() []interface{} {
 	return []interface{}{
 		map[string]interface{}{
@@ -1969,6 +1985,7 @@ func (p *Proxy) getBuiltinTools() []interface{} {
 				"type":       "object",
 				"properties": map[string]interface{}{},
 			},
+			"annotations": builtinToolAnnotations("AgentKeeper Gateway status"),
 		},
 		map[string]interface{}{
 			"name":        "agentkeeper_audit",
@@ -1977,6 +1994,7 @@ func (p *Proxy) getBuiltinTools() []interface{} {
 				"type":       "object",
 				"properties": map[string]interface{}{},
 			},
+			"annotations": builtinToolAnnotations("AgentKeeper MCP security audit"),
 		},
 	}
 }
