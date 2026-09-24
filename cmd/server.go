@@ -205,7 +205,19 @@ are blocked.`,
 				p.SetEnforceMode(mode == "enforce")
 			})
 			dashboardConnected = tc.Start()
-			defer tc.Stop()
+			// Every exit path (stdin EOF, client disconnect, SIGINT/SIGTERM)
+			// reaches this after the proxy has recorded terminal evidence for
+			// in-flight calls. Upload that evidence with a bounded final flush
+			// while owned backends stop, so neither bound adds to the other.
+			defer func() {
+				backendsStopped := make(chan struct{})
+				go func() {
+					defer close(backendsStopped)
+					mgr.StopAll()
+				}()
+				tc.Stop()
+				<-backendsStopped
+			}()
 		}
 		if !authorityClient.ModeAuthorityReady() {
 			return fmt.Errorf("%w: reconnect this route for an acknowledged mode assignment; existing customer configuration was preserved", telemetry.ErrModeAuthorityUnavailable)

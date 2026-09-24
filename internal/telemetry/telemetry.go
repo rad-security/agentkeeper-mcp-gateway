@@ -115,7 +115,21 @@ type Client struct {
 	policyStateValid         bool
 	policyCacheMu            sync.Mutex
 	now                      func() time.Time
+	// requestCtx bounds every backend request; Stop cancels it when the final
+	// evidence flush budget is spent so a hung backend cannot delay exit.
+	requestCtx    context.Context
+	cancelRequest context.CancelFunc
+	loopDone      chan struct{}
+	stopOnce      sync.Once
 }
+
+// finalFlushBudget bounds the evidence upload attempted when the Gateway exits
+// (stdin EOF, client disconnect or termination signal). Evidence that is not
+// acknowledged within the budget stays in the durable queues for the next start.
+const finalFlushBudget = 3 * time.Second
+
+// maxFinalFlushBatches bounds how many full upload batches the exit drain sends.
+const maxFinalFlushBatches = 10
 
 // NewRuntimeClient uses the local machine broker for all connected telemetry.
 // The gateway never receives or stores the machine device credential.
@@ -136,6 +150,7 @@ func StableHostname() string {
 func NewClient(apiURL, apiKey string, logger *logging.Logger) *Client {
 	hostname := StableHostname()
 	machineID := machineid.Detect()
+	requestCtx, cancelRequest := context.WithCancel(context.Background())
 	return &Client{
 		apiURL:         apiURL,
 		apiKey:         apiKey,
@@ -146,6 +161,8 @@ func NewClient(apiURL, apiKey string, logger *logging.Logger) *Client {
 		done:           make(chan struct{}),
 		policyCacheTTL: 24 * time.Hour,
 		now:            time.Now,
+		requestCtx:     requestCtx,
+		cancelRequest:  cancelRequest,
 	}
 }
 
@@ -286,7 +303,10 @@ func (c *Client) Start() bool {
 	// Register immediately on startup
 	connected := c.sync()
 
+	loopDone := make(chan struct{})
+	c.loopDone = loopDone
 	go func() {
+		defer close(loopDone)
 		flushTicker := time.NewTicker(5 * time.Second)
 		syncTicker := time.NewTicker(30 * time.Second)
 		defer flushTicker.Stop()
@@ -299,8 +319,7 @@ func (c *Client) Start() bool {
 			case <-syncTicker.C:
 				c.sync()
 			case <-c.done:
-				c.flush() // Final flush
-				c.flushReceipts()
+				c.drainEvidence()
 				return
 			}
 		}
@@ -308,9 +327,54 @@ func (c *Client) Start() bool {
 	return connected
 }
 
-// Stop signals the flush loop to stop.
+// Stop ends the background loops after a final evidence upload bounded by
+// finalFlushBudget, and waits for that upload before returning so process exit
+// cannot discard it. It is safe to call more than once.
 func (c *Client) Stop() {
-	close(c.done)
+	c.StopWithin(finalFlushBudget)
+}
+
+// StopWithin is Stop with an explicit final-flush budget. When the budget is
+// spent, in-flight backend requests are cancelled; unacknowledged events and
+// receipts remain in their durable queues and upload on the next start.
+func (c *Client) StopWithin(budget time.Duration) {
+	c.stopOnce.Do(func() {
+		close(c.done)
+		if c.loopDone != nil {
+			timer := time.AfterFunc(budget, c.cancelRequests)
+			<-c.loopDone
+			timer.Stop()
+		}
+		c.cancelRequests()
+	})
+}
+
+func (c *Client) cancelRequests() {
+	if c.cancelRequest != nil {
+		c.cancelRequest()
+	}
+}
+
+func (c *Client) requestContext() context.Context {
+	if c.requestCtx != nil {
+		return c.requestCtx
+	}
+	return context.Background()
+}
+
+// drainEvidence uploads queued events and receipts until both queues are
+// empty, an upload fails, or the request context is cancelled by StopWithin.
+func (c *Client) drainEvidence() {
+	for batch := 0; batch < maxFinalFlushBatches; batch++ {
+		if c.requestContext().Err() != nil {
+			return
+		}
+		moreEvents := c.flush()
+		moreReceipts := c.flushReceipts()
+		if !moreEvents && !moreReceipts {
+			return
+		}
+	}
 }
 
 // Policy returns the cached dashboard policy. A verified last-known-good
@@ -531,17 +595,20 @@ func (c *Client) discoveredServers() []DiscoveredServerInfo {
 	return c.discovered
 }
 
-func (c *Client) flush() {
+// flush uploads one batch of queued events. It reports true only when a full
+// batch was acknowledged, meaning more queued events may remain.
+func (c *Client) flush() bool {
 	if c.logger == nil {
-		return
+		return false
 	}
-	events, durable, pendingErr := c.logger.PendingEvents(100)
+	const batchSize = 100
+	events, durable, pendingErr := c.logger.PendingEvents(batchSize)
 	if pendingErr != nil {
 		c.logger.Warn("could not read durable event queue: %v", pendingErr)
-		return
+		return false
 	}
 	if len(events) == 0 {
-		return
+		return false
 	}
 
 	payload := map[string]interface{}{
@@ -557,7 +624,7 @@ func (c *Client) flush() {
 		if !durable {
 			c.logger.RequeueFront(events)
 		}
-		return
+		return false
 	}
 
 	var result struct {
@@ -577,14 +644,14 @@ func (c *Client) flush() {
 			c.logger.RequeueFront(events)
 		}
 		fmt.Fprintf(os.Stderr, "[agentkeeper] telemetry upload failed: %v\n", postErr)
-		return
+		return false
 	}
 	if status < 200 || status >= 300 {
 		if !durable {
 			c.logger.RequeueFront(events)
 		}
 		fmt.Fprintf(os.Stderr, "[agentkeeper] telemetry upload error (HTTP %d)\n", status)
-		return
+		return false
 	}
 	if result.Disabled {
 		statuses := make(map[string]string, len(events))
@@ -595,7 +662,7 @@ func (c *Client) flush() {
 			c.logger.Warn("could not resolve disabled event batch: %v", err)
 		}
 		c.logger.Info("telemetry upload skipped: connector disabled")
-		return
+		return false
 	}
 	if !result.OK || result.Error != "" {
 		if !durable {
@@ -606,7 +673,7 @@ func (c *Client) flush() {
 		} else {
 			fmt.Fprintf(os.Stderr, "[agentkeeper] telemetry upload not acknowledged\n")
 		}
-		return
+		return false
 	}
 	if len(result.Acks) > 0 {
 		statuses := make(map[string]string, len(result.Acks))
@@ -628,17 +695,17 @@ func (c *Client) flush() {
 		}
 		if err := c.logger.ResolveEvents(statuses); err != nil {
 			c.logger.Warn("could not resolve event acknowledgments: %v", err)
-			return
+			return false
 		}
 		c.logger.Info("telemetry upload acknowledged per item: sent=%d acked=%d inserted=%d", len(events), len(statuses), result.Inserted)
-		return
+		return len(events) == batchSize && terminalAckCount(statuses) > 0
 	}
 	if result.Received == nil || *result.Received != len(events) {
 		if !durable {
 			c.logger.RequeueFront(events)
 		}
 		fmt.Fprintf(os.Stderr, "[agentkeeper] telemetry upload not fully acknowledged\n")
-		return
+		return false
 	}
 	statuses := make(map[string]string, len(events))
 	for _, event := range events {
@@ -646,20 +713,24 @@ func (c *Client) flush() {
 	}
 	if err := c.logger.ResolveEvents(statuses); err != nil {
 		c.logger.Warn("could not resolve acknowledged event batch: %v", err)
-		return
+		return false
 	}
 	received := len(events)
 	received = *result.Received
 	c.logger.Info("telemetry upload acknowledged: sent=%d received=%d inserted=%d", len(events), received, result.Inserted)
+	return len(events) == batchSize
 }
 
-func (c *Client) flushReceipts() {
+// flushReceipts uploads one batch of queued receipts. It reports true only
+// when a full batch was acknowledged, meaning more queued receipts may remain.
+func (c *Client) flushReceipts() bool {
 	if c.receiptStore == nil || c.gatewayID == "" {
-		return
+		return false
 	}
-	receipts, err := c.receiptStore.Peek(100)
+	const batchSize = 100
+	receipts, err := c.receiptStore.Peek(batchSize)
 	if err != nil || len(receipts) == 0 {
-		return
+		return false
 	}
 	payload := map[string]interface{}{
 		"gateway_id": c.gatewayID,
@@ -667,7 +738,7 @@ func (c *Client) flushReceipts() {
 	}
 	data, err := json.Marshal(payload)
 	if err != nil {
-		return
+		return false
 	}
 	var result struct {
 		OK   bool `json:"ok"`
@@ -681,7 +752,7 @@ func (c *Client) flushReceipts() {
 		if postErr != nil && c.logger != nil {
 			c.logger.Warn("signed receipt upload failed: %v", postErr)
 		}
-		return
+		return false
 	}
 	statuses := make(map[string]string, len(result.Acks))
 	for _, ack := range result.Acks {
@@ -689,9 +760,26 @@ func (c *Client) flushReceipts() {
 			statuses[ack.ReceiptID] = ack.Status
 		}
 	}
-	if err := c.receiptStore.Resolve(statuses); err != nil && c.logger != nil {
-		c.logger.Warn("could not resolve signed receipt acknowledgments: %v", err)
+	if err := c.receiptStore.Resolve(statuses); err != nil {
+		if c.logger != nil {
+			c.logger.Warn("could not resolve signed receipt acknowledgments: %v", err)
+		}
+		return false
 	}
+	return len(receipts) == batchSize && terminalAckCount(statuses) > 0
+}
+
+// terminalAckCount counts acknowledgments that remove an item from its queue,
+// so the exit drain never re-sends a batch that made no progress.
+func terminalAckCount(statuses map[string]string) int {
+	count := 0
+	for _, status := range statuses {
+		switch status {
+		case "accepted", "duplicate", "rejected", "conflicted":
+			count++
+		}
+	}
+	return count
 }
 
 func (c *Client) postJSON(operation, endpoint string, data []byte, out any) (int, error) {
@@ -700,11 +788,11 @@ func (c *Client) postJSON(operation, endpoint string, data []byte, out any) (int
 		if err := json.Unmarshal(data, &payload); err != nil {
 			return 0, err
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 1900*time.Millisecond)
+		ctx, cancel := context.WithTimeout(c.requestContext(), 1900*time.Millisecond)
 		defer cancel()
 		return runtimebroker.Post(ctx, c.runtimeSocket, operation, payload, out)
 	}
-	req, err := http.NewRequest(http.MethodPost, c.apiURL+endpoint, bytes.NewReader(data))
+	req, err := http.NewRequestWithContext(c.requestContext(), http.MethodPost, c.apiURL+endpoint, bytes.NewReader(data))
 	if err != nil {
 		return 0, err
 	}
