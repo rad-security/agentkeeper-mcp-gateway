@@ -70,6 +70,7 @@ type Server struct {
 	pendMu          sync.Mutex
 	notify          func(method string, params json.RawMessage)
 	done            chan struct{}
+	outputDone      chan struct{}
 	sseMu           sync.Mutex
 	sseEndpoint     string
 	sseBody         io.ReadCloser
@@ -148,38 +149,81 @@ func (m *Manager) StartAll() error {
 			fmt.Fprintln(os.Stderr, "[agentkeeper] skipping MCP server with empty name")
 			continue
 		}
-		if m.Get(cfg.Name) != nil {
-			continue
-		}
-		transport := normalizeTransport(cfg)
-		if transport == "http" || transport == "sse" {
-			if strings.TrimSpace(cfg.URL) == "" {
-				fmt.Fprintf(os.Stderr, "[agentkeeper] skipping MCP server %s: empty URL for HTTP transport\n", cfg.Name)
-				continue
-			}
-			cfg.Transport = transport
-			// HTTP servers don't need to be spawned — they're remote
-			m.mu.Lock()
-			m.servers[cfg.Name] = &Server{
-				config:        cfg,
-				pending:       make(map[int64]chan rpcResponse),
-				notify:        m.serverNotifier(cfg.Name),
-				sseEndpointCh: make(chan string, 1),
-				sseErrCh:      make(chan error, 1),
-			}
-			m.mu.Unlock()
-			continue
-		}
-		if strings.TrimSpace(cfg.Command) == "" {
-			fmt.Fprintf(os.Stderr, "[agentkeeper] skipping MCP server %s: empty command\n", cfg.Name)
-			continue
-		}
-		if err := m.startServer(cfg); err != nil {
+		if err := m.startConfigured(cfg); err != nil {
 			fmt.Fprintf(os.Stderr, "[agentkeeper] skipping MCP server %s: %v\n", cfg.Name, err)
-			continue
 		}
 	}
 	return nil
+}
+
+// startConfigured attaches one configured backend unless it is already live.
+// The caller holds startMu.
+func (m *Manager) startConfigured(cfg ServerConfig) error {
+	if srv := m.Get(cfg.Name); srv != nil && !srv.stoppedNow() {
+		return nil
+	}
+	transport := normalizeTransport(cfg)
+	if transport == "http" || transport == "sse" {
+		if strings.TrimSpace(cfg.URL) == "" {
+			return errors.New("empty URL for HTTP transport")
+		}
+		cfg.Transport = transport
+		// HTTP servers don't need to be spawned — they're remote
+		m.mu.Lock()
+		m.servers[cfg.Name] = &Server{
+			config:        cfg,
+			pending:       make(map[int64]chan rpcResponse),
+			notify:        m.serverNotifier(cfg.Name),
+			sseEndpointCh: make(chan string, 1),
+			sseErrCh:      make(chan error, 1),
+		}
+		m.mu.Unlock()
+		return nil
+	}
+	if strings.TrimSpace(cfg.Command) == "" {
+		return errors.New("empty command")
+	}
+	return m.startServer(cfg)
+}
+
+// ErrRestartLimit reports a backend whose bounded automatic restarts are
+// exhausted after repeated consecutive exits.
+var ErrRestartLimit = fmt.Errorf("restart limit reached after %d consecutive exits", maxRestartAttempts)
+
+// EnsureStarted starts a configured backend that is not currently running,
+// for a request that needs it now, instead of waiting for the pending
+// background restart backoff. It shares the crash-loop budget: once automatic
+// restarts are exhausted it returns ErrRestartLimit without spawning.
+func (m *Manager) EnsureStarted(name string) error {
+	m.startMu.Lock()
+	defer m.startMu.Unlock()
+	m.mu.RLock()
+	stopping := m.stopping
+	// A backend whose output already ended is exited even if its watcher has
+	// not yet removed it; replacing it is safe because the watcher only
+	// removes the exact instance it owns.
+	running := m.servers[name] != nil && !m.servers[name].stoppedNow()
+	attempts := m.restartAttempts[name]
+	var cfg ServerConfig
+	configured := false
+	for _, candidate := range m.configs {
+		if candidate.Name == name {
+			cfg, configured = candidate, true
+			break
+		}
+	}
+	m.mu.RUnlock()
+	switch {
+	case running:
+		return nil
+	case stopping:
+		return errors.New("the Gateway is shutting down")
+	case !configured:
+		return errors.New("not configured")
+	case attempts > maxRestartAttempts:
+		return ErrRestartLimit
+	}
+	return m.startConfigured(cfg)
 }
 
 // UpdateConfigs replaces the desired backend set. Existing live servers are
@@ -220,13 +264,14 @@ func (m *Manager) startServer(cfg ServerConfig) error {
 	}
 
 	srv := &Server{
-		config:  cfg,
-		cmd:     cmd,
-		stdin:   stdin,
-		stdout:  bufio.NewReader(stdout),
-		pending: make(map[int64]chan rpcResponse),
-		notify:  m.serverNotifier(cfg.Name),
-		done:    make(chan struct{}),
+		config:     cfg,
+		cmd:        cmd,
+		stdin:      stdin,
+		stdout:     bufio.NewReader(stdout),
+		pending:    make(map[int64]chan rpcResponse),
+		notify:     m.serverNotifier(cfg.Name),
+		done:       make(chan struct{}),
+		outputDone: make(chan struct{}),
 	}
 
 	// Read responses and own cmd.Wait in background. Exactly one goroutine may
@@ -438,6 +483,22 @@ func (s *Server) stop() {
 	case <-time.After(backendStopGracePeriod):
 		_ = s.cmd.Process.Kill()
 		<-s.done
+	}
+}
+
+// Stopped is closed once an owned stdio backend can no longer answer: its
+// output stream ended because the process exited. It is nil (never ready) for
+// remote HTTP/SSE backends.
+func (s *Server) Stopped() <-chan struct{} {
+	return s.outputDone
+}
+
+func (s *Server) stoppedNow() bool {
+	select {
+	case <-s.outputDone:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -1217,6 +1278,9 @@ func normalizeTransport(cfg ServerConfig) string {
 
 func (s *Server) readResponses() {
 	defer s.failPending(io.EOF)
+	// Runs before failPending: a caller that observes the EOF failure already
+	// sees this backend as stopped and can restart it.
+	defer close(s.outputDone)
 	for {
 		line, err := s.stdout.ReadBytes('\n')
 		if err != nil {
