@@ -91,3 +91,39 @@ func TestPostUsesAllowlistedUnixSocketEnvelope(t *testing.T) {
 type testError struct{ message string }
 
 func (err *testError) Error() string { return err.message }
+
+// The Gateway's bounded final evidence flush cancels its request context when
+// the budget is spent; a hung broker must not hold the exit for the full
+// per-request deadline.
+func TestPostReturnsPromptlyWhenContextIsCancelled(t *testing.T) {
+	tempDir, err := os.MkdirTemp("/tmp", "ak-broker-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(tempDir) })
+	socket := filepath.Join(tempDir, "runtime.sock")
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	release := make(chan struct{})
+	defer close(release)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		<-release // accept the request and never answer
+	}()
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(100*time.Millisecond, cancel)
+	started := time.Now()
+	if _, err := Post(ctx, socket, "events", map[string]any{}, nil); err == nil {
+		t.Fatal("hung broker request succeeded")
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("Post ignored cancellation for %s", elapsed)
+	}
+}

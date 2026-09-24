@@ -162,6 +162,10 @@ func Post(ctx context.Context, socketPath, operation string, payload any, out an
 		deadline = contextDeadline
 	}
 	_ = conn.SetDeadline(deadline)
+	// Cancellation (for example the Gateway's bounded exit flush) must end an
+	// in-flight exchange, not only bound the dial.
+	stopCancel := context.AfterFunc(ctx, func() { _ = conn.SetDeadline(time.Now()) })
+	defer stopCancel()
 	if _, err := conn.Write(append(requestBody, '\n')); err != nil {
 		return 0, fmt.Errorf("send AgentKeeper runtime broker request: %w", err)
 	}
