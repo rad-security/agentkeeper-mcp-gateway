@@ -132,9 +132,12 @@ func (c *Client) loadPolicyCache() error {
 		// A crash between those writes must not resurrect the older mode.
 		restoredMode = normalizePolicyMode(currentMode)
 		restoredRevision = currentRevision
-	} else if strings.EqualFold(currentMode, "enforce") {
-		// Never let a cached Observe snapshot weaken an explicitly configured
-		// Enforce startup.
+	} else if strings.EqualFold(currentMode, "enforce") && (currentRevision > 0 || restoredRevision == 0) {
+		// Never let a cached Observe snapshot weaken an established Enforce
+		// assignment or an explicitly configured Enforce startup on a route
+		// without a revisioned assignment. A local enforce request must not
+		// relabel a revisioned control-plane Observe assignment as Enforce: that
+		// state can be neither persisted nor acknowledged at that revision.
 		restoredMode = "enforce"
 	}
 	c.modeMu.Lock()
@@ -216,7 +219,11 @@ func (c *Client) loadPolicyStateFrom(path string) error {
 		c.modeMu.Unlock()
 		return nil
 	}
-	if normalizePolicyMode(state.EffectiveMode) == "enforce" || c.startupEnforce {
+	// A local enforce request strengthens only the unassigned initial Observe
+	// state (revision 0). A revisioned assignment is control-plane authority;
+	// relabelling it would leave the Gateway unable to persist or acknowledge
+	// that revision, so the dashboard could never promote the route.
+	if normalizePolicyMode(state.EffectiveMode) == "enforce" || c.startupEnforce && state.EffectiveAssignmentRevision == 0 {
 		c.mode = "enforce"
 	} else {
 		c.mode = "audit"

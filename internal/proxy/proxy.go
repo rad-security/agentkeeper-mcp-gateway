@@ -33,6 +33,11 @@ import (
 const (
 	backendToolListWarmupDeadline = 2 * time.Second
 	backendContentListDeadline    = 2 * time.Second
+	// backendRecoveryDeadline bounds restarting an exited upstream and
+	// re-listing its tools for a pending call.
+	backendRecoveryDeadline = 10 * time.Second
+	// backendExitGrace distinguishes an exited upstream from a slow one.
+	backendExitGrace = 250 * time.Millisecond
 )
 
 var simpleResourceTemplateVariable = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_.-]*$`)
@@ -608,30 +613,125 @@ func (p *Proxy) refreshTools() {
 
 	for remaining := len(names); remaining > 0; remaining-- {
 		result := <-results
-		if result.err != nil {
-			if p.ctx != nil && p.ctx.Err() != nil {
-				continue
-			}
-			p.warn("failed to list tools from %s: %v", result.name, result.err)
-			p.setToolStatus(result.name, toolRefreshStatus{
-				Status:    "degraded",
-				LastError: result.err.Error(),
-				UpdatedAt: time.Now().UTC().Format(time.RFC3339Nano),
-			})
-			continue
+		p.applyToolList(result.name, result.tools, result.err)
+	}
+}
+
+// applyToolList records one upstream's tools/list outcome in the manifest
+// cache, tool status and routing map.
+func (p *Proxy) applyToolList(serverName string, tools []interface{}, err error) {
+	if err != nil {
+		if p.ctx != nil && p.ctx.Err() != nil {
+			return
 		}
-		changed := p.setCachedTools(result.name, result.tools)
-		p.manager.MarkHealthy(result.name)
-		p.setToolStatus(result.name, toolRefreshStatus{
-			Status:    "ready",
+		p.warn("failed to list tools from %s: %v", serverName, err)
+		p.setToolStatus(serverName, toolRefreshStatus{
+			Status:    "degraded",
+			LastError: err.Error(),
 			UpdatedAt: time.Now().UTC().Format(time.RFC3339Nano),
 		})
-		p.logToolDescriptionDetections(result.name, result.tools)
-		p.rebuildToolMapFromCache()
-		if changed {
-			p.emitToolsListChanged()
+		return
+	}
+	changed := p.setCachedTools(serverName, tools)
+	p.manager.MarkHealthy(serverName)
+	p.setToolStatus(serverName, toolRefreshStatus{
+		Status:    "ready",
+		UpdatedAt: time.Now().UTC().Format(time.RFC3339Nano),
+	})
+	p.logToolDescriptionDetections(serverName, tools)
+	p.rebuildToolMapFromCache()
+	if changed {
+		p.emitToolsListChanged()
+	}
+}
+
+// configuredServerForTool returns the configured upstream whose namespace a
+// public tool name carries, or "" when no configured upstream owns it. An
+// encoded server segment never contains the "__" delimiter, so at most one
+// configured upstream can match.
+func (p *Proxy) configuredServerForTool(publicName string) string {
+	if p.manager == nil {
+		return ""
+	}
+	for _, name := range p.manager.ConfiguredNames() {
+		if prefix := publicMCPName(name, ""); strings.HasPrefix(publicName, prefix) && len(publicName) > len(prefix) {
+			return name
 		}
 	}
+	return ""
+}
+
+// liveUpstream returns a usable upstream for a call. A configured stdio
+// upstream whose process exited is restarted on demand rather than after the
+// background backoff, within the manager's crash-loop budget.
+func (p *Proxy) liveUpstream(serverName string) (*server.Server, error) {
+	if srv := p.manager.Get(serverName); srv != nil && !upstreamStopped(srv) {
+		return srv, nil
+	}
+	if err := p.manager.EnsureStarted(serverName); err != nil {
+		return nil, fmt.Errorf("upstream MCP server %q is not running: %w", serverName, err)
+	}
+	if srv := p.manager.Get(serverName); srv != nil && !upstreamStopped(srv) {
+		return srv, nil
+	}
+	return nil, fmt.Errorf("upstream MCP server %q is not running: it exited during restart", serverName)
+}
+
+func upstreamStopped(srv *server.Server) bool {
+	select {
+	case <-srv.Stopped():
+		return true
+	default:
+		return false
+	}
+}
+
+func (p *Proxy) lookupTool(publicName string) (string, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	serverName, ok := p.toolMap[publicName]
+	return serverName, ok
+}
+
+// resolveUnmappedTool routes a tool name missing from the live routing map.
+// A stdio upstream that exited is removed from routing until it restarts, and
+// a client may call its listed tools inside that window. For a tool namespaced
+// to a configured upstream this restarts the upstream on demand (bounded by
+// the manager's crash-loop budget) and re-lists its tools. It returns the
+// owning upstream with a truthful error when it cannot serve the call, and
+// ("", false, nil) for a genuinely unknown tool.
+func (p *Proxy) resolveUnmappedTool(ctx context.Context, publicName string) (string, bool, error) {
+	owner := p.configuredServerForTool(publicName)
+	if owner == "" {
+		done := p.startToolRefresh()
+		select {
+		case <-done:
+		case <-time.After(backendToolListWarmupDeadline):
+		}
+		p.rebuildToolMapFromCache()
+		serverName, ok := p.lookupTool(publicName)
+		return serverName, ok, nil
+	}
+	srv, err := p.liveUpstream(owner)
+	if err != nil {
+		return owner, false, err
+	}
+	recoverCtx, cancel := context.WithTimeout(ctx, backendRecoveryDeadline)
+	defer cancel()
+	tools, err := srv.ListToolsContext(recoverCtx)
+	p.applyToolList(owner, tools, err)
+	if err != nil {
+		select {
+		case <-srv.Stopped():
+			return owner, false, fmt.Errorf("upstream MCP server %q is not running: it exited while starting: %w", owner, err)
+		case <-time.After(backendExitGrace):
+		}
+		return owner, false, fmt.Errorf("upstream MCP server %q did not list its tools: %w", owner, err)
+	}
+	if serverName, ok := p.lookupTool(publicName); ok {
+		return serverName, true, nil
+	}
+	return "", false, nil
 }
 
 func (p *Proxy) warn(format string, args ...interface{}) {
@@ -1028,20 +1128,14 @@ func (p *Proxy) handleToolsCallContext(ctx context.Context, msg JSONRPCMessage) 
 	}
 
 	// Find the target server
-	p.mu.Lock()
-	serverName, ok := p.toolMap[callParams.Name]
-	p.mu.Unlock()
+	serverName, ok := p.lookupTool(callParams.Name)
+	// upstreamUnavailable is set when a configured upstream that owns this
+	// tool cannot serve it. The call still passes policy and records terminal
+	// evidence below, and is never dispatched.
+	var upstreamUnavailable error
 	if !ok {
-		done := p.startToolRefresh()
-		select {
-		case <-done:
-		case <-time.After(backendToolListWarmupDeadline):
-		}
-		p.rebuildToolMapFromCache()
-		p.mu.Lock()
-		serverName, ok = p.toolMap[callParams.Name]
-		p.mu.Unlock()
-		if !ok {
+		serverName, ok, upstreamUnavailable = p.resolveUnmappedTool(ctx, callParams.Name)
+		if !ok && upstreamUnavailable == nil {
 			return nil, fmt.Errorf("unknown tool: %s", callParams.Name)
 		}
 	}
@@ -1204,9 +1298,18 @@ func (p *Proxy) handleToolsCallContext(ctx context.Context, msg JSONRPCMessage) 
 	}
 
 	// --- 5. Forward to backend server ---
-	srv := p.manager.Get(serverName)
-	if srv == nil {
-
+	if upstreamUnavailable != nil {
+		p.logToolOutcome(serverName, originalName, callParams.Arguments, finalResult, logging.ToolCallOutcome{
+			CallID: callID, AttemptID: attemptID, Mode: effectiveMode,
+			PolicyDecision: finalVerdict, EvaluationStatus: evaluationStatus,
+			DecisionID:          decisionID,
+			RequiredDisposition: "forward", AppliedDisposition: "dispatch_failed",
+			FailureReason: "upstream_unavailable",
+		})
+		return nil, upstreamUnavailable
+	}
+	srv, srvErr := p.liveUpstream(serverName)
+	if srvErr != nil {
 		p.logToolOutcome(serverName, originalName, callParams.Arguments, finalResult, logging.ToolCallOutcome{
 			CallID: callID, AttemptID: attemptID, Mode: effectiveMode,
 			PolicyDecision: finalVerdict, EvaluationStatus: evaluationStatus,
@@ -1214,7 +1317,7 @@ func (p *Proxy) handleToolsCallContext(ctx context.Context, msg JSONRPCMessage) 
 			RequiredDisposition: "forward", AppliedDisposition: "dispatch_failed",
 			FailureReason: "server_not_available",
 		})
-		return nil, fmt.Errorf("server not available: %s", serverName)
+		return nil, srvErr
 	}
 	if err := srv.InitializeContext(ctx); err != nil {
 		p.logToolOutcome(serverName, originalName, callParams.Arguments, finalResult, logging.ToolCallOutcome{
@@ -1857,6 +1960,22 @@ func (p *Proxy) inspectContentResultMode(id *json.RawMessage, serverName, method
 	return &JSONRPCMessage{JSONRPC: "2.0", ID: id, Result: response}, nil
 }
 
+// builtinToolAnnotations marks a Gateway built-in as read-only. Neither
+// built-in invokes an upstream tool or changes configuration: agentkeeper_status
+// reads in-memory Gateway and queue state, and agentkeeper_audit reads the
+// cached manifests after triggering the same background tools/list refresh
+// that tools/list performs. Without readOnlyHint, clients such as Cursor
+// classify them as writes that need approval.
+func builtinToolAnnotations(title string) map[string]interface{} {
+	return map[string]interface{}{
+		"title":           title,
+		"readOnlyHint":    true,
+		"destructiveHint": false,
+		"idempotentHint":  true,
+		"openWorldHint":   false,
+	}
+}
+
 func (p *Proxy) getBuiltinTools() []interface{} {
 	return []interface{}{
 		map[string]interface{}{
@@ -1866,6 +1985,7 @@ func (p *Proxy) getBuiltinTools() []interface{} {
 				"type":       "object",
 				"properties": map[string]interface{}{},
 			},
+			"annotations": builtinToolAnnotations("AgentKeeper Gateway status"),
 		},
 		map[string]interface{}{
 			"name":        "agentkeeper_audit",
@@ -1874,6 +1994,7 @@ func (p *Proxy) getBuiltinTools() []interface{} {
 				"type":       "object",
 				"properties": map[string]interface{}{},
 			},
+			"annotations": builtinToolAnnotations("AgentKeeper MCP security audit"),
 		},
 	}
 }
