@@ -317,16 +317,25 @@ func scanMCPServers(home, cwd string) []MCPServer {
 // commandBaseName reduces a configured stdio command to the binary's base
 // name ("npx", "python3"). Arguments and environment are never reported: they
 // routinely carry connection strings and API keys. A command string that
-// embeds its own arguments is cut at the first whitespace, both path
-// separators are honoured so a Windows path reduces the same way on any OS,
-// and a leading KEY=value assignment is environment, so nothing is reported.
-// Empty in (remote servers) is empty out.
+// embeds its own arguments is cut at the first whitespace, unless the whole
+// string names an existing file: that is a path with spaces, so its own base
+// name is reported. Both path separators are honoured so a Windows path
+// reduces the same way on any OS, and a leading KEY=value assignment is
+// environment, so nothing is reported. Empty in (remote servers) is empty out.
 func commandBaseName(command string) string {
 	fields := strings.Fields(command)
 	if len(fields) == 0 || strings.Contains(fields[0], "=") {
 		return ""
 	}
 	name := fields[0]
+	if len(fields) > 1 {
+		// "/Library/Application Support/Example/server" is one executable,
+		// not a command with arguments, when the whole string is a file.
+		whole := strings.TrimSpace(command)
+		if info, err := os.Stat(whole); err == nil && !info.IsDir() {
+			name = whole
+		}
+	}
 	if i := strings.LastIndexAny(name, `/\`); i >= 0 {
 		name = name[i+1:]
 	}

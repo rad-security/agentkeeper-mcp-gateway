@@ -23,11 +23,14 @@ run configure-ide --dry-run and configure-ide first.
 
 The server can be a local stdio command or a remote http(s) URL. Everything
 after a stdio command is passed to that command, so put add's own flags
-before it. Flags may also follow a URL.
+before it. To give the command an argument spelled like one of add's flags
+(--env, --header, --config), put -- before the command. Flags may also
+follow a URL.
 
 Examples:
   agentkeeper-mcp-gateway add filesystem npx -y @modelcontextprotocol/server-filesystem /tmp
   agentkeeper-mcp-gateway add --env '{"API_TOKEN":"..."}' local-api python3 server.py --port 8080
+  agentkeeper-mcp-gateway add local-api -- python3 server.py --config server.toml
   agentkeeper-mcp-gateway add remote-api https://api.example.com/mcp --header "Authorization:Bearer tok"`,
 	Args: cobra.MinimumNArgs(2),
 	RunE: func(cmd *cobra.Command, args []string) error {
@@ -92,11 +95,12 @@ Examples:
 
 // addServerArgs returns the server command (or URL) from the arguments that
 // follow <name>. Interspersed flag parsing is off for add (see init), so cobra
-// stops at <name> and a command's own flags (`npx -y ...`, even `--header`)
-// reach the gateway config untouched. Two places still take add's flags:
-// between <name> and the command, where a `--` separator may also sit, and
-// after a URL, which takes no arguments of its own (the documented
-// `add <name> <url> --header key:value` form).
+// stops at <name> and a command's own flags (`npx -y ...`) reach the gateway
+// config untouched. Two places still take add's flags: between <name> and the
+// command, where a `--` separator may also sit, and after a URL, which takes
+// no arguments of its own (the documented `add <name> <url> --header
+// key:value` form). After a stdio command add's flags are refused unless a
+// `--` says they are the command's (see misplacedAddFlag).
 func addServerArgs(cmd *cobra.Command, rest []string) ([]string, error) {
 	flags := cmd.Flags()
 	if err := flags.Parse(rest); err != nil {
@@ -114,10 +118,44 @@ func addServerArgs(cmd *cobra.Command, rest []string) ([]string, error) {
 			return nil, fmt.Errorf("unexpected argument %q after server URL", flags.Arg(0))
 		}
 		server = server[:1]
+	} else if flags.ArgsLenAtDash() < 0 {
+		if flag := misplacedAddFlag(cmd, server[1:]); flag != "" {
+			return nil, fmt.Errorf(`%s after the server command would be passed to the server, not applied by add: put it before the server command, or put "--" before the server command to pass it through (add <name> -- <command> [args...])`, flag)
+		}
 	}
 	// --config may have been parsed just now, after the root command applied it.
 	config.SetPathOverride(configPath)
 	return server, nil
+}
+
+// addOwnFlags are the flags the previous release also accepted after a stdio
+// command. There they are now the command's arguments, which would silently
+// drop the env, headers or config path and keep a token in the command string.
+var addOwnFlags = []string{"env", "header", "config"}
+
+// misplacedAddFlag returns the first of add's own flags, as its name only,
+// among a stdio command's arguments, or "". A `--` among them ends the
+// search: what follows it is explicitly the server's.
+func misplacedAddFlag(cmd *cobra.Command, serverArgs []string) string {
+	for _, arg := range serverArgs {
+		if arg == "--" {
+			break
+		}
+		for _, name := range addOwnFlags {
+			long := "--" + name
+			if arg == long || strings.HasPrefix(arg, long+"=") {
+				return long
+			}
+			flag := cmd.Flags().Lookup(name)
+			if flag == nil || flag.Shorthand == "" {
+				continue
+			}
+			if short := "-" + flag.Shorthand; !strings.HasPrefix(arg, "--") && strings.HasPrefix(arg, short) {
+				return short
+			}
+		}
+	}
+	return ""
 }
 
 func isRemoteURL(s string) bool {

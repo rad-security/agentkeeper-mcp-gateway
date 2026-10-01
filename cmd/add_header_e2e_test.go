@@ -74,7 +74,8 @@ func TestAddRejectsMalformedOrMisplacedHeaders(t *testing.T) {
 }
 
 // Everything after a stdio command is that command's own: add must not parse
-// it, reject it, or consume it as one of its own flags.
+// it or consume it as one of its own flags. After an explicit `--` that holds
+// even for arguments spelled like add's flags.
 func TestAddStdioCommandKeepsItsOwnFlags(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -96,9 +97,18 @@ func TestAddStdioCommandKeepsItsOwnFlags(t *testing.T) {
 		{"env between name and command",
 			[]string{"add", "fs", "--env", `{"K":"V"}`, "python3", "server.py", "-v"},
 			map[string]interface{}{"name": "fs", "command": "python3 server.py -v", "env": map[string]interface{}{"K": "V"}}},
-		{"command with add's flag names",
-			[]string{"add", "fs", "python3", "server.py", "--header", "X-Upstream:1", "--env", "prod", "--config", "server.toml", "--help"},
+		{"separator before a command with add's flag names",
+			[]string{"add", "fs", "--", "python3", "server.py", "--header", "X-Upstream:1", "--env", "prod", "--config", "server.toml", "--help"},
 			map[string]interface{}{"name": "fs", "command": "python3 server.py --header X-Upstream:1 --env prod --config server.toml --help"}},
+		{"separator before the name",
+			[]string{"add", "--", "fs", "python3", "server.py", "--config", "server.toml"},
+			map[string]interface{}{"name": "fs", "command": "python3 server.py --config server.toml"}},
+		{"separator inside the server arguments",
+			[]string{"add", "fs", "python3", "server.py", "--", "--env=prod"},
+			map[string]interface{}{"name": "fs", "command": "python3 server.py -- --env=prod"}},
+		{"env before name with a server flag",
+			[]string{"add", "--env", `{"API_TOKEN":"tok-123"}`, "local-api", "python3", "server.py", "--port", "8080"},
+			map[string]interface{}{"name": "local-api", "command": "python3 server.py --port 8080", "env": map[string]interface{}{"API_TOKEN": "tok-123"}}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			home := t.TempDir()
@@ -109,6 +119,60 @@ func TestAddStdioCommandKeepsItsOwnFlags(t *testing.T) {
 			servers := readAddedServers(t, home)
 			if len(servers) != 1 || !reflect.DeepEqual(servers[0], tc.want) {
 				t.Fatalf("servers = %v, want [%v]", servers, tc.want)
+			}
+		})
+	}
+}
+
+// The previous release took add's flags after a stdio command, so people type
+// them there. Recording them as server arguments would drop the env or config
+// path and leave a token in the command string: refuse, and write nothing.
+func TestAddRejectsOwnFlagsAfterStdioCommand(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"env", []string{"add", "local-api", "python3", "server.py", "--env", `{"API_TOKEN":"tok-123"}`}, "--env"},
+		{"env with equals", []string{"add", "local-api", "python3", "server.py", `--env={"API_TOKEN":"tok-123"}`}, "--env"},
+		{"header", []string{"add", "local-api", "python3", "server.py", "--header", "Authorization:Bearer tok-123"}, "--header"},
+		{"header with equals", []string{"add", "local-api", "python3", "server.py", "--header=Authorization:Bearer tok-123"}, "--header"},
+		{"config", []string{"add", "local-api", "python3", "server.py", "--config", "alt.json"}, "--config"},
+		{"config with equals", []string{"add", "local-api", "python3", "server.py", "--config=alt.json"}, "--config"},
+		{"directly after the command", []string{"add", "local-api", "python3", "--env", `{"API_TOKEN":"tok-123"}`, "server.py"}, "--env"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			configFile := filepath.Join(home, ".config", "agentkeeper-mcp-gateway", "config.json")
+			if _, stderr, code := run(t, home, "add", "existing", "python3", "x.py"); code != 0 {
+				t.Fatalf("seed add: exit %d, stderr: %s", code, stderr)
+			}
+			before, err := os.ReadFile(configFile)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			_, stderr, code := runInDir(t, home, home, tc.args...)
+			if code == 0 {
+				t.Fatalf("expected failure for %v", tc.args)
+			}
+			for _, want := range []string{tc.want, "before the server command", `"--"`} {
+				if !strings.Contains(stderr, want) {
+					t.Fatalf("stderr %q does not mention %q", stderr, want)
+				}
+			}
+			if strings.Contains(stderr, "tok-123") {
+				t.Fatalf("stderr repeats the flag value: %q", stderr)
+			}
+			after, err := os.ReadFile(configFile)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(after) != string(before) {
+				t.Fatalf("a rejected add changed the config:\nbefore: %s\nafter:  %s", before, after)
+			}
+			if _, err := os.Stat(filepath.Join(home, "alt.json")); err == nil {
+				t.Fatalf("a rejected add wrote the --config path")
 			}
 		})
 	}

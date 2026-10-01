@@ -96,10 +96,14 @@ func lastLines(path string, n int) ([]byte, int64, error) {
 	return tail[start:], size, nil
 }
 
-// followLog copies what is appended to the log until interrupted.
+// followLog copies what is appended to the log until interrupted, or until
+// out stops taking writes.
 func followLog(path string, offset int64, out io.Writer, stop <-chan os.Signal) error {
 	ticker := time.NewTicker(250 * time.Millisecond)
 	defer ticker.Stop()
+	sink := &writeErrorKeeper{out: out}
+	// The file that offset counts into.
+	last, _ := os.Stat(path)
 	for {
 		select {
 		case <-stop:
@@ -110,10 +114,12 @@ func followLog(path string, offset int64, out io.Writer, stop <-chan os.Signal) 
 		if err != nil {
 			continue
 		}
-		if info.Size() < offset {
-			// The log was rotated.
+		if info.Size() < offset || (last != nil && !os.SameFile(last, info)) {
+			// The log was rotated. Size alone misses a new file that has
+			// already grown past the old offset.
 			offset = 0
 		}
+		last = info
 		if info.Size() == offset {
 			continue
 		}
@@ -122,11 +128,31 @@ func followLog(path string, offset int64, out io.Writer, stop <-chan os.Signal) 
 			continue
 		}
 		if _, err := file.Seek(offset, io.SeekStart); err == nil {
-			copied, _ := io.Copy(out, file)
+			copied, _ := io.Copy(sink, file)
 			offset += copied
 		}
 		file.Close()
+		if sink.err != nil {
+			// The reader is gone (`logs -f | head -1`). Windows has no
+			// SIGPIPE to end the process, so this is the only way out.
+			return sink.err
+		}
 	}
+}
+
+// writeErrorKeeper remembers a failed write. io.Copy reports read and write
+// errors alike, and a failed read of the log is retried on the next poll.
+type writeErrorKeeper struct {
+	out io.Writer
+	err error
+}
+
+func (w *writeErrorKeeper) Write(p []byte) (int, error) {
+	n, err := w.out.Write(p)
+	if err != nil {
+		w.err = err
+	}
+	return n, err
 }
 
 func init() {
