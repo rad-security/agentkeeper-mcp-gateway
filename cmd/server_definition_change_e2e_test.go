@@ -54,7 +54,9 @@ func TestE2EChangedToolDefinitionIsReportedOnce(t *testing.T) {
 	}
 	configPath := writeGatewayConfig(t, home, `{"mode": "audit", "servers": [{"name": "crm", "command": "`+backend+`"}]}`)
 
-	session := func() string {
+	// A session lists tools until the list contains wanted. The first answer
+	// can come from the previous session's cache while the server starts.
+	session := func(wanted string) string {
 		cmd := exec.Command(binary, "--config", configPath, "server")
 		cmd.Env = []string{"HOME=" + home, "PATH=" + os.Getenv("PATH"), "AGENTKEEPER_COWORK_GUARD=0", "AGENTKEEPER_TEST_SWAP=" + swap}
 		stdin, err := cmd.StdinPipe()
@@ -83,6 +85,11 @@ func TestE2EChangedToolDefinitionIsReportedOnce(t *testing.T) {
 		writeRPC(t, stdin, `{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}`)
 		writeRPC(t, stdin, `{"jsonrpc":"2.0","id":131,"method":"tools/list","params":{}}`)
 		list := readRPCResponseForIDWithin(t, reader, "131", 5*time.Second)
+		for attempt := 0; !strings.Contains(list, wanted) && attempt < 40; attempt++ {
+			time.Sleep(100 * time.Millisecond)
+			writeRPC(t, stdin, `{"jsonrpc":"2.0","id":132,"method":"tools/list","params":{}}`)
+			list = readRPCResponseForIDWithin(t, reader, "132", 5*time.Second)
+		}
 		_ = stdin.Close()
 		if err := cmd.Wait(); err != nil {
 			t.Fatalf("gateway exit failed: %v stderr=%s", err, stderr.String())
@@ -90,13 +97,14 @@ func TestE2EChangedToolDefinitionIsReportedOnce(t *testing.T) {
 		return list
 	}
 
-	if list := session(); !strings.Contains(list, `"crm__lookup"`) {
+	const original, swapped = `Look up a customer record."`, `including internal notes.`
+	if list := session(original); !strings.Contains(list, `"crm__lookup"`) {
 		t.Fatalf("first session did not list the tool: %s", list)
 	}
 	if events := definitionChangeEvents(t, home); len(events) != 0 {
 		t.Fatalf("first sight of a definition was reported as a change: %+v", events)
 	}
-	session()
+	session(original)
 	if events := definitionChangeEvents(t, home); len(events) != 0 {
 		t.Fatalf("an unchanged definition was reported as a change: %+v", events)
 	}
@@ -104,15 +112,15 @@ func TestE2EChangedToolDefinitionIsReportedOnce(t *testing.T) {
 	if err := os.WriteFile(swap, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if list := session(); !strings.Contains(list, `"crm__lookup"`) {
-		t.Fatalf("a changed definition must stay listed: %s", list)
+	if list := session(swapped); !strings.Contains(list, `"crm__lookup"`) || !strings.Contains(list, swapped) {
+		t.Fatalf("the changed definition must be listed: %s", list)
 	}
 	events := definitionChangeEvents(t, home)
 	if len(events) != 1 || events[0]["event_type"] != "mcp.threat_detected" || events[0]["tool_name"] != "lookup" ||
 		events[0]["server_name"] != "crm" || events[0]["category"] != "tool_poisoning" || events[0]["verdict"] != "warn" {
 		t.Fatalf("want one tool_definition_changed warning for crm/lookup, got %+v", events)
 	}
-	session()
+	session(swapped)
 	if events := definitionChangeEvents(t, home); len(events) != 1 {
 		t.Fatalf("the change was reported again on a later session: %+v", events)
 	}

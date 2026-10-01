@@ -418,6 +418,12 @@ func (p *Proxy) handleBackendLifecycle(serverName, state string, lifecycleErr er
 		p.setToolStatus(serverName, toolRefreshStatus{Status: "ready", UpdatedAt: time.Now().UTC().Format(time.RFC3339Nano)})
 		return
 	}
+	// The Gateway stopping its own backends is not a backend failure. The
+	// tools it last listed stay cached so the next session can offer them
+	// while a slow server starts.
+	if p.ctx != nil && p.ctx.Err() != nil {
+		return
+	}
 	p.mu.Lock()
 	delete(p.toolCache, serverName)
 	delete(p.emptyToolLists, serverName)

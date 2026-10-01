@@ -454,6 +454,14 @@ class Smoke:
         expect(not changed(), "an unchanged definition was reported: %s" % changed())
         swap.write_bytes(b"")
         server, _ = self.connect(home, env, {UPSTREAM + "__echo"})
+        # The first list can come from the last session's cache while the
+        # upstream starts; the changed definition arrives with the refresh.
+        deadline = time.monotonic() + TIMEOUT
+        while time.monotonic() < deadline:
+            listed = {tool["name"]: tool.get("description", "") for tool in server.request("tools/list")["tools"]}
+            if "caller's notes" in listed.get(UPSTREAM + "__echo", ""):
+                break
+            time.sleep(0.2)
         self.finish(server)
         self.read_events(state, lambda e: e.get("pattern_name") == "tool_definition_changed")
         reported = changed()
