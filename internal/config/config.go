@@ -246,7 +246,7 @@ func LoadWithSource(path string) (LoadResult, error) {
 		case err == nil:
 			data = stripUTF8BOM(data)
 			if err := json.Unmarshal(data, &cfg); err != nil {
-				return res, fmt.Errorf("parsing config: %w", err)
+				return res, fmt.Errorf("parsing config %s: %w", path, err)
 			}
 			if cfg.APIKey != "" {
 				res.APIKeySource = SourceFile
@@ -329,11 +329,15 @@ func Save(cfg Config) error {
 	return os.Rename(tmpPath, path)
 }
 
-// SaveAPIKey stores the API key from auth login.
+// SaveAPIKey stores the API key from auth login. Like every mutator below, it
+// refuses to save when the existing file cannot be read or parsed: writing
+// defaults over it would silently discard the mode, key and servers it holds.
+// A missing file is not an error (Load returns defaults), so a first run
+// still creates the config.
 func SaveAPIKey(apiKey string) error {
 	cfg, err := Load()
 	if err != nil {
-		cfg = DefaultConfig()
+		return err
 	}
 	cfg.APIKey = apiKey
 	return Save(cfg)
@@ -343,7 +347,7 @@ func SaveAPIKey(apiKey string) error {
 func AddServer(entry ServerEntry) error {
 	cfg, err := Load()
 	if err != nil {
-		cfg = DefaultConfig()
+		return err
 	}
 
 	// Remove existing server with same name
@@ -358,7 +362,8 @@ func AddServer(entry ServerEntry) error {
 	return Save(cfg)
 }
 
-// RemoveServer removes a server from the config.
+// RemoveServer removes a server from the config. A name that is not
+// registered is an error and leaves the config file untouched.
 func RemoveServer(name string) error {
 	cfg, err := Load()
 	if err != nil {
@@ -370,6 +375,9 @@ func RemoveServer(name string) error {
 		if s.Name != name {
 			filtered = append(filtered, s)
 		}
+	}
+	if len(filtered) == len(cfg.Servers) {
+		return fmt.Errorf("no server named %q in %s", name, CurrentConfigPath())
 	}
 	cfg.Servers = filtered
 

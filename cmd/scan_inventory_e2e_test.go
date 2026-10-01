@@ -8,7 +8,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -115,8 +117,52 @@ func TestScan03_MCPServersInSettings(t *testing.T) {
 	if got.Name != "github" || got.Type != "stdio" {
 		t.Errorf("wrong shape: %+v", got)
 	}
-	if got.Command != "npx -y @modelcontextprotocol/server-github" {
-		t.Errorf("command not joined: %q", got.Command)
+	if got.Command != "npx" {
+		t.Errorf("command must be the base name only: %q", got.Command)
+	}
+}
+
+// SCAN-10: arguments, environment and anything after the binary in a command
+// string never reach the payload, from Claude Code or Claude Desktop config.
+func TestScan10_CommandArgumentsAndSecretsNeverReported(t *testing.T) {
+	home := t.TempDir()
+	cwd := t.TempDir()
+	const conn = "postgresql://app:conn-pw-0001@db.example.test/prod"
+	scanWriteFixture(t, filepath.Join(home, ".claude", "settings.json"),
+		`{"mcpServers":{"pg":{"command":"npx","args":["-y","pg-mcp","`+conn+`","--api-key","sk-test-args-0002"],"env":{"PGPASSWORD":"env-value-0003"}}}}`)
+	scanWriteFixture(t, filepath.Join(cwd, ".mcp.json"),
+		`{"mcpServers":{"inline":{"command":"/Users/dev/bin/pg-mcp --token tok-inline-0004 `+conn+`"}}}`)
+	scanWriteFixture(t, ideConfigPath(home, "claude-desktop"),
+		`{"mcpServers":{"desktop":{"command":"uvx db-mcp --api-key sk-test-desktop-0005","args":["`+conn+`"]}}}`)
+
+	stdout, stderr, code := run(t, home, "scan-inventory", "--dry-run", "--cwd", cwd)
+	if code != 0 {
+		t.Fatalf("exit %d, stderr: %s", code, stderr)
+	}
+	var payload struct {
+		InstalledMCPServer []struct {
+			Name    string `json:"name"`
+			Command string `json:"command"`
+		} `json:"installed_mcp_servers"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &payload); err != nil {
+		t.Fatalf("output not valid JSON: %v\n%s", err, stdout)
+	}
+	commands := map[string]string{}
+	for _, server := range payload.InstalledMCPServer {
+		commands[server.Name] = server.Command
+	}
+	want := map[string]string{"pg": "npx", "inline": "pg-mcp", "desktop": "uvx"}
+	if !reflect.DeepEqual(commands, want) {
+		t.Errorf("commands = %v, want %v", commands, want)
+	}
+	for _, secret := range []string{
+		"conn-pw-0001", "db.example.test", "sk-test-args-0002", "env-value-0003",
+		"tok-inline-0004", "sk-test-desktop-0005", "--api-key", "--token",
+	} {
+		if strings.Contains(stdout+stderr, secret) {
+			t.Errorf("dry-run output leaked %q:\n%s%s", secret, stdout, stderr)
+		}
 	}
 }
 

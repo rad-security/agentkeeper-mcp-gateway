@@ -1096,9 +1096,12 @@ func addServerWithoutClobber(entry config.ServerEntry, sourceKey string) (string
 		return "", errors.New("server name is required")
 	}
 
+	// An unreadable gateway config must not be replaced by defaults. Callers
+	// add servers before rewriting the client config, so failing here leaves
+	// both files as they were.
 	cfg, err := config.Load()
 	if err != nil {
-		cfg = config.DefaultConfig()
+		return "", err
 	}
 
 	baseName := entry.Name
