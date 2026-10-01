@@ -25,6 +25,13 @@ import (
 const (
 	manifestVersion = 1
 	ownershipID     = "agentkeeper.manual.v1"
+	// The Cowork entrypoint is written into the Claude Desktop config.
+	clientClaudeDesktop     = "claude-desktop"
+	clientCowork            = "cowork"
+	claudeDesktopConfigName = "claude_desktop_config.json"
+	// The manifest embeds each routed client's pre-route bytes, and a real
+	// ~/.claude.json runs to megabytes. The cap only bounds a corrupt file.
+	maxManifestBytes = 64 << 20
 )
 
 type ConfigureOptions struct {
@@ -33,21 +40,50 @@ type ConfigureOptions struct {
 }
 
 type RemoveOptions struct {
+	// Adapters are the supported clients checked for an unowned Gateway route
+	// when no ownership manifest exists.
 	Adapters []*ideconfig.Adapter
-	DryRun   bool
+	// Clients names the routes to restore, including ones no adapter covers
+	// (Cowork sources). Empty selects the Adapters' clients.
+	Clients []string
+	DryRun  bool
+}
+
+// KindCoworkRemote marks Cowork's session state file, whose native remote MCP
+// entries are disabled rather than replaced by a Gateway entry.
+const KindCoworkRemote = "cowork_remote"
+
+// AdoptOptions describes a client file that AgentKeeper rewrote outside the
+// adapter path: Claude Code project-scoped routes, project .mcp.json files and
+// Cowork sources.
+type AdoptOptions struct {
+	Client         string
+	Path           string
+	Kind           string
+	OriginalExists bool
+	Original       []byte
+	SourceHash     string
+	RouteRevision  string
+	// AddedGatewayServers were created in the Gateway config by this step.
+	// ReferencedGatewayServers are all Gateway servers the route depends on.
+	AddedGatewayServers      []string
+	ReferencedGatewayServers []string
 }
 
 type Report struct {
-	Result             string            `json:"result"`
-	Changed            bool              `json:"changed"`
-	Configured         []string          `json:"configured,omitempty"`
-	Removed            []string          `json:"removed,omitempty"`
-	ExactRestored      []string          `json:"exact_restored,omitempty"`
-	StructuralRestored []string          `json:"structural_restored,omitempty"`
-	MigratedServers    []string          `json:"migrated_servers,omitempty"`
-	ManifestPath       string            `json:"manifest_path"`
-	Errors             map[string]string `json:"errors,omitempty"`
-	Plans              []ideconfig.Plan  `json:"-"`
+	Result             string   `json:"result"`
+	Changed            bool     `json:"changed"`
+	Configured         []string `json:"configured,omitempty"`
+	Removed            []string `json:"removed,omitempty"`
+	ExactRestored      []string `json:"exact_restored,omitempty"`
+	StructuralRestored []string `json:"structural_restored,omitempty"`
+	// SkippedMissing lists routed files that no longer exist. Their routes
+	// went with them, so their records are dropped without a restore.
+	SkippedMissing  []string          `json:"skipped_missing,omitempty"`
+	MigratedServers []string          `json:"migrated_servers,omitempty"`
+	ManifestPath    string            `json:"manifest_path"`
+	Errors          map[string]string `json:"errors,omitempty"`
+	Plans           []ideconfig.Plan  `json:"-"`
 }
 
 type manifest struct {
@@ -67,6 +103,11 @@ type clientState struct {
 	SourceHash      string   `json:"source_hash"`
 	RouteRevision   string   `json:"route_revision"`
 	MigratedServers []string `json:"migrated_servers,omitempty"`
+	// Kind selects the restore strategy; empty is an mcpServers document.
+	Kind string `json:"kind,omitempty"`
+	// GatewayServers are Gateway config entries this route depends on whose
+	// names can differ from the client's own server names.
+	GatewayServers []string `json:"gateway_servers,omitempty"`
 }
 
 type migratedServer struct {
@@ -92,6 +133,7 @@ type restoreAction struct {
 	state      clientState
 	current    fileState
 	removeFile bool
+	missing    bool
 	updated    []byte
 	mode       os.FileMode
 	exact      bool
@@ -127,7 +169,7 @@ func Configure(opts ConfigureOptions) (Report, error) {
 			continue
 		}
 		report.Plans = append(report.Plans, plan)
-		if _, ok := findClient(state.Clients, adapter.Name, plan.ConfigPath); ok && plan.AlreadyWired {
+		if _, ok := findClient(state.Clients, plan.ConfigPath); ok && plan.AlreadyWired {
 			report.Configured = append(report.Configured, adapter.Name)
 			continue
 		}
@@ -141,15 +183,20 @@ func Configure(opts ConfigureOptions) (Report, error) {
 			OriginalBytes: original.data, OriginalMode: uint32(original.mode.Perm()),
 			SourceHash: plan.SourceHash, RouteRevision: plan.RouteRevision,
 		}
-		if previous, ok := findClient(state.Clients, adapter.Name, plan.ConfigPath); ok {
+		if previous, ok := findClient(state.Clients, plan.ConfigPath); ok {
+			// A file has one record. The Cowork entrypoint may have recorded
+			// this path first; the adapter that routes the file takes it over.
 			client = previous
-			client.OriginalExists = original.exists
+			client.Name = adapter.Name
 			client.OriginalMode = uint32(original.mode.Perm())
 			baseline, baselineErr := directBaseline(original.data, previous.OriginalBytes, plan.Migrated)
 			if baselineErr != nil {
 				return report, fmt.Errorf("prepare updated rollback baseline for %s: %w", adapter.Name, baselineErr)
 			}
 			client.OriginalBytes = baseline
+			// A file routing itself created stays removable until the customer
+			// has put something of their own in it.
+			client.OriginalExists = previous.OriginalExists || holdsCustomerContent(baseline)
 		} else if plan.HasGateway {
 			baseline, baselineErr := directBaseline(original.data, nil, plan.Migrated)
 			if baselineErr != nil {
@@ -288,8 +335,13 @@ func Remove(opts RemoveOptions) (Report, error) {
 	}
 
 	wanted := map[string]bool{}
-	for _, adapter := range opts.Adapters {
-		wanted[adapter.Name] = true
+	for _, name := range opts.Clients {
+		wanted[strings.ToLower(strings.TrimSpace(name))] = true
+	}
+	if len(opts.Clients) == 0 {
+		for _, adapter := range opts.Adapters {
+			wanted[adapter.Name] = true
+		}
 	}
 	var selected, remaining []clientState
 	for _, client := range state.Clients {
@@ -301,6 +353,33 @@ func Remove(opts RemoveOptions) (Report, error) {
 	}
 	if len(selected) == 0 {
 		report.Result = "not_configured"
+		return report, nil
+	}
+
+	actions := make([]restoreAction, 0, len(selected))
+	for _, client := range selected {
+		action, actionErr := prepareRestore(client)
+		if actionErr != nil {
+			return report, fmt.Errorf("prepare rollback for %s: %w", client.Name, actionErr)
+		}
+		if action.missing {
+			// The file may be gone for good (a Cowork session) or only absent
+			// (a renamed or unmounted project). Its record and its Gateway
+			// servers are kept so it can still be restored if it comes back.
+			report.SkippedMissing = append(report.SkippedMissing, client.Path)
+			remaining = append(remaining, client)
+			continue
+		}
+		actions = append(actions, action)
+		report.Removed = append(report.Removed, client.Name)
+		if action.exact {
+			report.ExactRestored = append(report.ExactRestored, client.Name)
+		} else {
+			report.StructuralRestored = append(report.StructuralRestored, client.Name)
+		}
+	}
+	if len(actions) == 0 {
+		report.Result = "skipped_missing"
 		return report, nil
 	}
 
@@ -319,7 +398,12 @@ func Remove(opts RemoveOptions) (Report, error) {
 			continue
 		}
 		current, exists := findGatewayServer(gatewayConfig.Servers, name)
-		if !exists || !reflect.DeepEqual(current, owned.Installed) {
+		if !exists {
+			// Already removed by hand: nothing left to clean up.
+			delete(state.MigratedServers, name)
+			continue
+		}
+		if !reflect.DeepEqual(current, owned.Installed) {
 			return report, fmt.Errorf("gateway server %s drifted after route configuration; refusing destructive cleanup", name)
 		}
 		if owned.PreviousExists && owned.Previous != nil {
@@ -328,21 +412,6 @@ func Remove(opts RemoveOptions) (Report, error) {
 			gatewayConfig.Servers = removeGatewayServer(gatewayConfig.Servers, name)
 		}
 		delete(state.MigratedServers, name)
-	}
-
-	actions := make([]restoreAction, 0, len(selected))
-	for _, client := range selected {
-		action, actionErr := prepareRestore(client)
-		if actionErr != nil {
-			return report, fmt.Errorf("prepare rollback for %s: %w", client.Name, actionErr)
-		}
-		actions = append(actions, action)
-		report.Removed = append(report.Removed, client.Name)
-		if action.exact {
-			report.ExactRestored = append(report.ExactRestored, client.Name)
-		} else {
-			report.StructuralRestored = append(report.StructuralRestored, client.Name)
-		}
 	}
 	if opts.DryRun {
 		return report, nil
@@ -413,10 +482,14 @@ func prepareRestore(state clientState) (restoreAction, error) {
 	if err != nil {
 		return restoreAction{}, err
 	}
-	if !current.exists {
-		return restoreAction{}, fmt.Errorf("owned route configuration is missing")
-	}
 	action := restoreAction{state: state, current: current, mode: current.mode}
+	if !current.exists {
+		// Cowork session and plugin directories come and go. A routed file
+		// that is gone has no route left to remove, and must not stop every
+		// other client from rolling back.
+		action.missing = true
+		return action, nil
+	}
 	if gatewayentry.ContentHash(current.data) == state.RoutedHash {
 		action.exact = true
 		if state.OriginalExists {
@@ -427,26 +500,53 @@ func prepareRestore(state clientState) (restoreAction, error) {
 		}
 		return action, nil
 	}
+	updated, err := unroutedDocument(state, current.data, true)
+	if err != nil {
+		return action, err
+	}
+	action.updated = updated
+	return action, nil
+}
 
-	var root map[string]json.RawMessage
-	if err := json.Unmarshal(current.data, &root); err != nil {
-		return action, fmt.Errorf("parse drifted client config: %w", err)
+// unroutedDocument returns a routed client file with AgentKeeper's route taken
+// out and the servers the route migrated put back, keeping everything else as
+// the file has it now.
+//
+// Rollback passes requireOwned: the Gateway entry must be one this record
+// owns, or nothing is touched. Adopt reads the bytes AgentKeeper itself is
+// about to replace or has just replaced, where any Gateway-shaped entry is a
+// route and none of it is customer content.
+func unroutedDocument(state clientState, routed []byte, requireOwned bool) ([]byte, error) {
+	if state.Kind == KindCoworkRemote {
+		return restoreCoworkRemoteEntries(routed, state)
+	}
+	root := map[string]json.RawMessage{}
+	if len(routed) > 0 {
+		if err := json.Unmarshal(routed, &root); err != nil {
+			return nil, fmt.Errorf("parse drifted client config: %w", err)
+		}
 	}
 	servers := map[string]json.RawMessage{}
-	if raw := root["mcpServers"]; len(raw) > 0 {
+	if raw := root["mcpServers"]; len(raw) > 0 && string(raw) != "null" {
 		if err := json.Unmarshal(raw, &servers); err != nil {
-			return action, fmt.Errorf("parse drifted mcpServers: %w", err)
+			return nil, fmt.Errorf("parse drifted mcpServers: %w", err)
 		}
 	}
-	if raw, exists := servers[ideconfig.GatewayServerName]; exists {
-		if !isOwnedGatewayEntry(raw, state) {
-			return action, fmt.Errorf("gateway entry no longer matches the AgentKeeper-owned route identity")
+	if requireOwned {
+		if raw, exists := servers[ideconfig.GatewayServerName]; exists {
+			if !isOwnedGatewayEntry(raw, state) {
+				return nil, fmt.Errorf("gateway entry no longer matches the AgentKeeper-owned route identity")
+			}
+			delete(servers, ideconfig.GatewayServerName)
 		}
+	} else if isGatewayRouteEntry(servers[ideconfig.GatewayServerName]) {
+		// Only the entry under AgentKeeper's own name is a route. A Gateway
+		// entry the customer wrote under another name is their server.
 		delete(servers, ideconfig.GatewayServerName)
 	}
 	originalServers, err := serverMap(state.OriginalBytes)
 	if err != nil {
-		return action, err
+		return nil, err
 	}
 	for _, name := range state.MigratedServers {
 		if original, ok := originalServers[name]; ok {
@@ -455,28 +555,407 @@ func prepareRestore(state clientState) (restoreAction, error) {
 			}
 		}
 	}
-	encoded, err := json.Marshal(servers)
-	if err != nil {
-		return action, err
+	// A document that had no server map before routing does not gain an
+	// empty one.
+	_, had := root["mcpServers"]
+	if len(servers) == 0 && len(state.OriginalBytes) > 0 && !hasTopLevelKey(state.OriginalBytes, "mcpServers") {
+		delete(root, "mcpServers")
+	} else if had || len(servers) > 0 {
+		encoded, err := json.Marshal(servers)
+		if err != nil {
+			return nil, err
+		}
+		root["mcpServers"] = encoded
 	}
-	root["mcpServers"] = encoded
+	if err := restoreProjectScopedServers(root, state, requireOwned); err != nil {
+		return nil, err
+	}
 	updated, err := json.MarshalIndent(root, "", "  ")
 	if err != nil {
-		return action, err
+		return nil, err
 	}
-	action.updated = append(updated, '\n')
-	return action, nil
+	return append(updated, '\n'), nil
 }
 
+// isOwnedGatewayEntry accepts the route identity this manifest recorded, and
+// also an identity AgentKeeper itself re-attested afterwards: project and
+// Cowork migration rebind every Gateway entry in a file they rewrite, which
+// the manifest written by an earlier release did not follow. A re-attested
+// entry must still name this record's client (the Claude Desktop config is
+// shared with the Cowork entrypoint). An entry whose identity was edited by
+// hand matches neither and is refused.
 func isOwnedGatewayEntry(raw json.RawMessage, state clientState) bool {
 	var entry ideconfig.ServerEntry
 	if json.Unmarshal(raw, &entry) != nil || len(entry.Args) != 1 || entry.Args[0] != "server" {
 		return false
 	}
-	return gatewayentry.IsGatewayCommand(entry.Command) &&
-		entry.Env[gatewayentry.EnvClientName] == state.Name &&
+	if !gatewayentry.IsGatewayCommand(entry.Command) {
+		return false
+	}
+	client := entry.Env[gatewayentry.EnvClientName]
+	if client == state.Name &&
 		entry.Env[gatewayentry.EnvConfigSourceHash] == state.SourceHash &&
-		entry.Env[gatewayentry.EnvRouteRevision] == state.RouteRevision
+		entry.Env[gatewayentry.EnvRouteRevision] == state.RouteRevision {
+		return true
+	}
+	sharesDesktopConfig := filepath.Base(state.Path) == claudeDesktopConfigName &&
+		((state.Name == clientClaudeDesktop && client == clientCowork) ||
+			(state.Name == clientCowork && client == clientClaudeDesktop))
+	return (client == state.Name || sharesDesktopConfig) && gatewayentry.IsAttestedRoute(entry.Command, entry.Env)
+}
+
+// isGatewayRouteEntry recognises a Gateway entry by shape alone, for telling
+// customer servers apart from routes when reading pre-route bytes.
+func isGatewayRouteEntry(raw json.RawMessage) bool {
+	var entry ideconfig.ServerEntry
+	if json.Unmarshal(raw, &entry) != nil || len(entry.Args) != 1 || entry.Args[0] != "server" {
+		return false
+	}
+	return gatewayentry.IsGatewayCommand(entry.Command)
+}
+
+// restoreProjectScopedServers undoes Claude Code project-scoped routes nested
+// under `projects` in ~/.claude.json: each routed project loses its Gateway
+// entry and regains the servers it had before routing. Projects and settings
+// the client added later are left untouched.
+func restoreProjectScopedServers(root map[string]json.RawMessage, state clientState, requireOwned bool) error {
+	rawProjects := root["projects"]
+	if len(rawProjects) == 0 || string(rawProjects) == "null" {
+		return nil
+	}
+	var projects map[string]map[string]json.RawMessage
+	if err := json.Unmarshal(rawProjects, &projects); err != nil {
+		return nil // not the Claude Code project map; nothing to restore
+	}
+	originalProjects := projectServerMaps(state.OriginalBytes)
+	changed := false
+	for project, settings := range projects {
+		servers := map[string]json.RawMessage{}
+		if raw := settings["mcpServers"]; len(raw) > 0 && string(raw) != "null" {
+			if err := json.Unmarshal(raw, &servers); err != nil {
+				continue
+			}
+		}
+		routed := false
+		if requireOwned {
+			if raw, exists := servers[ideconfig.GatewayServerName]; exists {
+				if !isOwnedGatewayEntry(raw, state) {
+					return fmt.Errorf("gateway entry for project %s no longer matches the AgentKeeper-owned route identity", project)
+				}
+				delete(servers, ideconfig.GatewayServerName)
+				routed = true
+			}
+		} else if isGatewayRouteEntry(servers[ideconfig.GatewayServerName]) {
+			delete(servers, ideconfig.GatewayServerName)
+			routed = true
+		}
+		if !routed {
+			continue
+		}
+		for name, entry := range originalProjects[project] {
+			if _, exists := servers[name]; exists || name == ideconfig.GatewayServerName {
+				continue
+			}
+			servers[name] = entry
+		}
+		encoded, err := json.Marshal(servers)
+		if err != nil {
+			return err
+		}
+		settings["mcpServers"] = encoded
+		projects[project] = settings
+		changed = true
+	}
+	if !changed {
+		return nil
+	}
+	encoded, err := json.Marshal(projects)
+	if err != nil {
+		return err
+	}
+	root["projects"] = encoded
+	return nil
+}
+
+func coworkRemoteKey(remote map[string]json.RawMessage) string {
+	var uuid, name, url string
+	_ = json.Unmarshal(remote["uuid"], &uuid)
+	if strings.TrimSpace(uuid) != "" {
+		return uuid
+	}
+	_ = json.Unmarshal(remote["name"], &name)
+	_ = json.Unmarshal(remote["url"], &url)
+	return strings.ToLower(strings.TrimSpace(name)) + "|" + strings.TrimSpace(url)
+}
+
+func coworkRemoteEntries(data []byte) (map[string]json.RawMessage, []map[string]json.RawMessage, error) {
+	root := map[string]json.RawMessage{}
+	if len(data) > 0 {
+		if err := json.Unmarshal(data, &root); err != nil {
+			return nil, nil, err
+		}
+	}
+	var remotes []map[string]json.RawMessage
+	if raw := root["remoteMcpServersConfig"]; len(raw) > 0 && string(raw) != "null" {
+		if err := json.Unmarshal(raw, &remotes); err != nil {
+			return nil, nil, err
+		}
+	}
+	return root, remotes, nil
+}
+
+// restoreCoworkRemoteEntries puts back the native remote MCP entries and tool
+// selections that routing disabled, keeping everything Cowork wrote since.
+func restoreCoworkRemoteEntries(current []byte, state clientState) ([]byte, error) {
+	root, remotes, err := coworkRemoteEntries(current)
+	if err != nil {
+		return nil, fmt.Errorf("parse drifted Cowork state: %w", err)
+	}
+	originalRoot, originalRemotes, err := coworkRemoteEntries(state.OriginalBytes)
+	if err != nil {
+		return nil, err
+	}
+	disabled := map[string]bool{}
+	for _, key := range state.MigratedServers {
+		disabled[key] = true
+	}
+	present := map[string]bool{}
+	for _, remote := range remotes {
+		present[coworkRemoteKey(remote)] = true
+	}
+	restored := map[string]bool{}
+	for _, remote := range originalRemotes {
+		key := coworkRemoteKey(remote)
+		if !disabled[key] || present[key] {
+			continue
+		}
+		remotes = append(remotes, remote)
+		restored[key] = true
+	}
+	encoded, err := json.Marshal(remotes)
+	if err != nil {
+		return nil, err
+	}
+	root["remoteMcpServersConfig"] = encoded
+
+	originalEnabled := map[string]json.RawMessage{}
+	if raw := originalRoot["enabledMcpTools"]; len(raw) > 0 && string(raw) != "null" {
+		_ = json.Unmarshal(raw, &originalEnabled)
+	}
+	// Cowork owns this file and may change the shape of its tool selections.
+	// The remote entries are restored either way.
+	enabled := map[string]json.RawMessage{}
+	enabledReadable := true
+	if raw := root["enabledMcpTools"]; len(raw) > 0 && string(raw) != "null" {
+		if err := json.Unmarshal(raw, &enabled); err != nil {
+			enabledReadable = false
+		}
+	}
+	changedEnabled := false
+	if !enabledReadable {
+		originalEnabled = nil
+	}
+	for key, value := range originalEnabled {
+		if _, exists := enabled[key]; exists {
+			continue
+		}
+		for remoteKey := range restored {
+			if strings.HasPrefix(key, remoteKey+":") {
+				enabled[key] = value
+				changedEnabled = true
+			}
+		}
+	}
+	if changedEnabled {
+		encodedEnabled, err := json.Marshal(enabled)
+		if err != nil {
+			return nil, err
+		}
+		root["enabledMcpTools"] = encodedEnabled
+	}
+	updated, err := json.MarshalIndent(root, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	return append(updated, '\n'), nil
+}
+
+// Adopt records a client file AgentKeeper rewrote outside the adapter path so
+// `configure-ide --remove-routing` can undo it. A file has one record.
+//
+// The record's original is what the file would be without the route. When the
+// file is routed again after the customer changed it (a server added to an
+// already-routed file, settings added to a config routing created), that
+// moves with it: restoring the bytes from before the first run would discard
+// everything written since.
+func Adopt(opts AdoptOptions) error {
+	manifestPath, err := ManifestPath()
+	if err != nil {
+		return err
+	}
+	state := manifest{
+		Version: manifestVersion, OwnershipID: ownershipID,
+		Clients: []clientState{}, MigratedServers: map[string]migratedServer{},
+	}
+	if existing, readErr := readManifest(manifestPath); readErr == nil {
+		state = existing
+	} else if !errors.Is(readErr, os.ErrNotExist) {
+		return fmt.Errorf("read manual routing manifest: %w", readErr)
+	}
+	if state.Version != manifestVersion || state.OwnershipID != ownershipID {
+		return fmt.Errorf("manual routing manifest version is incompatible")
+	}
+	if state.MigratedServers == nil {
+		state.MigratedServers = map[string]migratedServer{}
+	}
+	// The migration writes through a symlinked client file (a dotfiles
+	// checkout), so the record names the file that was actually rewritten.
+	// Only a link at the file itself is followed: resolving parent directories
+	// would give the same file two spellings, and so two records.
+	path := opts.Path
+	if info, statErr := os.Lstat(path); statErr == nil && info.Mode()&os.ModeSymlink != 0 {
+		if resolved, resolveErr := filepath.EvalSymlinks(path); resolveErr == nil {
+			path = resolved
+		}
+	}
+	current, err := snapshotFile(path)
+	if err != nil {
+		return err
+	}
+	if !current.exists {
+		return fmt.Errorf("routed configuration is missing: %s", path)
+	}
+
+	record, found := findClient(state.Clients, path)
+	if !found {
+		record = clientState{Name: opts.Client, Path: path, Kind: opts.Kind, OriginalMode: uint32(current.mode.Perm())}
+	}
+	if opts.OriginalExists {
+		// The bytes this step replaced may already carry a route: one made by
+		// a release that kept no record, or the route this record owns.
+		baseline, baselineErr := unroutedDocument(record, opts.Original, false)
+		switch {
+		case baselineErr != nil:
+			if !found {
+				record.OriginalBytes = opts.Original
+			}
+		case !found && sameJSON(baseline, opts.Original):
+			record.OriginalBytes = opts.Original // keep the customer's exact bytes
+		case !found || !sameJSON(baseline, record.OriginalBytes):
+			record.OriginalBytes = baseline
+		}
+		record.OriginalExists = record.OriginalExists || !found || record.Kind == KindCoworkRemote || holdsCustomerContent(record.OriginalBytes)
+	}
+	record.RoutedHash = gatewayentry.ContentHash(current.data)
+	if opts.SourceHash != "" {
+		record.SourceHash, record.RouteRevision = opts.SourceHash, opts.RouteRevision
+	}
+	removed, err := removedByRouting(record, current.data)
+	if err != nil {
+		return err
+	}
+	for _, name := range removed {
+		record.MigratedServers = appendUnique(record.MigratedServers, name)
+	}
+	sort.Strings(record.MigratedServers)
+
+	gatewayConfig, err := config.Load()
+	if err != nil {
+		return fmt.Errorf("load gateway config for route ownership: %w", err)
+	}
+	for _, name := range opts.AddedGatewayServers {
+		if _, owned := state.MigratedServers[name]; owned {
+			continue
+		}
+		if installed, ok := findGatewayServer(gatewayConfig.Servers, name); ok {
+			state.MigratedServers[name] = migratedServer{Installed: installed}
+		}
+	}
+	for _, name := range opts.ReferencedGatewayServers {
+		if _, owned := state.MigratedServers[name]; owned {
+			record.GatewayServers = appendUnique(record.GatewayServers, name)
+		}
+	}
+	sort.Strings(record.GatewayServers)
+	state.Clients = replaceClient(state.Clients, record)
+	_, err = writeManifest(manifestPath, state)
+	return err
+}
+
+// removedByRouting names what the route took out of the client file: server
+// names for an mcpServers document, remote entry keys for Cowork state.
+func removedByRouting(record clientState, current []byte) ([]string, error) {
+	var removed []string
+	if record.Kind == KindCoworkRemote {
+		_, originalRemotes, err := coworkRemoteEntries(record.OriginalBytes)
+		if err != nil {
+			return nil, err
+		}
+		_, currentRemotes, err := coworkRemoteEntries(current)
+		if err != nil {
+			return nil, err
+		}
+		present := map[string]bool{}
+		for _, remote := range currentRemotes {
+			present[coworkRemoteKey(remote)] = true
+		}
+		for _, remote := range originalRemotes {
+			if key := coworkRemoteKey(remote); !present[key] {
+				removed = append(removed, key)
+			}
+		}
+		return removed, nil
+	}
+	originalServers, err := serverMap(record.OriginalBytes)
+	if err != nil {
+		return nil, err
+	}
+	currentServers, err := serverMap(current)
+	if err != nil {
+		return nil, err
+	}
+	for name := range originalServers {
+		if _, present := currentServers[name]; !present && name != ideconfig.GatewayServerName {
+			removed = append(removed, name)
+		}
+	}
+	return removed, nil
+}
+
+func hasTopLevelKey(data []byte, key string) bool {
+	var root map[string]json.RawMessage
+	if json.Unmarshal(data, &root) != nil {
+		return false
+	}
+	_, ok := root[key]
+	return ok
+}
+
+// holdsCustomerContent reports whether an mcpServers document has anything in
+// it besides an empty server map.
+func holdsCustomerContent(data []byte) bool {
+	var root map[string]json.RawMessage
+	if json.Unmarshal(data, &root) != nil {
+		return len(bytes.TrimSpace(data)) > 0
+	}
+	for key, raw := range root {
+		if key != "mcpServers" {
+			return true
+		}
+		var servers map[string]json.RawMessage
+		if json.Unmarshal(raw, &servers) != nil || len(servers) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func sameJSON(a, b []byte) bool {
+	var left, right interface{}
+	if json.Unmarshal(a, &left) != nil || json.Unmarshal(b, &right) != nil {
+		return bytes.Equal(a, b)
+	}
+	return reflect.DeepEqual(left, right)
 }
 
 func serverMap(data []byte) (map[string]json.RawMessage, error) {
@@ -539,11 +1018,88 @@ func directBaseline(current, priorOriginal []byte, migrated []ideconfig.NamedSer
 		return nil, err
 	}
 	root["mcpServers"] = encoded
+	if err := baselineProjectScopedServers(root, priorOriginal); err != nil {
+		return nil, err
+	}
 	baseline, err := json.MarshalIndent(root, "", "  ")
 	if err != nil {
 		return nil, err
 	}
 	return append(baseline, '\n'), nil
+}
+
+// baselineProjectScopedServers carries the pre-route servers of each routed
+// Claude Code project forward into a refreshed baseline. The refreshed
+// baseline is built from the client's current file, whose projects hold only
+// the Gateway entry, so without this a second configure-ide run would forget
+// what rollback has to put back.
+func baselineProjectScopedServers(root map[string]json.RawMessage, priorOriginal []byte) error {
+	priorProjects := projectServerMaps(priorOriginal)
+	if len(priorProjects) == 0 {
+		return nil
+	}
+	var projects map[string]map[string]json.RawMessage
+	if raw := root["projects"]; len(raw) == 0 || json.Unmarshal(raw, &projects) != nil {
+		return nil
+	}
+	changed := false
+	for project, settings := range projects {
+		servers := map[string]json.RawMessage{}
+		if raw := settings["mcpServers"]; len(raw) > 0 && string(raw) != "null" {
+			if json.Unmarshal(raw, &servers) != nil {
+				continue
+			}
+		}
+		if !isGatewayRouteEntry(servers[ideconfig.GatewayServerName]) {
+			continue
+		}
+		delete(servers, ideconfig.GatewayServerName)
+		for name, raw := range priorProjects[project] {
+			if _, exists := servers[name]; !exists && name != ideconfig.GatewayServerName {
+				servers[name] = raw
+			}
+		}
+		encoded, err := json.Marshal(servers)
+		if err != nil {
+			return err
+		}
+		settings["mcpServers"] = encoded
+		projects[project] = settings
+		changed = true
+	}
+	if !changed {
+		return nil
+	}
+	encoded, err := json.Marshal(projects)
+	if err != nil {
+		return err
+	}
+	root["projects"] = encoded
+	return nil
+}
+
+// projectServerMaps reads each Claude Code project's mcpServers from a
+// ~/.claude.json document.
+func projectServerMaps(data []byte) map[string]map[string]json.RawMessage {
+	result := map[string]map[string]json.RawMessage{}
+	if len(data) == 0 {
+		return result
+	}
+	var root map[string]json.RawMessage
+	var projects map[string]map[string]json.RawMessage
+	if json.Unmarshal(data, &root) != nil || len(root["projects"]) == 0 || json.Unmarshal(root["projects"], &projects) != nil {
+		return result
+	}
+	for project, settings := range projects {
+		servers := map[string]json.RawMessage{}
+		if raw := settings["mcpServers"]; len(raw) > 0 && string(raw) != "null" {
+			if json.Unmarshal(raw, &servers) != nil {
+				continue
+			}
+		}
+		result[project] = servers
+	}
+	return result
 }
 
 func snapshotFile(path string) (fileState, error) {
@@ -624,16 +1180,23 @@ func removeGatewayServer(servers []config.ServerEntry, name string) []config.Ser
 func referencedServers(clients []clientState) map[string]bool {
 	result := map[string]bool{}
 	for _, client := range clients {
-		for _, name := range client.MigratedServers {
+		// Cowork state records remote entry keys here, not server names.
+		if client.Kind != KindCoworkRemote {
+			for _, name := range client.MigratedServers {
+				result[name] = true
+			}
+		}
+		for _, name := range client.GatewayServers {
 			result[name] = true
 		}
 	}
 	return result
 }
 
-func findClient(clients []clientState, name, path string) (clientState, bool) {
+// A client file has exactly one record: two would each try to restore it.
+func findClient(clients []clientState, path string) (clientState, bool) {
 	for _, client := range clients {
-		if client.Name == name && client.Path == path {
+		if client.Path == path {
 			return client, true
 		}
 	}
@@ -643,7 +1206,7 @@ func findClient(clients []clientState, name, path string) (clientState, bool) {
 func replaceClient(clients []clientState, replacement clientState) []clientState {
 	result := append([]clientState(nil), clients...)
 	for index, client := range result {
-		if client.Name == replacement.Name && client.Path == replacement.Path {
+		if client.Path == replacement.Path {
 			result[index] = replacement
 			return result
 		}
@@ -695,12 +1258,12 @@ func readManifest(path string) (manifest, error) {
 		return value, err
 	}
 	defer file.Close()
-	raw, err := io.ReadAll(io.LimitReader(file, 1<<20+1))
+	raw, err := io.ReadAll(io.LimitReader(file, maxManifestBytes+1))
 	if err != nil {
 		return value, err
 	}
-	if len(raw) > 1<<20 {
-		return value, fmt.Errorf("manual routing manifest exceeds 1 MiB")
+	if len(raw) > maxManifestBytes {
+		return value, fmt.Errorf("manual routing manifest exceeds %d MiB", maxManifestBytes>>20)
 	}
 	if err := json.Unmarshal(raw, &value); err != nil {
 		return value, err

@@ -45,8 +45,24 @@ func ContentHash(source []byte) string {
 func RouteIdentity(clientName string, source []byte) (string, string) {
 	canonical := canonicalRouteSource(source)
 	sourceHash := ContentHash(canonical)
-	routeSum := sha256.Sum256([]byte(clientName + "\x00" + sourceHash + "\x00" + Command()))
-	return sourceHash, "route:" + hex.EncodeToString(routeSum[:])
+	return sourceHash, routeRevision(clientName, sourceHash, Command())
+}
+
+func routeRevision(clientName, sourceHash, command string) string {
+	routeSum := sha256.Sum256([]byte(clientName + "\x00" + sourceHash + "\x00" + command))
+	return "route:" + hex.EncodeToString(routeSum[:])
+}
+
+// IsAttestedRoute reports whether a Gateway entry carries a route revision
+// that AttestRoutes derives from the entry's own client name, source hash and
+// command. It identifies an entry written by AgentKeeper without needing the
+// document it was attested against, which the client has usually changed since.
+func IsAttestedRoute(command string, env map[string]string) bool {
+	clientName, sourceHash, revision := env[EnvClientName], env[EnvConfigSourceHash], env[EnvRouteRevision]
+	if clientName == "" || sourceHash == "" || revision == "" || !IsGatewayCommand(command) {
+		return false
+	}
+	return revision == routeRevision(clientName, sourceHash, command)
 }
 
 func canonicalRouteSource(source []byte) []byte {

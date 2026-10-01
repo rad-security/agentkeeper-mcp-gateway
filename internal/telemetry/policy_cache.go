@@ -65,8 +65,11 @@ func (c *Client) loadPolicyCache() error {
 		stateValid := c.policyStateValid
 		c.policyMu.RUnlock()
 		if stateValid {
-			mode, _ := c.currentMode()
-			if strings.EqualFold(mode, "enforce") {
+			// Only a control-plane assignment has a policy snapshot to lose.
+			// A local enforce request on the unassigned initial Observe state
+			// (revision 0) never had one.
+			mode, revision := c.currentMode()
+			if strings.EqualFold(mode, "enforce") && revision > 0 {
 				return c.rejectPolicyCache(fmt.Errorf("policy snapshot missing after an established Enforce assignment"))
 			}
 		}
@@ -92,7 +95,7 @@ func (c *Client) loadPolicyCache() error {
 	if snapshot.SignerKeyID != c.receiptStore.SignerKeyID() {
 		return c.rejectPolicyCache(fmt.Errorf("cache signer does not match endpoint key"))
 	}
-	if snapshot.MachineID == "" || snapshot.MachineID != c.machineID {
+	if snapshot.MachineID != c.machineID {
 		return c.rejectPolicyCache(fmt.Errorf("cache machine identity does not match endpoint"))
 	}
 	if snapshot.ClientName != c.clientName || snapshot.ConfigSourceHash != c.configSourceHash || snapshot.RouteRevision != c.routeRevision {
@@ -191,7 +194,9 @@ func (c *Client) loadPolicyStateFrom(path string) error {
 	if state.SignerKeyID != c.receiptStore.SignerKeyID() {
 		return c.rejectPolicyCache(fmt.Errorf("established policy state signer does not match endpoint key"))
 	}
-	if state.MachineID == "" || state.MachineID != c.machineID {
+	// Machine identity detection can legitimately return nothing; the endpoint
+	// signer still binds the record, so an empty identity matches itself.
+	if state.MachineID != c.machineID {
 		return c.rejectPolicyCache(fmt.Errorf("established policy state machine identity does not match endpoint"))
 	}
 	if state.ClientName != c.clientName || state.ConfigSourceHash != c.configSourceHash || state.RouteRevision != c.routeRevision {
@@ -472,6 +477,18 @@ func (c *Client) restoreModeAndPolicy() error {
 	c.policyMu.RLock()
 	stateValid, cacheValid := c.policyStateValid, c.policyValid
 	c.policyMu.RUnlock()
+	c.modeMu.RLock()
+	startupEnforce := c.startupEnforce
+	c.modeMu.RUnlock()
+	if stateExists && !stateValid && !cacheValid {
+		if err := c.reestablishObserveForThisMachine(authorityPath, startupEnforce); err == nil {
+			stateValid = true
+			authorityErr, stateErr, cacheErr = nil, nil, nil
+			if c.logger != nil {
+				c.logger.Warn("persisted Observe state belonged to a different machine identity; re-established Observe for this machine")
+			}
+		}
+	}
 	c.modeMu.Lock()
 	ambiguous := stateExists && !stateValid && !cacheValid && !c.startupEnforce
 	c.modeAuthorityUnavailable = ambiguous
@@ -499,6 +516,117 @@ func (c *Client) restoreModeAndPolicy() error {
 	return authorityErr
 }
 
+// reestablishObserveForThisMachine recovers a route whose persisted authority
+// is a locally signed Observe record bound to a different machine identity,
+// which is what a home directory restored onto a replacement machine carries.
+// Observe is the first-boot mode, so restarting it here weakens nothing, while
+// refusing leaves a local-mode route with no way to ever start again. An
+// Enforce record, or one that cannot be verified, is never recovered this way.
+func (c *Client) reestablishObserveForThisMachine(authorityPath string, startupEnforce bool) error {
+	if c.receiptStore == nil {
+		return fmt.Errorf("no durable signer")
+	}
+	release, err := fslock.Acquire(c.policyStatePath + ".lock")
+	if err != nil {
+		return err
+	}
+	defer release()
+	// Every persisted record must be a foreign Observe record. One Enforce or
+	// unverifiable record beside an Observe one (a restore that mixed two
+	// points in time) is not evidence the route was only ever in Observe.
+	records := 0
+	for _, path := range []string{authorityPath, c.policyStatePath} {
+		if _, err := os.Lstat(path); os.IsNotExist(err) {
+			continue
+		}
+		records++
+		if err := c.foreignMachineObserveAuthority(path); err != nil {
+			// Another process for this route may have recovered it already;
+			// end in the state that process reached.
+			if _, verifyErr := c.verifiedAuthority(authorityPath); verifyErr == nil {
+				if loadErr := c.loadPolicyStateFrom(authorityPath); loadErr != nil {
+					return loadErr
+				}
+				c.policyMu.Lock()
+				c.policyCacheBad = false
+				c.policyMu.Unlock()
+				return nil
+			}
+			return err
+		}
+	}
+	if records == 0 {
+		return fmt.Errorf("no persisted authority")
+	}
+	// The policy snapshot is a record too. One that says Enforce is not to be
+	// deleted on the strength of an Observe authority beside it.
+	if data, err := os.ReadFile(c.policyCachePath); err == nil {
+		var snapshot policyCacheSnapshot
+		if json.Unmarshal(data, &snapshot) == nil && normalizePolicyMode(snapshot.EffectiveMode) == "enforce" {
+			return fmt.Errorf("policy snapshot records an Enforce assignment")
+		}
+	}
+	// The replaceable snapshot is bound to the same foreign identity.
+	for _, stale := range []string{authorityPath, c.policyStatePath, c.policyCachePath} {
+		if err := os.Remove(stale); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+	if err := c.writeInitialObserveAuthority(authorityPath); err != nil {
+		return err
+	}
+	// As on a first boot, a local enforce request strengthens the unassigned
+	// initial Observe state.
+	c.modeMu.Lock()
+	c.mode = "audit"
+	if startupEnforce {
+		c.mode = "enforce"
+	}
+	c.modeRevision = 0
+	c.modeMu.Unlock()
+	c.policyMu.Lock()
+	c.policyCacheBad = false
+	c.policyMu.Unlock()
+	return nil
+}
+
+func (c *Client) foreignMachineObserveAuthority(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("non-regular authority")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	var state policyStateSnapshot
+	if err := json.Unmarshal(data, &state); err != nil {
+		return err
+	}
+	if state.MachineID == c.machineID {
+		return fmt.Errorf("authority is bound to this machine identity")
+	}
+	if state.EffectiveMode != "observe" {
+		return fmt.Errorf("only an Observe authority can be re-established")
+	}
+	// Everything except the machine identity must verify exactly as it would
+	// for this endpoint, including the local signer's signature.
+	if state.SchemaVersion != policyStateSchema || state.SignerKeyID != c.receiptStore.SignerKeyID() || state.ClientName != c.clientName || state.ConfigSourceHash != c.configSourceHash || state.RouteRevision != c.routeRevision || state.EffectiveAssignmentRevision < 0 || state.EffectiveAssignmentRevision == 0 && state.AssignmentOrigin != "initial_observe" {
+		return fmt.Errorf("authority identity or assignment invalid")
+	}
+	if _, err := time.Parse(time.RFC3339Nano, state.EstablishedAt); err != nil {
+		return err
+	}
+	canonical, err := canonicalPolicyState(state)
+	if err != nil || !c.receiptStore.VerifyBytes(canonical, state.SignatureBase64) {
+		return fmt.Errorf("authority signature invalid")
+	}
+	return nil
+}
+
 func (c *Client) persistInitialObserveAuthority(path string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		return err
@@ -520,6 +648,11 @@ func (c *Client) persistInitialObserveAuthority(path string) error {
 			return err
 		}
 	}
+	return c.writeInitialObserveAuthority(path)
+}
+
+// Callers hold the process-shared assignment lock.
+func (c *Client) writeInitialObserveAuthority(path string) error {
 	state := policyStateSnapshot{SchemaVersion: policyStateSchema, SignerKeyID: c.receiptStore.SignerKeyID(), MachineID: c.machineID, ClientName: c.clientName, ConfigSourceHash: c.configSourceHash, RouteRevision: c.routeRevision, EffectiveMode: "observe", EffectiveAssignmentRevision: 0, EstablishedAt: c.now().UTC().Format(time.RFC3339Nano), AssignmentOrigin: "initial_observe"}
 	canonical, err := canonicalPolicyState(state)
 	if err != nil {

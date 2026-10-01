@@ -274,3 +274,86 @@ func TestRemoveRefusesUnmanifestedRoute(t *testing.T) {
 		t.Fatalf("expected missing ownership refusal, got %v", err)
 	}
 }
+
+// A route another AgentKeeper client attested is well-formed but is not this
+// record's route. Rollback of this record must not remove it.
+func TestRemoveRefusesRouteAttestedForAnotherClient(t *testing.T) {
+	root, _ := setupTest(t)
+	clientPath := filepath.Join(root, "client.json")
+	writeFile(t, clientPath, []byte(`{"mcpServers":{"fixture":{"command":"fixture"}}}`), 0o600)
+	adapter := testAdapter("claude-code", clientPath)
+	if _, err := Configure(ConfigureOptions{Adapters: []*ideconfig.Adapter{adapter}}); err != nil {
+		t.Fatal(err)
+	}
+	routed, err := os.ReadFile(clientPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reattested, _, _, err := gatewayentry.AttestRoutes("cursor", routed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, clientPath, reattested, 0o600)
+
+	if _, err := Remove(RemoveOptions{Adapters: []*ideconfig.Adapter{adapter}}); err == nil || !strings.Contains(err.Error(), "route identity") {
+		t.Fatalf("expected route identity refusal, got %v", err)
+	}
+	after, _ := os.ReadFile(clientPath)
+	if !reflect.DeepEqual(reattested, after) {
+		t.Fatal("refused rollback changed the client config")
+	}
+
+	// The same file re-attested for this record's own client is accepted.
+	own, _, _, err := gatewayentry.AttestRoutes("claude-code", append(append([]byte(nil), reattested[:len(reattested)-1]...), ' ', '}'))
+	if err != nil {
+		own, _, _, err = gatewayentry.AttestRoutes("claude-code", reattested)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeFile(t, clientPath, own, 0o600)
+	if _, err := Remove(RemoveOptions{Adapters: []*ideconfig.Adapter{adapter}}); err != nil {
+		t.Fatalf("own re-attested route was refused: %v", err)
+	}
+}
+
+// The Claude Desktop config is the one file two clients write a route into.
+// The allowance for that must not apply to any other file.
+func TestCoworkAttestedEntryIsOwnedOnlyInTheClaudeDesktopConfig(t *testing.T) {
+	t.Setenv(gatewayentry.EnvBinary, "/opt/synthetic/agentkeeper-mcp-gateway")
+	source := []byte(`{"mcpServers":{"agentkeeper-mcp-gateway":{"command":"/opt/synthetic/agentkeeper-mcp-gateway","args":["server"]}}}`)
+	bound, _, _, err := gatewayentry.AttestRoutes("cowork", source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	servers, err := serverMap(bound)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := servers[ideconfig.GatewayServerName]
+	desktop := clientState{Name: "claude-desktop", Path: "/home/synthetic/Claude/claude_desktop_config.json"}
+	other := clientState{Name: "claude-desktop", Path: "/home/synthetic/repo/.mcp.json"}
+	if !isOwnedGatewayEntry(entry, desktop) {
+		t.Fatal("Cowork entrypoint in the Claude Desktop config was refused")
+	}
+	if isOwnedGatewayEntry(entry, other) {
+		t.Fatal("a Cowork-attested entry was accepted for a file that is not the Claude Desktop config")
+	}
+}
+
+// Cowork owns its state file and can change its shape. An unexpected tool
+// selection value must not make the remote entries unrestorable.
+func TestCoworkRemoteRestoreToleratesUnexpectedToolSelectionShape(t *testing.T) {
+	state := clientState{
+		Kind:            KindCoworkRemote,
+		MigratedServers: []string{"11111111-2222-4333-8444-555555555555"},
+		OriginalBytes:   []byte(`{"remoteMcpServersConfig":[{"uuid":"11111111-2222-4333-8444-555555555555","name":"Synthetic","url":"https://remote.example.test/mcp"}],"enabledMcpTools":{"11111111-2222-4333-8444-555555555555:search":true}}`),
+	}
+	restored, err := restoreCoworkRemoteEntries([]byte(`{"remoteMcpServersConfig":[],"enabledMcpTools":["unexpected"]}`), state)
+	if err != nil {
+		t.Fatalf("restore failed on an unexpected enabledMcpTools value: %v", err)
+	}
+	if !strings.Contains(string(restored), "https://remote.example.test/mcp") {
+		t.Fatalf("remote entry was not restored: %s", restored)
+	}
+}

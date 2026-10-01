@@ -18,7 +18,6 @@ import (
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/gatewayentry"
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/logging"
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/proxy"
-	"github.com/rad-security/agentkeeper-mcp-gateway/internal/receipt"
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/runtimebroker"
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/server"
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/telemetry"
@@ -101,11 +100,7 @@ are blocked.`,
 			}
 			tc = telemetry.NewClient(apiURL, cfg.APIKey, logger)
 		}
-		receiptRoot := filepath.Join(filepath.Dir(config.CurrentConfigPath()), "receipts-v2")
-		if cfg.LogPath != "" {
-			receiptRoot = filepath.Join(filepath.Dir(cfg.LogPath), "receipts-v2")
-		}
-		receiptStore, receiptErr := receipt.NewStore(receiptRoot, version)
+		receiptStore, receiptRoot, receiptErr := openReceiptStore(cfg, version)
 		if receiptStore != nil {
 			receiptStore.ConfigureQueueLimits(cfg.EventQueueMaxEvents, cfg.EventQueueMaxBytes)
 		}

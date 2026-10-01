@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -198,7 +199,7 @@ var coworkConfigureCmd = &cobra.Command{
 	Use:   "configure",
 	Short: "Route discovered Cowork local/plugin MCP servers through the gateway",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		result, err := discovery.MigrateCoworkMCP(coworkSource, coworkDryRun)
+		result, err := migrateCoworkOwned(coworkSource, coworkDryRun)
 		if err != nil {
 			return err
 		}
@@ -281,8 +282,13 @@ func runCoworkGuardOnce(sourcePath string, dryRun bool) (coworkGuardSummary, err
 	}
 	defer unlock()
 
-	result, err := discovery.MigrateCoworkMCP(sourcePath, dryRun)
-	if err != nil {
+	result, err := migrateCoworkOwned(sourcePath, dryRun)
+	var unrecorded *ownershipRecordError
+	if errors.As(err, &unrecorded) {
+		// The sources are routed and must be served this session; only their
+		// rollback record is missing.
+		fmt.Fprintf(os.Stderr, "[agentkeeper] Cowork guard: %v\n", unrecorded)
+	} else if err != nil {
 		return coworkGuardSummary{}, err
 	}
 	summary := coworkGuardSummary{Plans: len(result.Plans)}
