@@ -69,11 +69,11 @@ func compileBashPatterns() []Pattern {
 			Regex:       regexp.MustCompile(`(history\s+-c|>\s*~/\.(bash_history|zsh_history)|shred\s+.*history|rm\s+.*\.(bash_history|zsh_history)|unset\s+histfile|export\s+histsize=0)`),
 		},
 		{
-			Name:     "ssh_key_exfil",
-			Severity: "critical",
-			Description: "SSH private key access combined with network transfer",
-			Category:    "threat",
-			Regex:       regexp.MustCompile(`(cat|head|tail|cp|scp|base64)\s+.*(id_rsa|id_ed25519|id_ecdsa|\.pem|\.key)\b`),
+			Name:           "ssh_key_exfil",
+			Severity:       "critical",
+			Description:    "SSH private key access combined with network transfer",
+			Category:       "threat",
+			Regex:          regexp.MustCompile(`(cat|head|tail|cp|scp|base64)\s+.*(id_rsa|id_ed25519|id_ecdsa|\.pem|\.key)\b`),
 			SecondaryRegex: regexp.MustCompile(`(curl|wget|nc|ssh|scp|rsync)\s`),
 			TertiaryRegex:  regexp.MustCompile(`[;&|]`),
 		},
@@ -172,47 +172,6 @@ func compileWebPatterns() []Pattern {
 			Description: "HTTP request to raw IP address (potential C2 or exfiltration)",
 			Category:    "threat",
 			Regex:       regexp.MustCompile(`https?://(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)`),
-		},
-	}
-}
-
-// compileToolPoisoningPatterns returns compiled patterns for tool description poisoning.
-func compileToolPoisoningPatterns() []Pattern {
-	return []Pattern{
-		{
-			Name:        "poison_ignore_instructions",
-			Severity:    "critical",
-			Description: "Tool description contains instruction override attempt",
-			Category:    "tool_poisoning",
-			Regex:       regexp.MustCompile(`ignore previous instructions|ignore all prior|disregard your instructions`),
-		},
-		{
-			Name:        "poison_bypass_security",
-			Severity:    "critical",
-			Description: "Tool description contains security bypass instruction",
-			Category:    "tool_poisoning",
-			Regex:       regexp.MustCompile(`bypass security|bypass restrictions|bypass filters|bypass safeguards`),
-		},
-		{
-			Name:        "poison_silent_execute",
-			Severity:    "critical",
-			Description: "Tool description contains silent execution instruction",
-			Category:    "tool_poisoning",
-			Regex:       regexp.MustCompile(`silently execute|execute without|run without telling|do not inform`),
-		},
-		{
-			Name:        "poison_confidential",
-			Severity:    "high",
-			Description: "Tool description contains confidentiality coercion",
-			Category:    "tool_poisoning",
-			Regex:       regexp.MustCompile(`this is confidential|do not share this|keep this secret|hide this from`),
-		},
-		{
-			Name:        "poison_exfil_data",
-			Severity:    "critical",
-			Description: "Tool description contains data exfiltration instruction",
-			Category:    "tool_poisoning",
-			Regex:       regexp.MustCompile(`send data to|exfiltrate|forward to external|transmit to`),
 		},
 	}
 }
