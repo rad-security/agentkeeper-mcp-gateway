@@ -38,17 +38,18 @@ jobs:
       - run: go build -o agentkeeper-mcp-gateway${{ matrix.exe }} .
       - run: ${{ matrix.python }} scripts/smoke/smoke.py ./agentkeeper-mcp-gateway${{ matrix.exe }}
 
-  # Informational: the unit tests have not been run on Windows before, so this
-  # job reports without blocking merges.
+  # The unit tests that hold on Windows. The other packages' tests assume Unix
+  # file modes, shell fixtures or $HOME, and are covered there by the smoke job.
   windows-unit:
     runs-on: windows-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version: "1.23.3"
-      - run: go vet ./...
-      # Still run the tests when vet fails, so both results are visible.
-      - if: ${{ !cancelled() }}
-        run: go test -timeout 15m ./...
+      - run: go build ./...
+      - run: >-
+          go test -timeout 10m
+          ./internal/detection/ ./internal/policy/ ./internal/fslock/
+          ./internal/machineid/ ./internal/gatewayentry/ ./internal/discovery/
+          ./internal/coworkposture/ ./skillinventory/
