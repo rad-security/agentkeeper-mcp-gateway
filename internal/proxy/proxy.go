@@ -71,6 +71,9 @@ type Config struct {
 	ClientName           string
 	ConfigSourceHash     string
 	RouteRevision        string
+	// DefinitionPinsPath is where tool definition fingerprints are recorded.
+	// Empty turns the definition-change check off.
+	DefinitionPinsPath string
 }
 
 // Proxy manages the MCP protocol proxy.
@@ -652,6 +655,7 @@ func (p *Proxy) applyToolList(serverName string, tools []interface{}, err error)
 		UpdatedAt: time.Now().UTC().Format(time.RFC3339Nano),
 	})
 	p.logToolDescriptionDetections(serverName, tools)
+	p.logChangedToolDefinitions(serverName, tools)
 	p.rebuildToolMapFromCache()
 	if changed {
 		p.emitToolsListChanged()
@@ -787,8 +791,14 @@ func (p *Proxy) logToolDescriptionDetections(serverName string, tools []interfac
 	}
 	p.mu.Unlock()
 	if p.config.Logger != nil {
+		var synced telemetry.SyncPolicy
+		if p.telemetry != nil {
+			synced = p.telemetry.Policy()
+		}
 		for name, result := range newFindings {
-			p.config.Logger.LogDetection(serverName, originalMCPName(serverName, name), result)
+			// Record the decision the route would apply, so a definition that
+			// Enforce blocks reads as a block in Observe too.
+			p.config.Logger.LogDetection(serverName, originalMCPName(serverName, name), applyDetectionPolicy(result, synced, p.config.Detection))
 		}
 	}
 }
@@ -850,8 +860,8 @@ func ToolDescription(tool map[string]interface{}) detection.ToolDescription {
 
 func toolDescriptionFromMap(tool map[string]interface{}) detection.ToolDescription {
 	desc := detection.ToolDescription{
-		Name:        fmt.Sprintf("%v", tool["name"]),
-		Description: fmt.Sprintf("%v", tool["description"]),
+		Name:        definitionString(tool["name"]),
+		Description: definitionString(tool["description"]),
 	}
 	if inputSchema, ok := tool["inputSchema"].(map[string]interface{}); ok {
 		if props, ok := inputSchema["properties"].(map[string]interface{}); ok {
@@ -859,13 +869,62 @@ func toolDescriptionFromMap(tool map[string]interface{}) detection.ToolDescripti
 				if param, ok := paramValue.(map[string]interface{}); ok {
 					desc.Parameters = append(desc.Parameters, detection.ToolParam{
 						Name:        paramName,
-						Description: fmt.Sprintf("%v", param["description"]),
+						Description: definitionString(param["description"]),
 					})
 				}
 			}
 		}
 	}
+	// An instruction can sit anywhere the agent reads: a title, a nested
+	// property, an enum or default value, an annotation, the output schema.
+	budget := maxDefinitionFragmentBytes
+	keys := make([]string, 0, len(tool))
+	for key := range tool {
+		if key != "name" && key != "description" {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		collectDefinitionStrings(tool[key], &desc.Fragments, &budget, 0)
+	}
 	return desc
+}
+
+// maxDefinitionFragmentBytes bounds the inspection cost of one definition.
+const maxDefinitionFragmentBytes = 256 << 10
+
+func definitionString(value interface{}) string {
+	text, _ := value.(string)
+	return text
+}
+
+func collectDefinitionStrings(value interface{}, out *[]string, budget *int, depth int) {
+	if depth > 16 || *budget <= 0 {
+		return
+	}
+	switch typed := value.(type) {
+	case string:
+		if len(typed) > *budget {
+			typed = typed[:*budget]
+		}
+		*budget -= len(typed)
+		*out = append(*out, typed)
+	case []interface{}:
+		for _, item := range typed {
+			collectDefinitionStrings(item, out, budget, depth+1)
+		}
+	case map[string]interface{}:
+		keys := make([]string, 0, len(typed))
+		for key := range typed {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			collectDefinitionStrings(key, out, budget, depth+1)
+			collectDefinitionStrings(typed[key], out, budget, depth+1)
+		}
+	}
 }
 
 func (p *Proxy) cachedToolDescriptionDetection(serverName, originalName string) (detection.Result, bool) {
@@ -1557,6 +1616,11 @@ func applyDetectionPolicy(result detection.Result, p telemetry.SyncPolicy, local
 		}
 	case "threat", "tool_poisoning":
 		if strings.EqualFold(p.Detection.Threat, "block") || strings.EqualFold(local.Threat, "block") {
+			result.Verdict = detection.VerdictBlock
+		} else if result.HardBlock && !strings.EqualFold(local.Threat, "monitor") {
+			// A definition that instructs the agent is blocked without the
+			// organization opting detections into blocking. Setting the local
+			// threat action to monitor opts this workstation out.
 			result.Verdict = detection.VerdictBlock
 		}
 	}

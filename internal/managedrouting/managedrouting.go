@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"sort"
 	"strings"
 
@@ -492,7 +493,8 @@ func readManifest(path string) (manifest, error) {
 	if err != nil {
 		return value, err
 	}
-	if !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 {
+	// Windows reports 0666 for every writable file; see manualrouting.
+	if !info.Mode().IsRegular() || (runtime.GOOS != "windows" && info.Mode().Perm()&0o077 != 0) {
 		return value, fmt.Errorf("managed routing manifest must be a private regular file")
 	}
 	file, err := os.Open(path)
