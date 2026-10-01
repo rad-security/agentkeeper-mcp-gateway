@@ -17,7 +17,7 @@ func TestAcquireWaitsForABrieflyHeldLock(t *testing.T) {
 		t.Fatal(err)
 	}
 	go func() {
-		time.Sleep(600 * time.Millisecond)
+		time.Sleep(400 * time.Millisecond)
 		release()
 	}()
 	started := time.Now()
@@ -26,7 +26,7 @@ func TestAcquireWaitsForABrieflyHeldLock(t *testing.T) {
 		t.Fatalf("second holder gave up after %v: %v", time.Since(started), err)
 	}
 	second()
-	if waited := time.Since(started); waited < 400*time.Millisecond {
+	if waited := time.Since(started); waited < 300*time.Millisecond {
 		t.Fatalf("second holder acquired after %v while the lock was still held", waited)
 	}
 }

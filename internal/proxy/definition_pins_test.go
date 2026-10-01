@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"testing"
 )
 
@@ -22,7 +23,8 @@ func TestFirstSightOfADefinitionIsRecordedNotReported(t *testing.T) {
 	if changed := p.changedToolDefinitions("crm", []interface{}{tool("lookup", "Look up a record."), tool("update", "Update a record.")}); len(changed) != 0 {
 		t.Fatalf("first sight reported as a change: %v", changed)
 	}
-	if info, err := os.Stat(path); err != nil || info.Mode().Perm() != 0o600 {
+	// Windows reports 0666 for every writable file.
+	if info, err := os.Stat(path); err != nil || (runtime.GOOS != "windows" && info.Mode().Perm() != 0o600) {
 		t.Fatalf("pins not written privately: %v %v", info, err)
 	}
 	if changed := p.changedToolDefinitions("crm", []interface{}{tool("update", "Update a record."), tool("lookup", "Look up a record.")}); len(changed) != 0 {
