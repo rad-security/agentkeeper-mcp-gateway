@@ -202,6 +202,11 @@ func startGatewayProcess(t *testing.T, home string, cfg map[string]interface{}, 
 	if err := os.WriteFile(configPath, raw, 0o600); err != nil {
 		t.Fatal(err)
 	}
+	return startGatewayProcessWithConfigPath(t, home, configPath, extraEnv...)
+}
+
+func startGatewayProcessWithConfigPath(t *testing.T, home, configPath string, extraEnv ...string) *gatewayProcess {
+	t.Helper()
 	cmd := exec.Command(binary, "server", "--no-auto-auth", "--config", configPath)
 	cmd.Env = append([]string{"HOME=" + home, "XDG_CONFIG_HOME=" + home, "PATH=" + os.Getenv("PATH"), "AGENTKEEPER_COWORK_GUARD=0", "AGENTKEEPER_MACHINE_ID=machine-evidence-e2e"}, extraEnv...)
 	cmd.Dir = home

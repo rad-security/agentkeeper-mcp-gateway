@@ -104,6 +104,8 @@ type Proxy struct {
 	output             io.Writer
 	inflightMu         sync.Mutex
 	inflight           map[string]context.CancelFunc
+	policySkippedMu    sync.Mutex
+	policySkipped      map[string]bool
 }
 
 type toolRefreshStatus struct {
@@ -154,6 +156,7 @@ func NewProxy(cfg Config, mgr *server.Manager, tc *telemetry.Client) *Proxy {
 	if mgr != nil {
 		mgr.SetNotificationHandler(p.forwardBackendNotification)
 		mgr.SetLifecycleHandler(p.handleBackendLifecycle)
+		mgr.SetStartGate(p.upstreamStartPermitted)
 	}
 	p.loadPersistentToolCache()
 	return p
@@ -387,7 +390,12 @@ func (p *Proxy) handleMessageContext(ctx context.Context, msg JSONRPCMessage) (*
 	}
 }
 
-func (p *Proxy) forwardBackendNotification(_ string, method string, params json.RawMessage) {
+func (p *Proxy) forwardBackendNotification(serverName string, method string, params json.RawMessage) {
+	// An upstream that became blocked while running keeps its process until
+	// the Gateway restarts; nothing it sends may reach the client.
+	if p.serverBlockedByPolicy(serverName) {
+		return
+	}
 	if method == "notifications/tools/list_changed" {
 		p.startToolRefresh()
 		return
@@ -427,6 +435,9 @@ func (p *Proxy) handleBackendLifecycle(serverName, state string, lifecycleErr er
 
 func (p *Proxy) forwardNotification(method string, params json.RawMessage) {
 	for _, name := range p.manager.ServerNames() {
+		if p.serverBlockedByPolicy(name) {
+			continue
+		}
 		if srv := p.manager.Get(name); srv != nil {
 			srv.Notify(method, params)
 		}
@@ -434,7 +445,8 @@ func (p *Proxy) forwardNotification(method string, params json.RawMessage) {
 }
 
 func (p *Proxy) handleInitialize(msg JSONRPCMessage) (*JSONRPCMessage, error) {
-	// Start all backend servers
+	// Start the backend servers. The start gate holds back any the route's
+	// policy blocks.
 	if err := p.manager.StartAll(); err != nil {
 		return nil, fmt.Errorf("starting servers: %w", err)
 	}
@@ -596,6 +608,7 @@ func (p *Proxy) refreshTools() {
 		tools []interface{}
 		err   error
 	}
+	p.startNewlyPermittedUpstreams()
 	names := p.manager.ServerNames()
 	sort.Strings(names)
 	results := make(chan listResult, len(names))
@@ -827,6 +840,12 @@ func (p *Proxy) toolDescriptionDetection(tool map[string]interface{}) (detection
 		}
 	}
 	return strongest, true
+}
+
+// ToolDescription extracts the text of an advertised tool definition that the
+// detection engine inspects: its name, description and parameter descriptions.
+func ToolDescription(tool map[string]interface{}) detection.ToolDescription {
+	return toolDescriptionFromMap(tool)
 }
 
 func toolDescriptionFromMap(tool map[string]interface{}) detection.ToolDescription {
@@ -1134,6 +1153,13 @@ func (p *Proxy) handleToolsCallContext(ctx context.Context, msg JSONRPCMessage) 
 	// evidence below, and is never dispatched.
 	var upstreamUnavailable error
 	if !ok {
+		// A blocked upstream is never started, so its tools are unmapped.
+		// Route the call to the policy check below without starting it.
+		if blocked, isBlocked := p.blockedServerOwning(callParams.Name); isBlocked {
+			serverName, ok = blocked, true
+		}
+	}
+	if !ok {
 		serverName, ok, upstreamUnavailable = p.resolveUnmappedTool(ctx, callParams.Name)
 		if !ok && upstreamUnavailable == nil {
 			return nil, fmt.Errorf("unknown tool: %s", callParams.Name)
@@ -1330,9 +1356,11 @@ func (p *Proxy) handleToolsCallContext(ctx context.Context, msg JSONRPCMessage) 
 		return nil, fmt.Errorf("initializing %s: %w", serverName, err)
 	}
 
-	forwardParams := map[string]interface{}{
-		"name":      originalName,
-		"arguments": callParams.Arguments,
+	forwardParams := map[string]interface{}{"name": originalName}
+	// MCP lets a client omit arguments; do not turn that into a JSON null,
+	// which servers validating the field as an object reject.
+	if callParams.Arguments != nil {
+		forwardParams["arguments"] = callParams.Arguments
 	}
 	if len(callParams.Meta) > 0 && string(callParams.Meta) != "null" {
 		forwardParams["_meta"] = callParams.Meta
@@ -1554,6 +1582,11 @@ func (p *Proxy) handleResourcesReadContext(ctx context.Context, msg JSONRPCMessa
 	if err := json.Unmarshal(msg.Params, &params); err != nil || json.Unmarshal(params["uri"], &requestedURI) != nil || requestedURI == "" {
 		return nil, fmt.Errorf("invalid resources/read params")
 	}
+	// A blocked upstream is not running, so its URIs resolve to nothing; name
+	// the policy block instead of reporting an unknown resource.
+	if serverName, namespaced := serverForNamespacedResourceURI(requestedURI); namespaced && p.serverBlockedByPolicy(serverName) {
+		return p.blockedServerContentResponse(msg, serverName, "resources/read"), nil
+	}
 	p.mu.Lock()
 	route, ok := p.resourceMap[requestedURI]
 	if !ok {
@@ -1584,6 +1617,9 @@ func (p *Proxy) handleResourcesReadContext(ctx context.Context, msg JSONRPCMessa
 	}
 	if !ok {
 		return nil, fmt.Errorf("unknown resource URI")
+	}
+	if p.serverBlockedByPolicy(route.ServerName) {
+		return p.blockedServerContentResponse(msg, route.ServerName, "resources/read"), nil
 	}
 	srv := p.manager.Get(route.ServerName)
 	if srv == nil {
@@ -1622,7 +1658,7 @@ func (p *Proxy) handleResourcesReadContext(ctx context.Context, msg JSONRPCMessa
 }
 
 func (p *Proxy) loadResources() ([]interface{}, map[string]resourceRoute) {
-	names := p.manager.ServerNames()
+	names := p.permittedServerNames()
 	sort.Strings(names)
 	type listResult struct {
 		name      string
@@ -1695,7 +1731,7 @@ func (p *Proxy) handleResourceTemplatesList(msg JSONRPCMessage) (*JSONRPCMessage
 }
 
 func (p *Proxy) loadResourceTemplates() ([]interface{}, []resourceTemplateRoute) {
-	names := p.manager.ServerNames()
+	names := p.permittedServerNames()
 	sort.Strings(names)
 	type listResult struct {
 		name      string
@@ -1824,6 +1860,9 @@ func (p *Proxy) handlePromptsGetContext(ctx context.Context, msg JSONRPCMessage)
 		return nil, fmt.Errorf("invalid prompts/get params")
 	}
 	namespacedName, _ := params["name"].(string)
+	if blocked, isBlocked := p.blockedServerOwning(namespacedName); isBlocked {
+		return p.blockedServerContentResponse(msg, blocked, "prompts/get"), nil
+	}
 	p.mu.Lock()
 	serverName, ok := p.promptMap[namespacedName]
 	p.mu.Unlock()
@@ -1836,6 +1875,9 @@ func (p *Proxy) handlePromptsGetContext(ctx context.Context, msg JSONRPCMessage)
 	}
 	if !ok {
 		return nil, fmt.Errorf("unknown prompt: %s", namespacedName)
+	}
+	if p.serverBlockedByPolicy(serverName) {
+		return p.blockedServerContentResponse(msg, serverName, "prompts/get"), nil
 	}
 	params["name"] = originalMCPName(serverName, namespacedName)
 	forwardParams, _ := json.Marshal(params)
@@ -1855,7 +1897,7 @@ func (p *Proxy) handlePromptsGetContext(ctx context.Context, msg JSONRPCMessage)
 }
 
 func (p *Proxy) loadPrompts() ([]interface{}, map[string]string) {
-	names := p.manager.ServerNames()
+	names := p.permittedServerNames()
 	sort.Strings(names)
 	type listResult struct {
 		name    string

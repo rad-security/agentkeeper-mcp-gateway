@@ -94,6 +94,7 @@ type Manager struct {
 	restartAttempts     map[string]int
 	notificationHandler func(serverName, method string, params json.RawMessage)
 	lifecycleHandler    func(serverName, state string, err error)
+	startGate           func(name string) bool
 }
 
 // NewManager creates a server manager from configs.
@@ -136,6 +137,25 @@ func (m *Manager) serverNotifier(name string) func(string, json.RawMessage) {
 }
 
 // StartAll starts all configured servers.
+// ErrStartNotPermitted reports a backend the start gate declined.
+var ErrStartNotPermitted = errors.New("not permitted to start by policy")
+
+// SetStartGate installs a predicate every start path consults: StartAll,
+// EnsureStarted and the automatic restart after an exit. A backend it declines
+// is left unstarted and starts once the predicate permits it.
+func (m *Manager) SetStartGate(gate func(name string) bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.startGate = gate
+}
+
+func (m *Manager) startPermitted(name string) bool {
+	m.mu.RLock()
+	gate := m.startGate
+	m.mu.RUnlock()
+	return gate == nil || gate(name)
+}
+
 func (m *Manager) StartAll() error {
 	m.startMu.Lock()
 	defer m.startMu.Unlock()
@@ -147,6 +167,9 @@ func (m *Manager) StartAll() error {
 	for _, cfg := range configs {
 		if cfg.Name == "" {
 			fmt.Fprintln(os.Stderr, "[agentkeeper] skipping MCP server with empty name")
+			continue
+		}
+		if !m.startPermitted(cfg.Name) {
 			continue
 		}
 		if err := m.startConfigured(cfg); err != nil {
@@ -222,6 +245,8 @@ func (m *Manager) EnsureStarted(name string) error {
 		return errors.New("not configured")
 	case attempts > maxRestartAttempts:
 		return ErrRestartLimit
+	case !m.startPermitted(name):
+		return ErrStartNotPermitted
 	}
 	return m.startConfigured(cfg)
 }
@@ -339,7 +364,7 @@ func (m *Manager) scheduleRestart(cfg ServerConfig, cause error) {
 		configured := m.configuredLockedRead(cfg.Name)
 		alreadyRunning := m.servers[cfg.Name] != nil
 		m.mu.RUnlock()
-		if stopping || !configured || alreadyRunning {
+		if stopping || !configured || alreadyRunning || !m.startPermitted(cfg.Name) {
 			return
 		}
 		if err := m.startServer(cfg); err != nil {

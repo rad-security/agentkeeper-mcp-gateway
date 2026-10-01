@@ -392,8 +392,13 @@ func (c *Client) Policy() SyncPolicy {
 	c.policyMu.RUnlock()
 
 	expired := valid && !expiresAt.IsZero() && !c.now().Before(expiresAt)
-	mode, _ := c.currentMode()
-	if strings.EqualFold(mode, "enforce") && (cacheBad || expired || stateValid && !valid) {
+	mode, revision := c.currentMode()
+	// A missing policy fails closed only for an Enforce assignment the control
+	// plane established (revision > 0). A local enforce request on a route
+	// that recorded nothing but its initial Observe keeps local behavior, as
+	// it does on a fresh install.
+	assignedWithoutPolicy := stateValid && revision > 0 && !valid
+	if strings.EqualFold(mode, "enforce") && (cacheBad || expired || assignedWithoutPolicy) {
 		return failClosedPolicy()
 	}
 	return policy
@@ -409,17 +414,26 @@ func (c *Client) Evaluate(serverName, toolName string, params map[string]interfa
 		return nil
 	}
 	currentMode, _ := c.currentMode()
+	// The evaluation API validates params as an object and gateway_id as a
+	// UUID. A call without arguments, or one made before registration has
+	// returned an id, must still be evaluated rather than rejected and left to
+	// local detection alone.
+	if params == nil {
+		params = map[string]interface{}{}
+	}
 	payload := map[string]interface{}{
 		"server_name":    serverName,
 		"tool_name":      toolName,
 		"params":         params,
 		"hostname":       c.hostname,
 		"machine_id":     c.machineID,
-		"gateway_id":     c.gatewayID,
 		"source":         "agentkeeper-mcp-gateway",
 		"call_id":        callID,
 		"attempt_id":     attemptID,
 		"effective_mode": modeLabel(currentMode),
+	}
+	if c.gatewayID != "" {
+		payload["gateway_id"] = c.gatewayID
 	}
 
 	data, err := json.Marshal(payload)

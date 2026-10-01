@@ -149,7 +149,7 @@ agentkeeper-mcp-gateway list [--health] [--json]
 # Gateway
 agentkeeper-mcp-gateway server [--enforce]
 agentkeeper-mcp-gateway logs [-f] [-l 50]
-agentkeeper-mcp-gateway scan
+agentkeeper-mcp-gateway scan [--json]             # check advertised tool definitions; exits non-zero on findings
 agentkeeper-mcp-gateway export --format json|csv --since 2026-04-01
 
 # Configuration
@@ -168,7 +168,7 @@ agentkeeper-mcp-gateway configure-ide [--dry-run] [--ide=claude-code|claude-desk
 ```bash
 agentkeeper-mcp-gateway configure-ide --dry-run   # preview; writes nothing
 agentkeeper-mcp-gateway configure-ide              # apply
-agentkeeper-mcp-gateway configure-ide --remove-routing # restore owned global routes
+agentkeeper-mcp-gateway configure-ide --remove-routing # restore every route this command made
 ```
 
 For Cowork sources created after setup, run `agentkeeper-mcp-gateway cowork guard` from a login item/service, or rerun `configure-ide`. Native Cowork cloud connectors that are not represented as local MCP sources require the AgentKeeper Cowork ZIP/guardrail path; the standalone gateway can only govern MCP traffic it can route.
@@ -181,7 +181,7 @@ Supports **Claude Code** (`~/.claude.json`), **Claude Desktop** (macOS + Linux),
 4. Rewrites the IDE's `mcpServers` map to include the gateway plus any native-auth servers that must remain direct
 5. Preserves every non-MCP top-level key verbatim (`permissions`, `preferences`, etc.)
 
-A second invocation is a no-op when the exact current Gateway shape is already present. Every write creates a backup and uses a source-hash compare-and-swap check, so a file edited after planning is left unchanged. The applying form writes a private manual-ownership manifest. `--remove-routing` uses that manifest to restore byte-exact original client files when nothing drifted, or to remove only the owned Gateway entry and restore migrated servers while preserving later customer changes. It refuses inferred cleanup if ownership evidence is missing or a migrated Gateway server has drifted. The manual rollback flag covers global Claude Code, Claude Desktop, and Cursor routes; project-scoped and Cowork sources retain their dedicated rollback paths.
+A second invocation is a no-op when the exact current Gateway shape is already present. Every write creates a backup and uses a source-hash compare-and-swap check, so a file edited after planning is left unchanged. The applying form writes a private manual-ownership manifest. `--remove-routing` uses that manifest to restore byte-exact original client files when nothing drifted, or to remove only the owned Gateway entry and restore migrated servers while preserving later customer changes. It refuses inferred cleanup if ownership evidence is missing or a migrated Gateway server has drifted. The same flag covers every route `configure-ide`, `cowork configure` and the Cowork guard make: global Claude Code, Claude Desktop and Cursor routes, Claude Code project-scoped servers in `~/.claude.json`, project `.mcp.json` files, and Cowork sources. With `--ide`, only that client's routes are restored. Routes made by a release that did not record project or Cowork ownership are restored to the extent the manifest and backups allow; their servers stay in the gateway config and can be removed with `remove`. A routed file that is missing when rollback runs is skipped and reported under `skipped_missing`; its record and gateway servers are kept, so running rollback again restores it if it comes back (remove leftover servers with `remove <name>` if it will not). Stop a running `cowork guard` before rolling back, or its next pass routes the restored Cowork sources again.
 
 Package installation must remain stage-only: do not run the applying form from a postinstall script or broad MDM assignment. Managed routing is a separate, explicitly approved activation step after preview and client-state checks.
 
@@ -310,6 +310,8 @@ The gateway is designed to work under a fleet config-management tool (Kandji, An
 | 4 | `~/.config/agentkeeper-mcp-gateway/config.json` (if file exists) | dev default |
 | 5 | `/etc/agentkeeper-mcp-gateway/config.json` (if file exists) | system-wide, fleet-deploy target |
 | fallback | `~/.config/agentkeeper-mcp-gateway/config.json` | created on first write |
+
+**Where gateway state lives:** the signer, receipt queue and route state sit beside the event log when `log_path` is set, otherwise beside the config file. When the config directory is not writable by the user (the system-wide layout above), they live under `~/.config/agentkeeper-mcp-gateway/state/<id>/`, one directory per config path, and stay there even if the config directory later becomes writable.
 
 **Environment overrides:**
 

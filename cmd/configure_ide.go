@@ -69,8 +69,8 @@ By default every detected IDE is configured. Use --ide to target just one.
 		if configureIDERemoveManaged {
 			return fmt.Errorf("--remove-managed-routing requires --managed-runtime-config")
 		}
-		if configureIDERemoveManual && (shouldUseProjectMigration() || configureIDETargetIncludes(discovery.ClientCowork)) {
-			return fmt.Errorf("--remove-routing owns global claude-code, claude-desktop, and cursor routes only; Cowork and project-scoped routes require their dedicated rollback")
+		if configureIDERemoveManual && shouldUseProjectMigration() {
+			return fmt.Errorf("--remove-routing restores every route owned for the selected clients, including project-scoped ones; run it without --cwd or --scope")
 		}
 		if shouldUseProjectMigration() {
 			cwd := configureIDECWD
@@ -81,9 +81,15 @@ By default every detected IDE is configured. Use --ide to target just one.
 					return err
 				}
 			}
+			gatewayBefore := gatewayServerNameSet()
 			plan, err := discovery.MigrateProjectMCPExplicit(cwd, configureIDEDryRun)
 			if err != nil {
 				return err
+			}
+			if !configureIDEDryRun {
+				if err := recordMigrationOwnership(discovery.ClientClaudeCode, plan, gatewayBefore, false); err != nil {
+					return err
+				}
 			}
 			if configureIDEJSON {
 				data, err := json.MarshalIndent(plan, "", "  ")
@@ -123,7 +129,12 @@ By default every detected IDE is configured. Use --ide to target just one.
 		}
 
 		if configureIDERemoveManual {
-			report, err := manualrouting.Remove(manualrouting.RemoveOptions{Adapters: adapters, DryRun: configureIDEDryRun})
+			// Without --ide, restore everything this command can route.
+			clients := configureIDETarget
+			if len(clients) == 0 {
+				clients = []string{discovery.ClientClaudeCode, discovery.ClientClaudeDesktop, discovery.ClientCursor, discovery.ClientCowork}
+			}
+			report, err := manualrouting.Remove(manualrouting.RemoveOptions{Adapters: adapters, Clients: clients, DryRun: configureIDEDryRun})
 			if err != nil {
 				return err
 			}
@@ -150,7 +161,11 @@ By default every detected IDE is configured. Use --ide to target just one.
 		}
 
 		if configureIDETargetIncludes("claude-code") {
+			gatewayBefore := gatewayServerNameSet()
 			plan, err := discovery.MigrateClaudeJSONProjects(configureIDEDryRun)
+			if err == nil && !configureIDEDryRun {
+				err = recordMigrationOwnership(discovery.ClientClaudeCode, plan, gatewayBefore, false)
+			}
 			if err != nil {
 				fmt.Fprintf(out, "  %-16s error applying: %v\n", "claude-code:projects", err)
 			} else {
@@ -166,7 +181,11 @@ By default every detected IDE is configured. Use --ide to target just one.
 				if projectMigrationExplicit() {
 					migrate = discovery.MigrateProjectMCPExplicit
 				}
+				gatewayBefore = gatewayServerNameSet()
 				plan, err = migrate(cwd, configureIDEDryRun)
+				if err == nil && !configureIDEDryRun {
+					err = recordMigrationOwnership(discovery.ClientClaudeCode, plan, gatewayBefore, false)
+				}
 				if err != nil {
 					fmt.Fprintf(out, "  %-16s error applying: %v\n", "claude-code:project", err)
 				} else {
@@ -176,7 +195,7 @@ By default every detected IDE is configured. Use --ide to target just one.
 		}
 
 		if configureIDETargetIncludes(discovery.ClientCowork) {
-			result, err := discovery.MigrateCoworkMCP("", configureIDEDryRun)
+			result, err := migrateCoworkOwned("", configureIDEDryRun)
 			if err != nil {
 				fmt.Fprintf(out, "  %-16s error applying: %v\n", discovery.ClientCowork, err)
 			} else {
@@ -393,6 +412,6 @@ func init() {
 	configureIDECmd.Flags().StringVar(&configureIDEManagedRuntimeConfig, "managed-runtime-config", "", "Root-owned AgentKeeper runtime broker configuration")
 	configureIDECmd.Flags().BoolVar(&configureIDENonInteractive, "non-interactive", false, "Disable interactive behavior for managed deployment")
 	configureIDECmd.Flags().BoolVar(&configureIDERemoveManaged, "remove-managed-routing", false, "Remove only routing owned by the managed runtime deployment")
-	configureIDECmd.Flags().BoolVar(&configureIDERemoveManual, "remove-routing", false, "Restore only global IDE routes owned by manual AgentKeeper configuration")
+	configureIDECmd.Flags().BoolVar(&configureIDERemoveManual, "remove-routing", false, "Restore the client configs this command routed; with --ide, only those clients")
 	rootCmd.AddCommand(configureIDECmd)
 }

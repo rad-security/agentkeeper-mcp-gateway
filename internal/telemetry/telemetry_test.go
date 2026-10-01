@@ -837,3 +837,31 @@ func TestEventUploadWithoutExplicitAcknowledgmentRemainsPending(t *testing.T) {
 		t.Fatalf("acknowledged retry remained pending: %+v err=%v", pending, err)
 	}
 }
+
+// The evaluation API validates params as an object and gateway_id as a UUID,
+// and rejects the whole request otherwise, which leaves the call to local
+// detection alone. A call without arguments, or one made before registration
+// returned an id, must still be evaluated.
+func TestEvaluatePayloadIsAcceptedWithoutArgumentsOrGatewayID(t *testing.T) {
+	t.Setenv("AGENTKEEPER_MACHINE_ID", "machine-evaluate-2")
+	var captured map[string]json.RawMessage
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&captured); err != nil {
+			t.Fatal(err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"verdict":"pass"}`))
+	}))
+	defer srv.Close()
+
+	client := NewClient(srv.URL, "test-key", nil)
+	if result := client.Evaluate("atlas", "list_all", nil, "call-test-2", "attempt-test-2"); result == nil || result.Verdict != "pass" {
+		t.Fatalf("unexpected evaluate result: %#v", result)
+	}
+	if got := string(captured["params"]); got != "{}" {
+		t.Fatalf("params = %s, want an empty object", got)
+	}
+	if raw, present := captured["gateway_id"]; present {
+		t.Fatalf("gateway_id = %s was sent before registration returned one", raw)
+	}
+}
