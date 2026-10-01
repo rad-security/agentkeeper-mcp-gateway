@@ -264,7 +264,7 @@ func TestScan06_NoAPIKey_FailsOpen(t *testing.T) {
 }
 
 // SCAN-08: marketplace-cached skills are discovered end-to-end.
-// Regression test for the Ontra customer report — layout:
+// Regression test for a reported layout:
 //
 //	~/.claude/plugins/marketplaces/<marketplace>/skills/<skill>/SKILL.md
 //
