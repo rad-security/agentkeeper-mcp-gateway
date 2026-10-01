@@ -55,6 +55,14 @@ go run . version
 go build -o bin/agentkeeper-mcp-gateway .
 ```
 
+Smoke-test the built binary end to end. The script uses a throwaway home
+directory and a fake upstream MCP server, so it never touches your own config
+or the network; CI runs it on Linux, macOS and Windows:
+
+```bash
+python3 scripts/smoke/smoke.py bin/agentkeeper-mcp-gateway
+```
+
 Run a local gateway with a disposable filesystem MCP server:
 
 ```bash
@@ -74,6 +82,7 @@ internal/policy/           Audit/enforce policy behavior
 internal/proxy/            MCP proxy path
 internal/skillinventory/   Local skill inventory scan and check-in
 internal/telemetry/        Dashboard event upload
+scripts/smoke/             Cross-platform smoke test for a built binary
 ```
 
 Config resolution is documented below in "Headless / Config-Managed Install".
