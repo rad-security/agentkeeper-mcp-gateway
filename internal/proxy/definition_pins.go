@@ -214,8 +214,9 @@ func (p *Proxy) logChangedToolDefinitions(serverName string, tools []interface{}
 	}
 	if suppressed > 0 {
 		// One event stands for the rest, so a server that changes every
-		// definition at once cannot flood the event log. It names no tool.
-		p.config.Logger.LogDefinitionFinding(serverName, "", detection.Result{
+		// definition at once cannot flood the event log. The service drops
+		// an event with no tool name, so the count stands in for one.
+		p.config.Logger.LogDefinitionFinding(serverName, fmt.Sprintf("%d more tools", suppressed), detection.Result{
 			Verdict:     detection.VerdictWarn,
 			PatternName: "tool_definition_changed",
 			Severity:    "high",

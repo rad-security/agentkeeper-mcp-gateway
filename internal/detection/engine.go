@@ -104,6 +104,9 @@ type ToolDescription struct {
 	// nested schema descriptions, enum and default values, annotations), so an
 	// instruction cannot hide outside the description field.
 	Fragments []string
+	// Truncated reports that the definition was larger or more deeply nested
+	// than the inspection reads, so part of it was not inspected.
+	Truncated bool
 }
 
 // ToolParam represents a parameter in an MCP tool definition.

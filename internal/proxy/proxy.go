@@ -89,27 +89,31 @@ type Proxy struct {
 	mu        sync.Mutex
 	modeMu    sync.RWMutex
 	// Map from namespaced tool name to server name
-	toolMap            map[string]string
-	poisonedTools      map[string]detection.Result
-	resourceMap        map[string]resourceRoute
-	resourceContentMap map[string]resourceRoute
-	resourceTemplates  []resourceTemplateRoute
-	promptMap          map[string]string
-	toolCache          map[string][]interface{}
-	emptyToolLists     map[string]int
-	toolStatus         map[string]toolRefreshStatus
-	toolRefreshMu      sync.Mutex
-	toolRefreshDone    chan struct{}
-	clientReady        bool
-	activeToolsList    int
-	pendingListNote    bool
-	writeMu            sync.Mutex
-	outputMu           sync.RWMutex
-	output             io.Writer
-	inflightMu         sync.Mutex
-	inflight           map[string]context.CancelFunc
-	policySkippedMu    sync.Mutex
-	policySkipped      map[string]bool
+	toolMap       map[string]string
+	poisonedTools map[string]detection.Result
+	// definitionVerdicts holds the inspection result for each distinct tool
+	// definition seen, so a call does not re-inspect unchanged definitions.
+	definitionVerdictMu sync.Mutex
+	definitionVerdicts  map[[sha256.Size]byte]definitionVerdict
+	resourceMap         map[string]resourceRoute
+	resourceContentMap  map[string]resourceRoute
+	resourceTemplates   []resourceTemplateRoute
+	promptMap           map[string]string
+	toolCache           map[string][]interface{}
+	emptyToolLists      map[string]int
+	toolStatus          map[string]toolRefreshStatus
+	toolRefreshMu       sync.Mutex
+	toolRefreshDone     chan struct{}
+	clientReady         bool
+	activeToolsList     int
+	pendingListNote     bool
+	writeMu             sync.Mutex
+	outputMu            sync.RWMutex
+	output              io.Writer
+	inflightMu          sync.Mutex
+	inflight            map[string]context.CancelFunc
+	policySkippedMu     sync.Mutex
+	policySkipped       map[string]bool
 }
 
 type toolRefreshStatus struct {
@@ -775,10 +779,8 @@ func (p *Proxy) logToolDescriptionDetections(serverName string, tools []interfac
 		if !ok {
 			continue
 		}
-		desc := toolDescriptionFromMap(tm)
-		results := p.config.DetectionEngine.EvaluateToolDescriptions([]detection.ToolDescription{desc})
-		for _, r := range results {
-			found[publicMCPName(serverName, desc.Name)] = r
+		if result, flagged := p.toolDescriptionDetection(tm); flagged {
+			found[publicMCPName(serverName, definitionString(tm["name"]))] = result
 		}
 	}
 	newFindings := make(map[string]detection.Result)
@@ -828,7 +830,7 @@ func (p *Proxy) filterPoisonedTools(tools []interface{}) []interface{} {
 			continue
 		}
 		name, _ := tool["name"].(string)
-		result, found := p.toolDescriptionDetection(tool)
+		result, found := p.toolDescriptionDetection(definitionAsAdvertised(tool))
 		if !found {
 			// Retain the asynchronous index as a compatibility fallback when
 			// descriptor inspection is unavailable. Enforcement must not depend
@@ -851,18 +853,57 @@ func (p *Proxy) toolDescriptionDetection(tool map[string]interface{}) (detection
 	if p.config.DetectionEngine == nil {
 		return detection.Result{}, false
 	}
-	desc := toolDescriptionFromMap(tool)
-	results := p.config.DetectionEngine.EvaluateToolDescriptions([]detection.ToolDescription{desc})
-	if len(results) == 0 {
-		return detection.Result{}, false
-	}
-	strongest := results[0]
-	for _, result := range results[1:] {
-		if verdictRank(string(result.Verdict)) > verdictRank(string(strongest.Verdict)) {
-			strongest = result
+	// Every call re-checks its server's definitions, so the result for an
+	// unchanged definition is kept rather than recomputed.
+	var key [sha256.Size]byte
+	encoded, err := json.Marshal(tool)
+	keyed := err == nil
+	if keyed {
+		key = sha256.Sum256(encoded)
+		p.definitionVerdictMu.Lock()
+		cached, ok := p.definitionVerdicts[key]
+		p.definitionVerdictMu.Unlock()
+		if ok {
+			return cached.result, cached.found
 		}
 	}
-	return strongest, true
+	verdict := definitionVerdict{}
+	desc := toolDescriptionFromMap(tool)
+	results := p.config.DetectionEngine.EvaluateToolDescriptions([]detection.ToolDescription{desc})
+	if len(results) > 0 {
+		verdict = definitionVerdict{result: results[0], found: true}
+		for _, result := range results[1:] {
+			if verdictRank(string(result.Verdict)) > verdictRank(string(verdict.result.Verdict)) {
+				verdict.result = result
+			}
+		}
+	}
+	if keyed {
+		p.definitionVerdictMu.Lock()
+		if p.definitionVerdicts == nil || len(p.definitionVerdicts) >= maxDefinitionVerdicts {
+			p.definitionVerdicts = make(map[[sha256.Size]byte]definitionVerdict)
+		}
+		p.definitionVerdicts[key] = verdict
+		p.definitionVerdictMu.Unlock()
+	}
+	return verdict.result, verdict.found
+}
+
+// definitionAsAdvertised returns a listed tool under the name its server
+// advertised. The list a client sees carries namespaced names, a call checks
+// the server's own definition, and both must reach the same verdict.
+func definitionAsAdvertised(tool map[string]interface{}) map[string]interface{} {
+	name, _ := tool["name"].(string)
+	separator := strings.Index(name, "__")
+	if separator < 0 {
+		return tool
+	}
+	advertised := make(map[string]interface{}, len(tool))
+	for key, value := range tool {
+		advertised[key] = value
+	}
+	advertised["name"] = strings.NewReplacer(".u", "_", ".d", ".").Replace(name[separator+2:])
+	return advertised
 }
 
 // ToolDescription extracts the text of an advertised tool definition that the
@@ -872,9 +913,15 @@ func ToolDescription(tool map[string]interface{}) detection.ToolDescription {
 }
 
 func toolDescriptionFromMap(tool map[string]interface{}) detection.ToolDescription {
-	desc := detection.ToolDescription{
-		Name:        definitionString(tool["name"]),
-		Description: definitionString(tool["description"]),
+	desc := detection.ToolDescription{Name: definitionString(tool["name"])}
+	walk := definitionWalk{budget: maxDefinitionFragmentBytes}
+	switch description := tool["description"].(type) {
+	case string:
+		desc.Description = walk.take(description)
+	case nil:
+	default:
+		// A description that is not a string is still text an agent may read.
+		walk.collect(description, 0)
 	}
 	if inputSchema, ok := tool["inputSchema"].(map[string]interface{}); ok {
 		if props, ok := inputSchema["properties"].(map[string]interface{}); ok {
@@ -890,42 +937,83 @@ func toolDescriptionFromMap(tool map[string]interface{}) detection.ToolDescripti
 	}
 	// An instruction can sit anywhere the agent reads: a title, a nested
 	// property, an enum or default value, an annotation, the output schema.
-	budget := maxDefinitionFragmentBytes
+	// The parts an agent is most likely shown are read first, so unrelated
+	// bulk elsewhere in the definition cannot use up the budget before them.
+	first := []string{"inputSchema", "title", "outputSchema", "annotations"}
+	read := map[string]bool{"name": true, "description": true}
+	for _, key := range first {
+		read[key] = true
+		walk.collect(tool[key], 0)
+	}
 	keys := make([]string, 0, len(tool))
 	for key := range tool {
-		if key != "name" && key != "description" {
+		if !read[key] {
 			keys = append(keys, key)
 		}
 	}
 	sort.Strings(keys)
 	for _, key := range keys {
-		collectDefinitionStrings(tool[key], &desc.Fragments, &budget, 0)
+		walk.collect(tool[key], 0)
 	}
+	desc.Fragments = walk.fragments
+	desc.Truncated = walk.truncated
 	return desc
 }
 
 // maxDefinitionFragmentBytes bounds the inspection cost of one definition.
 const maxDefinitionFragmentBytes = 256 << 10
 
+// maxDefinitionDepth bounds how deeply a definition is read.
+const maxDefinitionDepth = 64
+
+// maxDefinitionVerdicts bounds the record of inspected definitions.
+const maxDefinitionVerdicts = 8192
+
+type definitionVerdict struct {
+	result detection.Result
+	found  bool
+}
+
 func definitionString(value interface{}) string {
 	text, _ := value.(string)
 	return text
 }
 
-func collectDefinitionStrings(value interface{}, out *[]string, budget *int, depth int) {
-	if depth > 16 || *budget <= 0 {
+// definitionWalk gathers the strings of a definition within a size and depth
+// bound, and records when the bound left part of the definition unread.
+type definitionWalk struct {
+	fragments []string
+	budget    int
+	truncated bool
+}
+
+func (w *definitionWalk) take(text string) string {
+	if len(text) > w.budget {
+		text = text[:w.budget]
+		w.truncated = true
+	}
+	w.budget -= len(text)
+	return text
+}
+
+func (w *definitionWalk) collect(value interface{}, depth int) {
+	if depth > maxDefinitionDepth {
+		w.truncated = true
 		return
 	}
 	switch typed := value.(type) {
 	case string:
-		if len(typed) > *budget {
-			typed = typed[:*budget]
+		if typed == "" {
+			return
 		}
-		*budget -= len(typed)
-		*out = append(*out, typed)
+		if w.budget <= 0 {
+			w.truncated = true
+			return
+		}
+		w.fragments = append(w.fragments, w.take(typed))
 	case []interface{}:
 		for _, item := range typed {
-			collectDefinitionStrings(item, out, budget, depth+1)
+			w.collect(item, depth+1)
 		}
 	case map[string]interface{}:
 		keys := make([]string, 0, len(typed))
@@ -934,8 +1022,8 @@ func collectDefinitionStrings(value interface{}, out *[]string, budget *int, dep
 		}
 		sort.Strings(keys)
 		for _, key := range keys {
-			collectDefinitionStrings(key, out, budget, depth+1)
-			collectDefinitionStrings(typed[key], out, budget, depth+1)
+			w.collect(key, depth+1)
+			w.collect(typed[key], depth+1)
 		}
 	}
 }
@@ -1685,10 +1773,10 @@ func applyDetectionPolicy(result detection.Result, p telemetry.SyncPolicy, local
 	case "threat", "tool_poisoning":
 		if strings.EqualFold(p.Detection.Threat, "block") || strings.EqualFold(local.Threat, "block") {
 			result.Verdict = detection.VerdictBlock
-		} else if result.HardBlock && !strings.EqualFold(local.Threat, "monitor") {
+		} else if result.HardBlock && !strings.EqualFold(local.Threat, "monitor") && !strings.EqualFold(p.Detection.Threat, "monitor") {
 			// A definition that instructs the agent is blocked without the
-			// organization opting detections into blocking. Setting the local
-			// threat action to monitor opts this workstation out.
+			// organization opting detections into blocking. Setting the threat
+			// action to monitor, locally or for the organization, opts out.
 			result.Verdict = detection.VerdictBlock
 		}
 	}
@@ -2199,22 +2287,7 @@ func (p *Proxy) handleBuiltinToolCall(id *json.RawMessage, name string, args map
 		}
 	case "agentkeeper_audit":
 		p.startToolRefresh()
-		servers := p.manager.ConfiguredNames()
-		sort.Strings(servers)
-		text = fmt.Sprintf("MCP Security Audit\nServers: %d\n", len(servers))
-		for _, s := range servers {
-			tools := p.cachedTools(s)
-			status := p.getToolStatus(s)
-			state := status.Status
-			if state == "" {
-				state = "refreshing"
-			}
-			if status.LastError != "" {
-				text += fmt.Sprintf("  %s: %d cached tools (%s: %s)\n", s, len(tools), state, status.LastError)
-				continue
-			}
-			text += fmt.Sprintf("  %s: %d cached tools (%s)\n", s, len(tools), state)
-		}
+		text = p.auditReport()
 	default:
 		text = "Unknown built-in tool: " + name
 	}
@@ -2226,6 +2299,72 @@ func (p *Proxy) handleBuiltinToolCall(id *json.RawMessage, name string, args map
 	}
 	resultJSON, _ := json.Marshal(result)
 	return &JSONRPCMessage{JSONRPC: "2.0", ID: id, Result: resultJSON}, nil
+}
+
+// auditReport lists each configured server with its cached tool count, then
+// the tool definitions the inspection flagged and what the route does with
+// each. It reads cached definitions only.
+func (p *Proxy) auditReport() string {
+	servers := p.manager.ConfiguredNames()
+	sort.Strings(servers)
+	var synced telemetry.SyncPolicy
+	if p.telemetry != nil {
+		synced = p.telemetry.Policy()
+	}
+	enforcing := p.enforceMode()
+	text := fmt.Sprintf("MCP Security Audit\nServers: %d\n", len(servers))
+	var flagged []string
+	for _, s := range servers {
+		tools := p.cachedTools(s)
+		status := p.getToolStatus(s)
+		state := status.Status
+		if state == "" {
+			state = "refreshing"
+		}
+		if status.LastError != "" {
+			text += fmt.Sprintf("  %s: %d cached tools (%s: %s)\n", s, len(tools), state, status.LastError)
+		} else {
+			text += fmt.Sprintf("  %s: %d cached tools (%s)\n", s, len(tools), state)
+		}
+		for _, value := range tools {
+			tool, ok := value.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			result, found := p.toolDescriptionDetection(tool)
+			if !found {
+				continue
+			}
+			decided := applyDetectionPolicy(result, synced, p.config.Detection)
+			outcome := "reported, still listed"
+			if decided.Verdict == detection.VerdictBlock {
+				outcome = "reported, still listed; Enforce hides it"
+				if enforcing {
+					outcome = "hidden from clients, calls blocked"
+				}
+			}
+			flagged = append(flagged, fmt.Sprintf("  %s/%s: %s %s (%s)\n", s, auditToolName(definitionString(tool["name"])), decided.Severity, decided.PatternName, outcome))
+		}
+	}
+	text += fmt.Sprintf("Flagged tool definitions: %d\n", len(flagged))
+	return text + strings.Join(flagged, "")
+}
+
+// auditToolName renders a server-controlled tool name for the audit report,
+// which the agent reads: identifier characters only, bounded.
+func auditToolName(name string) string {
+	var b strings.Builder
+	for _, r := range name {
+		if b.Len() >= 64 {
+			break
+		}
+		if r == '_' || r == '-' || r == '.' || (r >= '0' && r <= '9') || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') {
+			b.WriteRune(r)
+		} else {
+			b.WriteRune('?')
+		}
+	}
+	return b.String()
 }
 
 func (p *Proxy) cachedToolSummary() (backendCount int, toolCount int, degradedBackendCount int) {

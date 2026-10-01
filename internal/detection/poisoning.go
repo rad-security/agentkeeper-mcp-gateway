@@ -16,9 +16,9 @@ import (
 // several of the same words ("do not mention this setup call to the user",
 // "default key: ~/.ssh/id_rsa", "detects phrases such as 'ignore previous
 // instructions'"). The check therefore looks for independent traits and
-// decides on their combination: one strong trait is reported for review, and a
-// definition is blocked in Enforce only when traits that have no innocent
-// reading together appear.
+// decides on their combination: one suspicious trait is reported for review,
+// and a definition is blocked in Enforce only on a trait with no innocent
+// reading or on two suspicious traits together.
 
 // poisonTrait is one independent trait of a poisoned definition.
 type poisonTrait struct {
@@ -29,6 +29,21 @@ type poisonTrait struct {
 	weight int
 	rule   string
 	regex  *regexp.Regexp
+	// except, when set, names matches that do not count: the same wording
+	// with an innocent object.
+	except *regexp.Regexp
+}
+
+func (t poisonTrait) matches(text string) bool {
+	if t.except == nil {
+		return t.regex.MatchString(text)
+	}
+	for _, match := range t.regex.FindAllString(text, -1) {
+		if !t.except.MatchString(match) {
+			return true
+		}
+	}
+	return false
 }
 
 type poisonFamily struct {
@@ -40,7 +55,7 @@ type poisonFamily struct {
 var poisonFamilyOrder = []string{
 	"hidden_text", "override", "credential_access", "redirect", "concealment",
 	"exfiltration", "persona", "encoded_instructions", "false_authority", "bypass",
-	"injected_instructions", "markup", "secret_location", "side_parameter", "cross_tool",
+	"injected_instructions", "unscanned", "markup", "secret_location", "side_parameter", "cross_tool",
 }
 
 var poisonFamilies = map[string]poisonFamily{
@@ -55,6 +70,7 @@ var poisonFamilies = map[string]poisonFamily{
 	"false_authority":       {"poison_false_authority", "Tool definition claims approval or authority the user did not give"},
 	"bypass":                {"poison_bypass_security", "Tool description contains security bypass instruction"},
 	"injected_instructions": {"poison_injected_instructions", "Tool definition carries instructions addressed to the agent"},
+	"unscanned":             {"poison_unscanned_definition", "Tool definition is too large or too deeply nested to inspect in full"},
 	"markup":                {"poison_injected_instructions", "Tool definition carries instructions addressed to the agent"},
 	"secret_location":       {"poison_injected_instructions", "Tool definition carries instructions addressed to the agent"},
 	"side_parameter":        {"poison_injected_instructions", "Tool definition carries instructions addressed to the agent"},
@@ -82,7 +98,10 @@ const (
 	// Text within one sentence. A dot inside a path or file name ("~/.ssh",
 	// "mcp.json") does not end the sentence.
 	poisonSameSentence = `(?:[^.!?]|[.]\S)`
-	poisonReadVerb     = `\b(?:read|open|cat|load|fetch|retrieve|access|grab|dump|collect|copy|upload|send|sends|post|include|attach|append|submit|forward)\b`
+	// "Never reveal the password to the user" protects a secret; it does not
+	// hide an action. The object of the verb decides which it is.
+	poisonProtectsSecret = poisonDisclose + `\s+(?:(?:the|any|a|an|this|that|these|those|its|their|raw|actual|real|full|stored|retrieved|plaintext|plain[- ]text)\s+){0,3}(?:\w+\s+)?(?:passwords?|passphrases?|secrets?|tokens?|keys?|credentials?|pins?|codes?|values?|numbers?|ssn|pii)\b`
+	poisonReadVerb       = `\b(?:read|open|cat|load|fetch|retrieve|access|grab|dump|collect|copy|upload|send|sends|post|include|attach|append|submit|forward)\b`
 )
 
 func compileToolPoisoningTraits() []poisonTrait {
@@ -90,11 +109,18 @@ func compileToolPoisoningTraits() []poisonTrait {
 		return poisonTrait{family: family, weight: weight, rule: rule, regex: regexp.MustCompile(expr)}
 	}
 	return []poisonTrait{
-		// Instruction override.
-		t("override", 3, "", `\b(?:ignore|disregard|forget|override|discard)\s+(?:(?:all|any|every|the|your|my|these|those|of)\s+){0,3}(?:previous|prior|above|earlier|preceding|former|existing|original|initial|system)\s+(?:\w+\s+){0,2}?(?:instructions?|rules?|guidelines?|prompts?|directions?|constraints?|policies|policy|safeguards?|restrictions?|guardrails?)\b`),
+		// Instruction override: what an agent is told to do with its own
+		// instructions. "Override existing rules" and "discard existing
+		// constraints" describe what a tool does to data, and "overrides the
+		// system prompt for this request" describes a model parameter, so
+		// those forms are not decisive.
+		t("override", 3, "", `\b(?:ignore|disregard|forget)\s+(?:(?:all|any|every|the|your|my|these|those|of)\s+){0,3}(?:previous|prior|above|earlier|preceding|former|original|initial|system)\s+(?:\w+\s+){0,2}?(?:instructions?|rules?|guidelines?|prompts?|directions?|constraints?|safeguards?|restrictions?|guardrails?)\b`),
+		t("override", 3, "", `\b(?:override|discard)\s+(?:(?:all|any|every|the|your|my|these|those|of)\s+){0,3}(?:previous|prior|above|earlier|preceding|former)\s+(?:\w+\s+){0,2}?(?:instructions?|guidelines?|prompts?|directions?|safeguards?|restrictions?|guardrails?)\b`),
+		t("override", 3, "", `\b(?:ignore|disregard|forget|override|discard)\s+(?:all\s+(?:of\s+)?)?your\s+(?:\w+\s+){0,2}?(?:instructions?|rules?|guidelines?|prompts?|directions?|constraints?|safeguards?|restrictions?|guardrails?)\b`),
 		t("override", 3, "", `ignore previous instructions|ignore all prior|disregard your instructions`),
 		t("override", 3, "", `\b(?:forget|ignore|disregard)\s+(?:everything|anything|all)\s+(?:you\s+(?:were|have been|'ve been)\s+told|that\s+came\s+before|said\s+(?:above|before|earlier)|above|before this)\b`),
-		t("override", 3, "", `\b(?:supersedes?|overrides?|replaces?|takes? precedence over)\s+(?:the\s+|your\s+|any\s+)?system prompt\b|\b(?:the\s+)?(?:real|true|actual)\s+instructions\s+(?:are|follow|begin)\b`),
+		t("override", 3, "", `\b(?:supersedes?|overrides?|replaces?|takes? precedence over)\s+your\s+system prompt\b|\b(?:the\s+)?(?:real|true|actual)\s+instructions\s+(?:are|follow|begin)\b`),
+		t("override", 1, "", `\b(?:supersedes?|overrides?|replaces?|takes? precedence over)\s+(?:the\s+|any\s+)?system prompt\b`),
 		// The same request in other languages. Word boundaries are ASCII-only,
 		// so these match on the phrase alone.
 		t("override", 3, "", `ignora(?:r)?\s+(?:todas\s+)?las\s+instrucciones\s+(?:anteriores|previas)|ignor(?:e|a)\s+(?:todas\s+)?as\s+instru[cç][oõ]es\s+anteriores`),
@@ -103,7 +129,7 @@ func compileToolPoisoningTraits() []poisonTrait {
 		t("override", 3, "", `忽略(?:所有)?(?:之前|以上|先前|前面|上述)(?:的)?(?:所有)?(?:指令|指示|说明|提示)|(?:これまで|以前|前|上記)の(?:指示|命令)を(?:すべて|全て)?無視`),
 
 		// Concealment from the user.
-		t("concealment", 2, "", `\b`+poisonNegation+`\s+(?:ever\s+|even\s+|also\s+)?(?:be\s+)?`+poisonDisclose+`\b[^.!?]{0,60}?\b`+poisonTheUser),
+		{family: "concealment", weight: 2, regex: regexp.MustCompile(`\b` + poisonNegation + `\s+(?:ever\s+|even\s+|also\s+)?(?:be\s+)?` + poisonDisclose + `\b[^.!?]{0,60}?\b` + poisonTheUser), except: regexp.MustCompile(poisonProtectsSecret)},
 		t("concealment", 2, "", `\b`+poisonNegation+`\s+(?:ever\s+)?`+poisonDisclose+`\s+(?:about\s+)?(?:this|that|it|these|those|any of this|what you|the (?:call|step|steps|instruction|instructions|file|action|tool|change|request|read|fact|above))\b`),
 		t("concealment", 2, "", `\bwithout\s+(?:telling|informing|notifying|alerting)\s+the\s+(?:user|human)(?:[^a-z']|$)`),
 		t("concealment", 2, "", `\bwithout\s+(?:the\s+)?(?:user|human)(?:'s|s)?\s+(?:knowledge|awareness|knowing|noticing|being aware)\b`),
@@ -111,7 +137,7 @@ func compileToolPoisoningTraits() []poisonTrait {
 		t("concealment", 2, "", `\b(?:must|should|shall|can)\s*(?:not|n't)\s+be\s+(?:shown|visible|displayed|disclosed|reported)\s+to\s+`+poisonTheUser),
 		t("concealment", 2, "", `\b(?:hide|conceal|obscure|suppress|keep)\b[^.!?]{0,40}?\b(?:from|hidden from|secret from)\s+(?:the\s+)?(?:user|human)(?:[^a-z']|$)`),
 		t("concealment", 2, "", `\b(?:silently|secretly|covertly|stealthily|quietly|discreetly)\s+(?:execute|run|call|invoke|sends?|reads?|perform|do|uploads?|forwards?|cop(?:y|ies)|posts?|transmits?|includes?|adds?)\b|\b(?:call|run|execute|invoke|do|perform)\s+(?:(?:it|this|them|that)\s+)?(?:silently|secretly|covertly|quietly)\b`),
-		t("concealment", 2, "", `\bkeep\s+(?:this|it|that)\s+(?:just\s+)?between\s+us\b|\bno need to\s+(?:bother|tell|inform|notify|alert)\s+`+poisonTheUser),
+		t("concealment", 2, "", `\bkeep\s+(?:this|it|that)\s+(?:quiet|to yourself|under wraps)\b|\bkeep\s+(?:this|it|that)\s+(?:just\s+)?between\s+us\b|\bno need to\s+(?:bother|tell|inform|notify|alert)\s+`+poisonTheUser),
 		t("concealment", 2, "", `\b(?:omit|leave|exclude|drop|strip|remove)\s+(?:this|it|that|these|those|(?:the|this|that)\s+\w+)\b[^.!?]{0,30}?\b(?:from|out of)\s+(?:your|the)\s+(?:summary|response|answer|reply|output|report|explanation)\b`),
 		t("concealment", 2, "", `\b(?:stay|stays|remain|remains|be kept|kept)\s+(?:hidden|secret|confidential|invisible)\s+from\s+(?:the\s+)?(?:user|human)(?:[^a-z']|$)`),
 		t("concealment", 2, "", `\b(?:collect|read|send|upload|copy|forward|gather|put|include)\b[^.!?]{0,160}?,?\s+(?:silently|secretly|quietly|covertly)\s*(?:[.!?]|$)`),
@@ -188,67 +214,128 @@ var homoglyphs = map[rune]rune{
 
 type definitionText struct {
 	text      string // lower-cased, with characters that do not render removed
-	hidden    bool   // relied on characters that never render
-	zeroWidth int
-	mixed     int // words that mix Latin letters with look-alikes from another script
+	hidden    bool   // carried text that never renders
+	zeroWidth int    // zero-width characters splitting Latin words
+	mixed     int    // words that mix Latin letters with look-alikes from another script
+	control   int    // stray control characters and terminal colour codes
+}
+
+// ansiConceals reports whether a terminal escape sequence hides text: the
+// conceal attribute, or anything that moves the cursor or erases. Colour and
+// weight codes only style text.
+func ansiConceals(sequence string) bool {
+	if !strings.HasSuffix(sequence, "m") {
+		return true
+	}
+	for _, parameter := range strings.Split(strings.TrimSuffix(strings.TrimPrefix(sequence, "\x1b["), "m"), ";") {
+		if parameter == "8" {
+			return true
+		}
+	}
+	return false
 }
 
 // normalizeDefinition lower-cases a definition, removes characters that do not
 // render, and reports whether it relied on them. Text hidden in the Unicode
 // tag block is decoded, and look-alike letters are folded to Latin, so that
 // both are inspected like visible text.
+//
+// Characters that do not render are common in ordinary text: a stray control
+// character from an unescaped docstring, colour codes in help text, isolates
+// around right-to-left words, the tag sequence of a flag emoji, joiners in
+// Persian. Only uses that hide or split text count for much.
 func normalizeDefinition(raw string) definitionText {
 	var d definitionText
 	if strings.Contains(raw, "\x1b") {
-		d.hidden = true
+		for _, sequence := range ansiEscape.FindAllString(raw, -1) {
+			if ansiConceals(sequence) {
+				d.hidden = true
+			} else {
+				d.control++
+			}
+		}
 		raw = ansiEscape.ReplaceAllString(raw, " ")
 	}
 	var b strings.Builder
 	b.Grow(len(raw))
 	tagCharacters := 0
+	inFlagEmoji := false
 	wordLatin, wordFolded := false, false
+	previousLatin, pendingZeroWidth := false, 0
 	endWord := func() {
 		if wordLatin && wordFolded {
 			d.mixed++
 		}
 		wordLatin, wordFolded = false, false
 	}
+	// emit writes one visible character and settles whether the zero-width
+	// characters before it sat inside a Latin word.
+	emit := func(r rune) {
+		latin := r >= 'a' && r <= 'z'
+		if latin && previousLatin {
+			d.zeroWidth += pendingZeroWidth
+		}
+		pendingZeroWidth = 0
+		previousLatin = latin
+		b.WriteRune(r)
+	}
 	for _, r := range raw {
+		if r == 0x1F3F4 {
+			// A subdivision flag is this character followed by tag characters.
+			inFlagEmoji = true
+			emit(r)
+			continue
+		}
+		if inFlagEmoji {
+			if r >= 0xE0020 && r <= 0xE007F {
+				if r == 0xE007F {
+					inFlagEmoji = false
+				}
+				continue
+			}
+			inFlagEmoji = false
+		}
 		switch {
 		case r >= 0xE0020 && r <= 0xE007E:
 			tagCharacters++
-			b.WriteRune(unicode.ToLower(r - 0xE0000))
+			emit(unicode.ToLower(r - 0xE0000))
 			continue
 		case r == 0xE0001 || r == 0xE007F:
 			tagCharacters++
 			continue
-		case r >= 0x202A && r <= 0x202E, r >= 0x2066 && r <= 0x2069:
+		case r == 0x202D || r == 0x202E:
+			// Directional overrides reorder what is displayed.
 			d.hidden = true
 			continue
-		case r == 0x200B || r == 0x200C || r == 0x2060 || r == 0xFEFF || r == 0x00AD || r == 0x180E:
-			d.zeroWidth++
+		case r >= 0x202A && r <= 0x202C, r >= 0x2066 && r <= 0x2069:
+			// Embeddings and isolates: ordinary in mixed-direction text.
 			continue
-		case r == 0x200D:
-			// Zero-width joiner: part of ordinary emoji sequences.
+		case r == 0x200B || r == 0x200C || r == 0x2060 || r == 0xFEFF || r == 0x180E:
+			if previousLatin {
+				pendingZeroWidth++
+			}
+			continue
+		case r == 0x200D || r == 0x00AD:
+			// Zero-width joiner and soft hyphen: ordinary typography.
 			continue
 		case r == '\t' || r == '\n' || r == '\r' || r == ' ':
 			endWord()
-			b.WriteRune(' ')
+			emit(' ')
 			continue
 		case r < 0x20 || r == 0x7F:
-			d.hidden = true
+			d.control++
 			continue
 		case r == '’' || r == '‘':
-			b.WriteRune('\'')
+			emit('\'')
 			continue
 		case r == '“' || r == '”':
-			b.WriteRune('"')
+			emit('"')
 			continue
 		}
 		lower := unicode.ToLower(r)
 		if latin, ok := homoglyphs[lower]; ok {
 			wordFolded = true
-			b.WriteRune(latin)
+			emit(latin)
 			continue
 		}
 		if lower >= 'a' && lower <= 'z' {
@@ -256,7 +343,7 @@ func normalizeDefinition(raw string) definitionText {
 		} else if !unicode.IsLetter(lower) {
 			endWord()
 		}
-		b.WriteRune(lower)
+		emit(lower)
 	}
 	endWord()
 	if tagCharacters >= 4 {
@@ -309,11 +396,11 @@ func (e *Engine) evaluateToolDefinition(tool ToolDescription) (Result, bool) {
 		}
 	}
 	for _, trait := range e.poisonTraits {
-		if !trait.regex.MatchString(text) {
+		if !trait.matches(text) {
 			continue
 		}
 		weight := trait.weight
-		if documenting && poisonQuotableFamilies[trait.family] && !trait.regex.MatchString(outsideQuotes) {
+		if documenting && poisonQuotableFamilies[trait.family] && !trait.matches(outsideQuotes) {
 			weight = 1
 		}
 		note(trait.family, weight, trait.rule)
@@ -323,18 +410,25 @@ func (e *Engine) evaluateToolDefinition(tool ToolDescription) (Result, bool) {
 		note("hidden_text", 3, "")
 	case definition.zeroWidth >= 4 || definition.mixed >= 2 || paddingToHideTxt.MatchString(raw):
 		note("hidden_text", 2, "")
-	case encodedBlob.MatchString(raw):
+	case definition.control > 0 || encodedBlob.MatchString(raw):
 		note("hidden_text", 1, "")
+	}
+	if tool.Truncated {
+		note("unscanned", 2, "")
 	}
 	concealed := weights["concealment"] >= 2
 	movesIt := weights["exfiltration"] > 0 || weights["concealment"] > 0
 	switch {
 	case poisonReadsCredentialStore.MatchString(text) && (movesIt || weights["side_parameter"] > 0):
-		note("credential_access", 2, "")
+		// Reading a credential store and passing it on has no innocent reading.
+		note("credential_access", 3, "")
 	case poisonReadsSensitiveContext.MatchString(text) && movesIt:
 		note("credential_access", 2, "")
 	case concealed && namesCredentialStore.MatchString(text):
 		// Naming a credential store and asking for silence, in any language.
+		note("credential_access", 2, "")
+	case concealed && weights["side_parameter"] > 0 && weights["secret_location"] > 0:
+		// Passing secrets in a parameter and asking for silence.
 		note("credential_access", 2, "")
 	}
 	// Sending something elsewhere, or changing what another tool does, while
@@ -359,8 +453,10 @@ func (e *Engine) evaluateToolDefinition(tool ToolDescription) (Result, bool) {
 			strong++
 		}
 	}
-	others := len(weights) - strong
-	hardBlock := decisive > 0 || strong >= 2 || (strong == 1 && others >= 2)
+	// One suspicious trait among ordinary wording is what a login tool or a
+	// quiet setup step looks like, so a block needs a decisive trait or two
+	// suspicious ones.
+	hardBlock := decisive > 0 || strong >= 2
 	if !hardBlock && strong == 0 && len(weights) < 3 {
 		return Result{}, false
 	}

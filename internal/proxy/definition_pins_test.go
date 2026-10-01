@@ -365,7 +365,7 @@ func TestManyChangedDefinitionsLogOneSummaryEvent(t *testing.T) {
 		t.Fatalf("%d events for 100 changed definitions, want %d and one summary", len(events), maxReportedDefinitionChanges)
 	}
 	summary := events[len(events)-1]
-	if summary.ToolName != "" || summary.ServerName != "crm" || !strings.Contains(summary.Description, "75 more tool definitions changed") {
+	if summary.ToolName != "75 more tools" || summary.ServerName != "crm" || !strings.Contains(summary.Description, "75 more tool definitions changed") {
 		t.Fatalf("summary event = %+v", summary)
 	}
 }
