@@ -116,7 +116,7 @@ func compilePromptPatterns() []Pattern {
 			Severity:    "high",
 			Description: "Prompt injection: attempt to override prior instructions",
 			Category:    "threat",
-			Regex:       regexp.MustCompile(`(ignore|disregard|forget|override)\s+(all\s+)?(previous|prior|above|earlier)\s+(instructions?|rules?|guidelines?|constraints?)`),
+			Regex:       regexp.MustCompile(`(ignore|disregard|forget|override)\s+((all|any|the|your|my|these|those|of)\s+){0,3}(previous|prior|above|earlier)\s+((system|safety)\s+)?(instructions?|rules?|guidelines?|constraints?)`),
 		},
 		{
 			Name:        "prompt_injection_persona",
