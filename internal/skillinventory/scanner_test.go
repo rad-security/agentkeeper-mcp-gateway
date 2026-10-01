@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -260,8 +261,8 @@ func TestScan_MCPServersFromGlobalSettings(t *testing.T) {
 	if gh.Type != "stdio" {
 		t.Errorf("github type: want stdio, got %q", gh.Type)
 	}
-	if gh.Command != "npx -y @modelcontextprotocol/server-github" {
-		t.Errorf("github command: want joined args, got %q", gh.Command)
+	if gh.Command != "npx" {
+		t.Errorf("github command: want base name only, got %q", gh.Command)
 	}
 	if gh.Source != "global" {
 		t.Errorf("github source: want global, got %q", gh.Source)
@@ -270,6 +271,101 @@ func TestScan_MCPServersFromGlobalSettings(t *testing.T) {
 	remote := byName["remote-sse"]
 	if remote.Type != "http" {
 		t.Errorf("remote-sse type: want http, got %q", remote.Type)
+	}
+	if remote.Command != "" {
+		t.Errorf("remote-sse command: want empty, got %q", remote.Command)
+	}
+}
+
+// Arguments and environment routinely carry connection strings and API keys.
+// Only the binary's base name may leave the machine, from every source.
+func TestScan_MCPServerCommandNeverCarriesArgumentsOrSecrets(t *testing.T) {
+	home := t.TempDir()
+	cwd := t.TempDir()
+
+	const (
+		connString  = "postgresql://app:conn-pw-0001@db.example.test/prod"
+		argKey      = "sk-test-args-0002"
+		inlineToken = "tok-inline-0003"
+		windowsPass = "pw-windows-0004"
+		envPrefix   = "key-env-prefix-0005"
+		envValue    = "env-value-0006"
+	)
+	secrets := []string{
+		connString, "conn-pw-0001", "db.example.test", argKey, inlineToken,
+		windowsPass, envPrefix, envValue, "--api-key", "--token", "--password",
+	}
+
+	writeFile(t, filepath.Join(home, ".claude", "settings.json"), `{"mcpServers":{
+		"pg": {"command": "npx", "args": ["-y", "pg-mcp", "`+connString+`", "--api-key", "`+argKey+`"],
+		       "env": {"PGPASSWORD": "`+envValue+`"}},
+		"remote": {"type": "http", "url": "https://mcp.example.test/mcp"}
+	}}`)
+	writeFile(t, filepath.Join(cwd, ".mcp.json"), `{"mcpServers":{
+		"inline": {"command": "/Users/dev/bin/pg-mcp --token `+inlineToken+` `+connString+`"}
+	}}`)
+	writeFile(t, filepath.Join(cwd, ".claude", "settings.json"), `{"mcpServers":{
+		"win": {"command": "C:\\Users\\dev\\tools\\server.exe --password `+windowsPass+`"}
+	}}`)
+	writeFile(t, filepath.Join(cwd, ".claude", "settings.local.json"), `{"mcpServers":{
+		"envprefix": {"command": "API_KEY=`+envPrefix+` npx server"}
+	}}`)
+	want := map[string]string{
+		"pg":        "npx",
+		"remote":    "",
+		"inline":    "pg-mcp",
+		"win":       "server.exe",
+		"envprefix": "",
+	}
+	if cfgPath := coworkDesktopConfigPath(home); cfgPath != "" {
+		writeFile(t, cfgPath, `{"mcpServers":{
+			"desktop": {"command": "/usr/local/bin/python3", "args": ["server.py", "--api-key", "`+argKey+`"]},
+			"desktop-inline": {"command": "uvx db-mcp --token `+inlineToken+`"}
+		}}`)
+		want["desktop"] = "python3"
+		want["desktop-inline"] = "uvx"
+	}
+
+	inv, err := Scan(ScanOptions{Home: home, CWD: cwd})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(inv.MCPServers) != len(want) {
+		t.Fatalf("want %d MCP servers, got %d: %+v", len(want), len(inv.MCPServers), inv.MCPServers)
+	}
+	for _, s := range inv.MCPServers {
+		if base, ok := want[s.Name]; !ok || s.Command != base {
+			t.Errorf("%s command: want %q, got %q", s.Name, base, s.Command)
+		}
+	}
+
+	body, err := json.Marshal(BuildPayload(inv, "", "", ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, secret := range secrets {
+		if strings.Contains(string(body), secret) {
+			t.Errorf("payload leaked %q: %s", secret, body)
+		}
+	}
+}
+
+func TestCommandBaseName(t *testing.T) {
+	for _, tc := range []struct{ command, want string }{
+		{"", ""},
+		{"   ", ""},
+		{"npx", "npx"},
+		{"/usr/local/bin/python3", "python3"},
+		{"npx -y pg-mcp postgresql://app:pw@db.example.test/prod", "npx"},
+		{"/Users/dev/bin/server --api-key sk-test", "server"},
+		{`C:\Users\dev\tools\server.exe`, "server.exe"},
+		{`C:\Users\dev\tools\server.exe --password pw`, "server.exe"},
+		{`C:/Users/dev/tools\node.exe`, "node.exe"},
+		{"API_KEY=sk-test npx server", ""},
+	} {
+		if got := commandBaseName(tc.command); got != tc.want {
+			t.Errorf("commandBaseName(%q) = %q, want %q", tc.command, got, tc.want)
+		}
 	}
 }
 

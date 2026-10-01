@@ -51,7 +51,7 @@ type Skill struct {
 type MCPServer struct {
 	Name     string `json:"name"`
 	Type     string `json:"type"`              // "stdio" or "http"
-	Command  string `json:"command,omitempty"` // stdio: joined command+args
+	Command  string `json:"command,omitempty"` // stdio: binary base name only, never args or env
 	Source   string `json:"source"`            // "global" or "project"
 	Platform string `json:"platform"`          // "claude_code" or "claude_desktop"
 }
@@ -234,7 +234,8 @@ func scanSkills(home, cwd string) []Skill {
 // scanMCPServers mirrors collect_mcp() — reads mcpServers from each of the
 // three Claude Code settings.json locations, then the Claude Desktop
 // claude_desktop_config.json, flattening into a single list with a
-// `platform` discriminator per entry.
+// `platform` discriminator per entry. Unlike collect_mcp(), only the base name
+// of each command is reported (see commandBaseName).
 func scanMCPServers(home, cwd string) []MCPServer {
 	servers := []MCPServer{}
 	seen := map[string]bool{}
@@ -265,10 +266,9 @@ func scanMCPServers(home, cwd string) []MCPServer {
 		}
 		var settings struct {
 			MCPServers map[string]struct {
-				Type    string   `json:"type"`
-				URL     string   `json:"url"`
-				Command string   `json:"command"`
-				Args    []string `json:"args"`
+				Type    string `json:"type"`
+				URL     string `json:"url"`
+				Command string `json:"command"`
 			} `json:"mcpServers"`
 		}
 		if err := json.Unmarshal(data, &settings); err != nil {
@@ -289,16 +289,10 @@ func scanMCPServers(home, cwd string) []MCPServer {
 					serverType = "stdio"
 				}
 			}
-			command := cfg.Command
-			if command != "" && len(cfg.Args) > 0 {
-				for _, a := range cfg.Args {
-					command += " " + a
-				}
-			}
 			servers = append(servers, MCPServer{
 				Name:     name,
 				Type:     serverType,
-				Command:  command,
+				Command:  commandBaseName(cfg.Command),
 				Source:   src.scope,
 				Platform: src.platform,
 			})
@@ -319,6 +313,25 @@ func scanMCPServers(home, cwd string) []MCPServer {
 }
 
 // --- helpers ----------------------------------------------------------------
+
+// commandBaseName reduces a configured stdio command to the binary's base
+// name ("npx", "python3"). Arguments and environment are never reported: they
+// routinely carry connection strings and API keys. A command string that
+// embeds its own arguments is cut at the first whitespace, both path
+// separators are honoured so a Windows path reduces the same way on any OS,
+// and a leading KEY=value assignment is environment, so nothing is reported.
+// Empty in (remote servers) is empty out.
+func commandBaseName(command string) string {
+	fields := strings.Fields(command)
+	if len(fields) == 0 || strings.Contains(fields[0], "=") {
+		return ""
+	}
+	name := fields[0]
+	if i := strings.LastIndexAny(name, `/\`); i >= 0 {
+		name = name[i+1:]
+	}
+	return name
+}
 
 // readPreview returns the first 300 bytes of the file as a string, or empty
 // string on any error (unreadable, missing, etc.). Matches read_preview() in
