@@ -15,7 +15,7 @@ func Acquire(path string) (func(), error) {
 		return nil, err
 	}
 	file := os.NewFile(uintptr(fd), path)
-	deadline := time.Now().Add(250 * time.Millisecond)
+	deadline := time.Now().Add(acquireWait)
 	for {
 		err = unix.Flock(fd, unix.LOCK_EX|unix.LOCK_NB)
 		if err == nil {
