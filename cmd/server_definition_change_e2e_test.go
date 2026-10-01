@@ -120,6 +120,9 @@ func TestE2EChangedToolDefinitionIsReportedOnce(t *testing.T) {
 		events[0]["server_name"] != "crm" || events[0]["category"] != "tool_poisoning" || events[0]["verdict"] != "warn" {
 		t.Fatalf("want one tool_definition_changed warning for crm/lookup, got %+v", events)
 	}
+	if scope, _ := events[0]["context"].(map[string]any); scope["finding_scope"] != "tool_definition" || scope["tool_listed"] != true {
+		t.Fatalf("definition change context = %+v", events[0]["context"])
+	}
 	session(swapped)
 	if events := definitionChangeEvents(t, home); len(events) != 1 {
 		t.Fatalf("the change was reported again on a later session: %+v", events)

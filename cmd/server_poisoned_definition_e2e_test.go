@@ -116,6 +116,11 @@ func TestE2EEnforceBlocksPoisonedDefinitionWithDefaultPolicy(t *testing.T) {
 	if len(listed) != 1 || listed[0]["verdict"] != "block" || listed[0]["severity"] != "critical" || listed[0]["tool_name"] != "get_weather" {
 		t.Fatalf("want one critical block detection for get_weather at list time, got %+v", listed)
 	}
+	// A definition finding is not a call. It says so, and says what the
+	// route did with the tool, so it is not read as an unverified denied call.
+	if scope, _ := listed[0]["context"].(map[string]any); scope["finding_scope"] != "tool_definition" || scope["effective_mode"] != "enforce" || scope["tool_listed"] != false {
+		t.Fatalf("definition finding context = %+v", listed[0]["context"])
+	}
 	called := poisoningEvents(events, "mcp.tool_call")
 	if len(called) != 1 || called[0]["verdict"] != "block" {
 		t.Fatalf("want the blocked call recorded as a tool_poisoning block, got %+v", called)
@@ -133,6 +138,9 @@ func TestE2EObserveReportsPoisonedDefinitionAsWouldBlock(t *testing.T) {
 	listed := poisoningEvents(events, "mcp.threat_detected")
 	if len(listed) != 1 || listed[0]["verdict"] != "block" || listed[0]["severity"] != "critical" {
 		t.Fatalf("want the definition recorded as a block decision in Observe, got %+v", listed)
+	}
+	if scope, _ := listed[0]["context"].(map[string]any); scope["finding_scope"] != "tool_definition" || scope["effective_mode"] != "observe" || scope["tool_listed"] != true {
+		t.Fatalf("definition finding context = %+v", listed[0]["context"])
 	}
 	called := poisoningEvents(events, "mcp.tool_call")
 	if len(called) != 1 || called[0]["verdict"] != "block" {

@@ -802,10 +802,16 @@ func (p *Proxy) logToolDescriptionDetections(serverName string, tools []interfac
 		if p.telemetry != nil {
 			synced = p.telemetry.Policy()
 		}
+		mode, enforcing := "observe", p.enforceMode()
+		if enforcing {
+			mode = "enforce"
+		}
 		for name, result := range newFindings {
 			// Record the decision the route would apply, so a definition that
 			// Enforce blocks reads as a block in Observe too.
-			p.config.Logger.LogDetection(serverName, originalMCPName(serverName, name), applyDetectionPolicy(result, synced, p.config.Detection))
+			decided := applyDetectionPolicy(result, synced, p.config.Detection)
+			listed := !(enforcing && decided.Verdict == detection.VerdictBlock)
+			p.config.Logger.LogDefinitionFinding(serverName, originalMCPName(serverName, name), decided, mode, listed)
 		}
 	}
 }

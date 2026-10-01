@@ -135,12 +135,16 @@ func (p *Proxy) logChangedToolDefinitions(serverName string, tools []interface{}
 		if len(shown) > 80 {
 			shown = shown[:80]
 		}
-		p.config.Logger.LogDetection(serverName, name, detection.Result{
+		mode := "observe"
+		if p.enforceMode() {
+			mode = "enforce"
+		}
+		p.config.Logger.LogDefinitionFinding(serverName, name, detection.Result{
 			Verdict:     detection.VerdictWarn,
 			PatternName: "tool_definition_changed",
 			Severity:    "high",
 			Description: "Tool definition changed after it was first recorded; review it before trusting it in tool: " + shown,
 			Category:    "tool_poisoning",
-		})
+		}, mode, true)
 	}
 }
