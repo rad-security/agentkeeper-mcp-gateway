@@ -17,7 +17,8 @@ import (
 
 // TestContentMCPHelper is an owned stdio MCP provider that serves a tool, a
 // resource and a prompt. AK_TEST_START_LOG records one line per process start
-// and AK_TEST_REQUEST_LOG records every request line it receives.
+// and AK_TEST_REQUEST_LOG records every request line it receives. When
+// AK_TEST_TOOL_RESULT is set, tools/call answers with that JSON verbatim.
 func TestContentMCPHelper(t *testing.T) {
 	if os.Getenv("AK_TEST_CONTENT_MCP") != "1" {
 		return
@@ -59,6 +60,9 @@ func TestContentMCPHelper(t *testing.T) {
 			}}
 		case "tools/call":
 			result = map[string]interface{}{"content": []map[string]interface{}{{"type": "text", "text": "CONTENT_TOOL_" + label}}}
+			if raw := os.Getenv("AK_TEST_TOOL_RESULT"); raw != "" {
+				result = json.RawMessage(raw)
+			}
 		case "resources/list":
 			result = map[string]interface{}{"resources": []map[string]interface{}{{"uri": "fixture://" + label + "/notes", "name": "notes"}}}
 		case "resources/read":

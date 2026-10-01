@@ -93,11 +93,13 @@ type listHealthReport struct {
 	DiscoveryError      string                       `json:"discovery_error,omitempty"`
 }
 
+// backendToolHealth is what local evidence shows about one routed backend.
+// It carries no tool count: list --health starts no server, and the manifest
+// a running Gateway caches for a stdio backend does not outlive that Gateway.
 type backendToolHealth struct {
 	Name         string `json:"name"`
 	Transport    string `json:"transport"`
 	Status       string `json:"status"`
-	ToolCount    int    `json:"tool_count"`
 	LastToolName string `json:"last_tool_name,omitempty"`
 	LastCallAt   string `json:"last_call_at,omitempty"`
 	Error        string `json:"error,omitempty"`
@@ -199,10 +201,10 @@ func printListHealth(out interface{ Write([]byte) (int, error) }, report listHea
 	}
 	if len(report.BackendToolHealth) > 0 {
 		fmt.Fprintln(out, "")
-		fmt.Fprintf(out, "%-20s %-10s %-16s %-6s %s\n", "BACKEND", "TRANSPORT", "TOOLS", "COUNT", "DETAIL")
-		fmt.Fprintf(out, "%-20s %-10s %-16s %-6s %s\n", "-------", "---------", "-----", "-----", "------")
+		fmt.Fprintf(out, "%-20s %-10s %-16s %s\n", "BACKEND", "TRANSPORT", "TOOLS", "DETAIL")
+		fmt.Fprintf(out, "%-20s %-10s %-16s %s\n", "-------", "---------", "-----", "------")
 		for _, h := range report.BackendToolHealth {
-			fmt.Fprintf(out, "%-20s %-10s %-16s %-6d %s\n", h.Name, h.Transport, h.Status, h.ToolCount, backendToolHealthDetail(h))
+			fmt.Fprintf(out, "%-20s %-10s %-16s %s\n", h.Name, h.Transport, h.Status, backendToolHealthDetail(h))
 		}
 	}
 	fmt.Fprintln(out, "")
