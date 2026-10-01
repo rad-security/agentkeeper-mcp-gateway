@@ -5,6 +5,7 @@ package proxy
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -1196,9 +1197,15 @@ func (p *Proxy) handleToolsCallContext(ctx context.Context, msg JSONRPCMessage) 
 		Arguments map[string]interface{} `json:"arguments"`
 		Meta      json.RawMessage        `json:"_meta,omitempty"`
 	}
-	if err := json.Unmarshal(msg.Params, &callParams); err != nil {
+	if err := unmarshalExactNumbers(msg.Params, &callParams); err != nil {
 		return nil, fmt.Errorf("invalid tools/call params: %w", err)
 	}
+	// The upstream is sent forwardArguments, whose numbers are the client's
+	// own literals. Everything below that inspects or logs the call reads
+	// callParams.Arguments, which keeps the float64 values those checks have
+	// always seen.
+	forwardArguments := callParams.Arguments
+	callParams.Arguments = inspectionArguments(forwardArguments)
 
 	// Check for built-in tools
 	if strings.HasPrefix(callParams.Name, "agentkeeper_") {
@@ -1418,8 +1425,8 @@ func (p *Proxy) handleToolsCallContext(ctx context.Context, msg JSONRPCMessage) 
 	forwardParams := map[string]interface{}{"name": originalName}
 	// MCP lets a client omit arguments; do not turn that into a JSON null,
 	// which servers validating the field as an object reject.
-	if callParams.Arguments != nil {
-		forwardParams["arguments"] = callParams.Arguments
+	if forwardArguments != nil {
+		forwardParams["arguments"] = forwardArguments
 	}
 	if len(callParams.Meta) > 0 && string(callParams.Meta) != "null" {
 		forwardParams["_meta"] = callParams.Meta
@@ -1517,6 +1524,55 @@ func (p *Proxy) handleToolsCallContext(ctx context.Context, msg JSONRPCMessage) 
 	})
 
 	return &JSONRPCMessage{JSONRPC: "2.0", ID: msg.ID, Result: response}, nil
+}
+
+// unmarshalExactNumbers is json.Unmarshal, except that a number decoded into
+// an interface{} keeps the text the sender wrote (json.Number) and is written
+// back unchanged. The default float64 cannot hold an integer beyond 2^53, so
+// a decoded and re-encoded 9007199254740993 arrived as 9007199254740992.
+func unmarshalExactNumbers(data []byte, v interface{}) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	if err := decoder.Decode(v); err != io.EOF {
+		return err
+	}
+	// No input at all: report it the way json.Unmarshal does.
+	return json.Unmarshal(data, v)
+}
+
+// inspectionArguments copies exactly decoded arguments into the form policy,
+// detection and the evaluation API have always received: numbers as float64.
+// A number float64 cannot represent (1e400), which used to fail the whole
+// call, stays a json.Number; it prints and marshals as its literal.
+func inspectionArguments(arguments map[string]interface{}) map[string]interface{} {
+	if arguments == nil {
+		return nil
+	}
+	return inspectionValue(arguments).(map[string]interface{})
+}
+
+func inspectionValue(value interface{}) interface{} {
+	switch typed := value.(type) {
+	case json.Number:
+		if number, err := typed.Float64(); err == nil {
+			return number
+		}
+		return typed
+	case map[string]interface{}:
+		copied := make(map[string]interface{}, len(typed))
+		for key, entry := range typed {
+			copied[key] = inspectionValue(entry)
+		}
+		return copied
+	case []interface{}:
+		copied := make([]interface{}, len(typed))
+		for i, entry := range typed {
+			copied[i] = inspectionValue(entry)
+		}
+		return copied
+	default:
+		return value
+	}
 }
 
 func (p *Proxy) logToolOutcome(serverName, toolName string, params map[string]interface{}, result detection.Result, outcome logging.ToolCallOutcome) {
@@ -1920,7 +1976,7 @@ func (p *Proxy) handlePromptsGet(msg JSONRPCMessage) (*JSONRPCMessage, error) {
 }
 func (p *Proxy) handlePromptsGetContext(ctx context.Context, msg JSONRPCMessage) (*JSONRPCMessage, error) {
 	var params map[string]interface{}
-	if err := json.Unmarshal(msg.Params, &params); err != nil {
+	if err := unmarshalExactNumbers(msg.Params, &params); err != nil {
 		return nil, fmt.Errorf("invalid prompts/get params")
 	}
 	namespacedName, _ := params["name"].(string)

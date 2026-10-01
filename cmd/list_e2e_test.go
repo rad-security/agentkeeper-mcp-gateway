@@ -240,9 +240,8 @@ func TestListHealthReportsRemoteAuthConfigured(t *testing.T) {
 	var report struct {
 		ToolManifestStatus string `json:"tool_manifest_status"`
 		BackendToolHealth  []struct {
-			Name      string `json:"name"`
-			Status    string `json:"status"`
-			ToolCount int    `json:"tool_count"`
+			Name   string `json:"name"`
+			Status string `json:"status"`
 		} `json:"backend_tool_health"`
 	}
 	if err := json.Unmarshal([]byte(out), &report); err != nil {
@@ -251,7 +250,7 @@ func TestListHealthReportsRemoteAuthConfigured(t *testing.T) {
 	if report.ToolManifestStatus != "pending" {
 		t.Fatalf("expected pending until a real tool call observes tools, got %q in %s", report.ToolManifestStatus, out)
 	}
-	if len(report.BackendToolHealth) != 1 || report.BackendToolHealth[0].Status != "auth_configured" || report.BackendToolHealth[0].ToolCount != 0 {
+	if len(report.BackendToolHealth) != 1 || report.BackendToolHealth[0].Status != "auth_configured" {
 		t.Fatalf("unexpected backend health: %+v\n%s", report.BackendToolHealth, out)
 	}
 }
@@ -323,5 +322,59 @@ func TestListHealthReportsObservedToolCalls(t *testing.T) {
 	}
 	if !strings.Contains(strings.Join(report.NextSteps, "\n"), "make one real harmless tool call") {
 		t.Fatalf("missing next step for remaining pending backends: %+v", report.NextSteps)
+	}
+}
+
+// list --health starts no server and has no local record of how many tools a
+// backend lists, so it must not print a count: the column used to read 0 for
+// every backend, including ones whose tools were in use.
+func TestListHealthDoesNotReportAToolCountItCannotKnow(t *testing.T) {
+	home := t.TempDir()
+	logPath := filepath.Join(home, ".config", "agentkeeper-mcp-gateway", "events.jsonl")
+	writeGatewayConfig(t, home, `{
+		"mode": "audit",
+		"log_path": "`+filepath.ToSlash(logPath)+`",
+		"servers": [
+			{"name": "fixture-db", "command": "fixture-db-server"},
+			{"name": "fixture-docs", "command": "fixture-docs-server"}
+		]
+	}`)
+	if err := os.WriteFile(logPath, []byte(`{"timestamp":"2026-06-12T00:09:18.571889Z","event_type":"mcp.tool_call","server_name":"fixture-db","tool_name":"run_query","verdict":"pass"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	out, stderr, code := run(t, home, "list", "--health")
+	if code != 0 {
+		t.Fatalf("exit %d, stderr: %s", code, stderr)
+	}
+	var table []string
+	for _, line := range strings.Split(out, "\n") {
+		if fields := strings.Fields(line); len(fields) > 0 && (fields[0] == "BACKEND" || fields[0] == "fixture-db" || fields[0] == "fixture-docs") && !strings.Contains(line, "-server") {
+			table = append(table, strings.Join(fields, " "))
+		}
+	}
+	want := []string{
+		"BACKEND TRANSPORT TOOLS DETAIL",
+		"fixture-db stdio calls_observed last call run_query at 2026-06-12T00:09:18.571889Z",
+		"fixture-docs stdio pending",
+	}
+	if strings.Join(table, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("backend table =\n%s\nwant\n%s\nfull output:\n%s", strings.Join(table, "\n"), strings.Join(want, "\n"), out)
+	}
+
+	out, stderr, code = run(t, home, "list", "--health", "--json")
+	if code != 0 {
+		t.Fatalf("exit %d, stderr: %s", code, stderr)
+	}
+	var report struct {
+		BackendToolHealth []map[string]json.RawMessage `json:"backend_tool_health"`
+	}
+	if err := json.Unmarshal([]byte(out), &report); err != nil || len(report.BackendToolHealth) != 2 {
+		t.Fatalf("parsing json: %v\n%s", err, out)
+	}
+	for _, backend := range report.BackendToolHealth {
+		if count, reported := backend["tool_count"]; reported {
+			t.Fatalf("backend %s reports tool_count=%s without a source for it:\n%s", backend["name"], count, out)
+		}
 	}
 }
