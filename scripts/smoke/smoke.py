@@ -189,14 +189,17 @@ class Smoke:
                               stderr=subprocess.PIPE, timeout=2 * TIMEOUT)
         return done.returncode, (done.stdout + done.stderr).decode("utf-8", "replace")
 
-    def scenario(self, name, mode="audit", upstream_env=None):
+    def scenario(self, name, mode="audit", upstream_env=None, detection=None):
         """A second home with its own gateway config, for a case that must not share state."""
         home = self.home.parent / name
         state = home / ".config" / "agentkeeper-mcp-gateway"
         state.mkdir(parents=True)
         entry = {"name": UPSTREAM, "command": sys.executable,
                  "args": [str(self.upstream), "--fake-upstream"], "env": upstream_env or {}}
-        (state / "config.json").write_bytes(json.dumps({"mode": mode, "servers": [entry]}).encode("utf-8"))
+        config = {"mode": mode, "servers": [entry]}
+        if detection:
+            config["detection"] = detection
+        (state / "config.json").write_bytes(json.dumps(config).encode("utf-8"))
         env = dict(self.env)
         env.update({"HOME": str(home), "USERPROFILE": str(home),
                     "XDG_CONFIG_HOME": str(home / ".config"),
@@ -393,7 +396,8 @@ class Smoke:
         return "last 2 of %d event lines" % len(self.events.read_bytes().splitlines())
 
     def enforce_blocks_poisoned_tool(self):
-        home, state, env = self.scenario("enforce poisoned", mode="enforce", upstream_env={"SMOKE_POISON": "1"})
+        home, state, env = self.scenario("enforce poisoned", mode="enforce", upstream_env={"SMOKE_POISON": "1"},
+                                         detection={"threat": "block"})
         server, names = self.connect(home, env, {UPSTREAM + "__echo"})
         expect(UPSTREAM + "__get_weather" not in names, "poisoned tool was listed in Enforce: %s" % sorted(names))
         blocked = server.request("tools/call", {"name": UPSTREAM + "__get_weather", "arguments": {"city": "Austin"}})
@@ -412,8 +416,8 @@ class Smoke:
         self.finish(server)
         listed = [event for event in self.read_events(state, lambda e: e.get("event_type") == "mcp.threat_detected")
                   if event.get("event_type") == "mcp.threat_detected" and event.get("category") == "tool_poisoning"]
-        expect(len(listed) == 1 and listed[0].get("verdict") == "block" and listed[0].get("severity") == "critical",
-               "definition was not recorded as a critical block decision: %s" % listed)
+        expect(len(listed) == 1 and listed[0].get("verdict") == "warn" and listed[0].get("severity") == "critical",
+               "definition was not recorded as a critical finding: %s" % listed)
         return "call ran; definition recorded as %s (%s)" % (listed[0].get("pattern_name"), listed[0].get("verdict"))
 
     def two_gateways_one_home(self):
@@ -487,7 +491,7 @@ class Smoke:
         self.step("10 config path with a space", self.space_in_path)
         self.step("11 add keeps a command's flags; remove of a missing server fails", self.add_and_remove)
         self.step("12 logs", self.logs)
-        self.step("13 Enforce blocks a poisoned tool definition", self.enforce_blocks_poisoned_tool)
+        self.step("13 Enforce blocks a poisoned tool definition where detections block", self.enforce_blocks_poisoned_tool)
         self.step("14 Observe reports a poisoned tool definition", self.observe_reports_poisoned_tool)
         self.step("15 three gateways share one home", self.two_gateways_one_home)
         self.step("16 a changed tool definition is reported once", self.definition_change)

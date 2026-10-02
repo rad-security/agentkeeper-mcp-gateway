@@ -110,14 +110,14 @@ func TestPoisoningCorpusReport(t *testing.T) {
 		}
 		benignFlagged++
 		hb := "no"
-		if result.HardBlock {
+		if result.Severity == "critical" {
 			hb = "YES"
 			benignHardBlocked++
 		}
 		t.Logf("[FP] name=%q rule=%s severity=%s hard_block=%s source_style=%q\n     desc: %s",
 			d.Name, result.PatternName, result.Severity, hb, d.SourceStyle, clip(d.Description, 200))
 		key := result.PatternName
-		if result.HardBlock {
+		if result.Severity == "critical" {
 			key += " (HARD BLOCK)"
 		}
 		byRule[key] = append(byRule[key], d.Name)
@@ -140,7 +140,7 @@ func TestPoisoningCorpusReport(t *testing.T) {
 			missedByTech[d.Technique] = append(missedByTech[d.Technique], d.Name)
 			t.Logf("[MISS] technique=%s name=%q expect=%s\n     def: %s",
 				d.Technique, d.Name, d.Expect, clip(reportText(d), 220))
-		case result.HardBlock:
+		case result.Severity == "critical":
 			poisonHardBlocked++
 		case d.Expect == "hard_block":
 			// a finding, but only a warning where a block was expected

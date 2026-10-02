@@ -1023,6 +1023,17 @@ func (w *definitionWalk) collect(value interface{}, depth int) {
 		sort.Strings(keys)
 		for _, key := range keys {
 			w.collect(key, depth+1)
+			if value, ok := typed[key].([]interface{}); ok && (key == "examples" || key == "example") {
+				// Sample values are quotations, not text addressed to the agent.
+				for _, item := range value {
+					if text, ok := item.(string); ok {
+						w.collect("\""+text+"\"", depth+1)
+					} else {
+						w.collect(item, depth+1)
+					}
+				}
+				continue
+			}
 			w.collect(typed[key], depth+1)
 		}
 	}
@@ -1770,13 +1781,22 @@ func applyDetectionPolicy(result detection.Result, p telemetry.SyncPolicy, local
 		if strings.EqualFold(p.Detection.SensitiveData, "block") || strings.EqualFold(local.SensitiveData, "block") {
 			result.Verdict = detection.VerdictBlock
 		}
-	case "threat", "tool_poisoning":
+	case "threat":
 		if strings.EqualFold(p.Detection.Threat, "block") || strings.EqualFold(local.Threat, "block") {
 			result.Verdict = detection.VerdictBlock
-		} else if result.HardBlock && !strings.EqualFold(local.Threat, "monitor") && !strings.EqualFold(p.Detection.Threat, "monitor") {
-			// A definition that instructs the agent is blocked without the
-			// organization opting detections into blocking. Setting the threat
-			// action to monitor, locally or for the organization, opts out.
+		}
+	case "tool_poisoning":
+		blocking := strings.EqualFold(p.Detection.Threat, "block") || strings.EqualFold(local.Threat, "block")
+		monitoring := strings.EqualFold(p.Detection.Threat, "monitor") || strings.EqualFold(local.Threat, "monitor")
+		switch {
+		case blocking && result.Severity == "critical":
+			// Wording was judged, so a definition is blocked for it only
+			// where detections are set to block, and only on a critical
+			// finding: one suspicious trait is what ordinary tools have.
+			result.Verdict = detection.VerdictBlock
+		case result.HardBlock && !monitoring:
+			// Text that does not render is blocked without that setting.
+			// Setting the threat action to monitor opts out.
 			result.Verdict = detection.VerdictBlock
 		}
 	}

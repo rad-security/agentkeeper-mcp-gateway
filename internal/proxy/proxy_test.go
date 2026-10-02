@@ -599,6 +599,7 @@ func TestApplyDetectionPolicyEscalatesConfiguredDetectorBlocks(t *testing.T) {
 	poisoning := applyDetectionPolicy(detection.Result{
 		Verdict:  detection.VerdictWarn,
 		Category: "tool_poisoning",
+		Severity: "critical",
 	}, telemetry.SyncPolicy{}, telemetry.DetectionConfig{Threat: "block"})
 	if poisoning.Verdict != detection.VerdictBlock {
 		t.Fatalf("tool poisoning verdict = %s, want block", poisoning.Verdict)
