@@ -260,3 +260,29 @@ func TestOnlyInvisibleTextIsBlockedWithoutOptIn(t *testing.T) {
 		t.Fatalf("invisible payload: want critical and blocked by default, got found=%v %+v", found, hidden)
 	}
 }
+
+// Invisible text is the one finding that removes a tool without a detector
+// setting, so ordinary writing in any script must not look like it.
+func TestOrdinaryUnicodeTextIsNotHiddenText(t *testing.T) {
+	cases := map[string]string{
+		"family emoji":                 "Share an update \U0001F468\u200D\U0001F469\u200D\U0001F467\u200D\U0001F466 with the team \u2764\uFE0F\u200D\U0001F525.",
+		"rainbow flag and keycaps":     "Press 1\uFE0F\u20E3 then 2\uFE0F\u20E3. \U0001F3F3\uFE0F\u200D\U0001F308 theme available.",
+		"regional flags and skin tone": "Supported regions: \U0001F1FA\U0001F1F8 \U0001F1EF\U0001F1F5 \U0001F1E9\U0001F1EA. \U0001F44D\U0001F3FD",
+		"Arabic with direction marks":  "\u200Fابحث في قاعدة المعرفة\u200F (KB)\u200E. يدعم البحث بالعربية.",
+		"Hebrew with points":           "מַחֲזִיר אֶת מֶזֶג הָאֲוִיר לָעִיר שֶׁנִּבְחֲרָה.",
+		"Hindi with joiners":           "क्\u200Dष और र्\u200Dय जैसे संयुक्ताक्षर खोजें। ज्\u200Cञ भी समर्थित है।",
+		"Thai and Japanese":            "ค้นหาเอกสารภาษาไทย。日本語の文書も検索できます。",
+		"word joiners and soft hyphen": "Returns the part\u2060number and the Bestell\u00ADnummer for an order.",
+		"double zero-width space":      "Copied from a web page\u200B\u200B with stray characters\u200B.",
+		"byte-order mark mid-text":     "Reads a CSV.\uFEFF The first row is the header.",
+		"line and paragraph separator": "First line.\u2028Second line.\u2029Third paragraph.",
+		"combining accents":            "Re\u0301sume\u0301 parser for cafe\u0301 menus and nai\u0308ve inputs.",
+	}
+	for name, description := range cases {
+		t.Run(name, func(t *testing.T) {
+			if result, found := evaluateOne(t, ToolDescription{Name: "lookup", Description: description}); found {
+				t.Fatalf("ordinary text was flagged: %+v", result)
+			}
+		})
+	}
+}

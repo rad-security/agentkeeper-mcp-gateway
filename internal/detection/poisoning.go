@@ -410,10 +410,10 @@ func normalizeDefinition(raw string) definitionText {
 			// Embeddings and isolates: ordinary in mixed-direction text.
 			continue
 		case invisible(r):
-			// One between letters is ordinary in Persian or in an emoji; a
-			// run of them carries data.
+			// One between letters is ordinary in Persian or in an emoji, and
+			// web text carries the odd pair; a longer run carries data.
 			invisibleRun++
-			if invisibleRun >= 4 {
+			if invisibleRun >= 8 {
 				d.hidden = true
 			}
 			if previousLatin && r != 0x00AD {
