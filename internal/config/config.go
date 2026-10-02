@@ -327,7 +327,16 @@ func SavePathForGOOS(flag, systemFallback, goos string) string {
 	if flag != "" || os.Getenv(envConfigPath) != "" {
 		return resolved
 	}
-	if user := userConfigPath(); user != "" && isRuntimeOnlyConfig(systemFallback) {
+	user := userConfigPath()
+	if user == "" {
+		return resolved
+	}
+	// configure-ide with nothing to migrate writes the routing manifest and
+	// no config. That manifest keeps later saves in the profile even if the
+	// shared file has since gained Gateway settings, so the route it records
+	// can still be found and removed.
+	routedFromProfile := fileExists(filepath.Join(filepath.Dir(user), ManualRoutingManifestName))
+	if routedFromProfile || isRuntimeOnlyConfig(systemFallback) {
 		return user
 	}
 	return resolved

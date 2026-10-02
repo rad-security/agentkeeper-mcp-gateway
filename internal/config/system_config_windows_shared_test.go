@@ -157,6 +157,23 @@ func TestSavePathForGOOS_WindowsSystemLocation(t *testing.T) {
 	}
 }
 
+func TestSavePathForGOOS_StaysInTheProfileOnceRoutedFromIt(t *testing.T) {
+	// configure-ide with nothing to migrate writes the routing manifest and
+	// no config. If the shared file later gains Gateway settings (a fleet
+	// install rewrites it), the manifest must still be found where it was
+	// written, or --remove-routing refuses and the client stays routed.
+	system, homeCfg := windowsHome(t)
+	writeRaw(t, system, `{"api_key":"ak_live_example","mode":"audit","require_durable_events":true}`)
+	writeRaw(t, filepath.Join(filepath.Dir(homeCfg), "manual-routing.json"), `{}`)
+
+	if got := SavePathForGOOS("", system, "windows"); got != homeCfg {
+		t.Fatalf("SavePathForGOOS = %q, want %q", got, homeCfg)
+	}
+	if got := ResolveConfigPathForGOOS("", system, "windows"); got != system {
+		t.Fatalf("ResolveConfigPathForGOOS = %q, want %q", got, system)
+	}
+}
+
 func TestSavePathForGOOS_ExplicitSelectionIsHonoured(t *testing.T) {
 	// --config and AGENTKEEPER_CONFIG are authoritative, even when they name
 	// the shared file.
