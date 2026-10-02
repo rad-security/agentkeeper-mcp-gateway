@@ -241,6 +241,12 @@ var gatewaySettingKeys = []string{
 	"managed_runtime_socket", "managed_runtime_protocol", "credential_mode",
 }
 
+// Routing manifests the Gateway writes beside its config.
+const (
+	ManualRoutingManifestName  = "manual-routing.json"
+	ManagedRoutingManifestName = "managed-routing.json"
+)
+
 // isGatewaySystemConfig reports whether the file at the system location is
 // this Gateway's fleet config.
 //
@@ -252,9 +258,12 @@ var gatewaySettingKeys = []string{
 // configure-ide, add) fail with "Access is denied" for a developer, and
 // rewrite the runtime's config for an administrator. On Windows the file is
 // the Gateway's only when it holds a Gateway setting; the fleet installer and
-// the Gateway's own Save both write one. A file this account cannot open is
-// not its config either. A file that does not parse stays selected, so
-// loading reports the damage instead of starting from an empty config.
+// the Gateway's own Save both write one. A routing manifest beside the file
+// also keeps it selected: an earlier release routed clients from there, and
+// the routed Gateway has been running on that file's credential. A file this
+// account cannot open is not its config either. A file that does not parse
+// stays selected, so loading reports the damage instead of starting from an
+// empty config.
 func isGatewaySystemConfig(path, goos string) bool {
 	if !fileExists(path) {
 		return false
@@ -272,6 +281,11 @@ func isGatewaySystemConfig(path, goos string) bool {
 	}
 	for _, key := range gatewaySettingKeys {
 		if _, ok := keys[key]; ok {
+			return true
+		}
+	}
+	for _, manifest := range []string{ManualRoutingManifestName, ManagedRoutingManifestName} {
+		if fileExists(filepath.Join(filepath.Dir(path), manifest)) {
 			return true
 		}
 	}

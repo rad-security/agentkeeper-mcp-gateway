@@ -92,6 +92,29 @@ func TestResolveConfigPathForGOOS_WindowsSystemLocation(t *testing.T) {
 	}
 }
 
+func TestResolveConfigPathForGOOS_WindowsKeepsLocationAnEarlierGatewayRoutedFrom(t *testing.T) {
+	// An administrator who routed clients with an earlier release left the
+	// routing manifest beside the runtime's config, and the routed Gateway
+	// has been reading that config since. Moving it to a fresh per-user
+	// config would drop its credential and orphan the manifest.
+	for _, manifest := range []string{"manual-routing.json", "managed-routing.json"} {
+		t.Run(manifest, func(t *testing.T) {
+			isolateEnv(t)
+			tmp := t.TempDir()
+			home := filepath.Join(tmp, "home")
+			t.Setenv("HOME", home)
+			t.Setenv("USERPROFILE", home)
+			system := filepath.Join(tmp, "ProgramData", "AgentKeeper", "config.json")
+			writeRaw(t, system, runtimeOnlyConfig)
+			writeRaw(t, filepath.Join(filepath.Dir(system), manifest), `{}`)
+
+			if got := ResolveConfigPathForGOOS("", system, "windows"); got != system {
+				t.Fatalf("ResolveConfigPathForGOOS = %q, want %q", got, system)
+			}
+		})
+	}
+}
+
 func TestResolveConfigPathForGOOS_WindowsUnreadableSystemConfigIsSkipped(t *testing.T) {
 	// The runtime grants read access to one account. Another account on the
 	// same machine can see the file but not open it.

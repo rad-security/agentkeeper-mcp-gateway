@@ -475,7 +475,7 @@ func ManifestPath() (string, error) {
 	if path == "" {
 		return "", fmt.Errorf("gateway config path is unavailable")
 	}
-	return filepath.Join(filepath.Dir(path), "manual-routing.json"), nil
+	return filepath.Join(filepath.Dir(path), config.ManualRoutingManifestName), nil
 }
 
 func prepareRestore(state clientState) (restoreAction, error) {
