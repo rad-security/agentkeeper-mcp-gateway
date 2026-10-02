@@ -234,7 +234,7 @@ func Configure(opts ConfigureOptions) (Report, error) {
 		return report, nil
 	}
 
-	gatewayBefore, err := snapshotFile(config.CurrentConfigPath())
+	gatewayBefore, err := snapshotFile(config.SavePath())
 	if err != nil {
 		return report, err
 	}
@@ -384,7 +384,7 @@ func Remove(opts RemoveOptions) (Report, error) {
 		return report, nil
 	}
 
-	gatewayBefore, err := snapshotFile(config.CurrentConfigPath())
+	gatewayBefore, err := snapshotFile(config.SavePath())
 	if err != nil {
 		return report, err
 	}
@@ -471,7 +471,7 @@ func Remove(opts RemoveOptions) (Report, error) {
 }
 
 func ManifestPath() (string, error) {
-	path := strings.TrimSpace(config.CurrentConfigPath())
+	path := strings.TrimSpace(config.SavePath())
 	if path == "" {
 		return "", fmt.Errorf("gateway config path is unavailable")
 	}

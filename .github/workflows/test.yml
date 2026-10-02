@@ -37,6 +37,9 @@ jobs:
           go-version: "1.23.3"
       - run: go build -o agentkeeper-mcp-gateway${{ matrix.exe }} .
       - run: ${{ matrix.python }} scripts/smoke/smoke.py ./agentkeeper-mcp-gateway${{ matrix.exe }}
+        env:
+          # Windows only: also run the step that writes the shared system config.
+          GATEWAY_SMOKE_SHARED_CONFIG: ${{ matrix.os == 'windows-latest' && '1' || '' }}
 
   # The unit tests that hold on Windows. The other packages' tests assume Unix
   # file modes, shell fixtures or $HOME, and are covered there by the smoke job.
@@ -57,4 +60,4 @@ jobs:
       # for both platforms run here.
       - run: >-
           go test -timeout 5m ./internal/config/ ./internal/auth/
-          -run "TestResolveConfigPathForGOOS|TestSaveAPIKey_WindowsRuntimeConfigIsLeftAlone|TestBrowserCommand"
+          -run "TestResolveConfigPathForGOOS|TestSavePathForGOOS|TestSaveAPIKey_Windows|TestAddServer_Windows|TestBrowserCommand"

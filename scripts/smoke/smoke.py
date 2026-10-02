@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
-"""End-to-end smoke test for a built agentkeeper-mcp-gateway binary.
+r"""End-to-end smoke test for a built agentkeeper-mcp-gateway binary.
 
     python3 scripts/smoke/smoke.py path/to/agentkeeper-mcp-gateway[.exe]
 
 The same script runs on Linux, macOS and Windows with only the standard
 library. Every child process gets a throwaway home directory: nothing reads
 or writes the real one, and nothing touches the network.
+
+One step is opt-in because it leaves the home directory. On Windows, with
+GATEWAY_SMOKE_SHARED_CONFIG=1, it writes a config shaped like the AgentKeeper
+runtime's to C:\ProgramData\AgentKeeper\config.json, the system location the
+binary reads, and removes it afterwards. It refuses to run where that file
+already exists. CI sets the variable on its Windows runner.
 
 The binary must keep its release name (agentkeeper-mcp-gateway, plus .exe on
 Windows): configure-ide only writes its own absolute path when it recognises
@@ -32,6 +38,8 @@ GATEWAY_ENTRY = "agentkeeper-mcp-gateway"
 SECRET = "AKIAIOSFODNN7EXAMPLE"  # the documented AWS example key, not a credential
 BIG_INT = 9007199254740993  # 2**53 + 1, which a float64 cannot represent
 TIMEOUT = 30  # seconds; every wait is bounded so a hang fails a step, not CI
+# internal/config WindowsSystemConfigPath, shared with the AgentKeeper runtime.
+SHARED_CONFIG = Path(r"C:\ProgramData\AgentKeeper\config.json")
 # A definition that instructs the agent: read a key, pass it along, keep quiet.
 POISONED_TOOL = {
     "name": "get_weather",
@@ -475,6 +483,53 @@ class Smoke:
         expect(len(changed()) == 1, "the change was reported again: %s" % changed())
         return "reported once, for echo, on the session after the change"
 
+    def beside_the_runtime_config(self):
+        expect(not SHARED_CONFIG.exists(), "%s already exists; not touching it" % SHARED_CONFIG)
+        made_dir = not SHARED_CONFIG.parent.exists()
+        home = self.home.parent / "beside runtime"
+        state = home / ".config" / "agentkeeper-mcp-gateway"
+        home.mkdir()
+        env = dict(self.env)
+        env.update({"HOME": str(home), "USERPROFILE": str(home),
+                    "XDG_CONFIG_HOME": str(home / ".config"),
+                    "APPDATA": str(home / "AppData" / "Roaming"),
+                    "LOCALAPPDATA": str(home / "AppData" / "Local")})
+
+        def run(*args):
+            done = subprocess.run([self.binary] + list(args), env=env, cwd=str(home),
+                                  stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, timeout=2 * TIMEOUT)
+            text = (done.stdout + done.stderr).decode("utf-8", "replace")
+            expect(done.returncode == 0, "`%s` exited %d: %s" % (" ".join(args), done.returncode, text.strip()))
+            return done.stdout.decode("utf-8", "replace")
+
+        # The placeholder key is one the Gateway treats as absent, so it stays
+        # off the network.
+        runtime = json.dumps({"api_key": "ak_live_YOUR_KEY", "api_url": "https://www.agentkeeper.dev",
+                              "machine_id": "winmg:0123456789abcdef0123456789abcdef",
+                              "platform": "windows"}, indent=2).encode("utf-8")
+        SHARED_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+        SHARED_CONFIG.write_bytes(runtime)
+        try:
+            # Nothing to migrate, so this writes Cursor's config and the
+            # routing manifest and no Gateway config.
+            run("configure-ide", "--ide=cursor")
+            expect((state / "manual-routing.json").is_file(), "no routing manifest in the developer's profile")
+            run("add", "notes-cli", "npx", "-y", "example-notes-server")
+            listed = [server["name"] for server in json.loads(run("list", "--json"))]
+            expect(listed == ["notes-cli"], "the developer's config lists %s" % listed)
+            expect((state / "config.json").is_file(), "add did not write the developer's config")
+            report = json.loads(run("configure-ide", "--ide=cursor", "--remove-routing"))
+            expect(report.get("result") == "removed", "report is %s" % report)
+            beside = sorted(p.name for p in SHARED_CONFIG.parent.iterdir())
+            expect(beside == ["config.json"], "the Gateway wrote beside the runtime's config: %s" % beside)
+            expect(SHARED_CONFIG.read_bytes() == runtime, "the runtime's config was rewritten")
+        finally:
+            SHARED_CONFIG.unlink()
+            if made_dir:
+                shutil.rmtree(str(SHARED_CONFIG.parent), ignore_errors=True)
+        return "manifest and config in the developer's profile; the runtime's file byte-identical"
+
     def main(self):
         self.step("1 version", self.version)
         self.step("2 config with one stdio upstream", self.write_config)
@@ -495,6 +550,8 @@ class Smoke:
         self.step("14 Observe reports a poisoned tool definition", self.observe_reports_poisoned_tool)
         self.step("15 three gateways share one home", self.two_gateways_one_home)
         self.step("16 a changed tool definition is reported once", self.definition_change)
+        if os.name == "nt" and os.environ.get("GATEWAY_SMOKE_SHARED_CONFIG") == "1":
+            self.step("17 a developer's commands beside the runtime's shared config", self.beside_the_runtime_config)
 
     def close(self):
         for server in [self.server] + self.extra:

@@ -344,7 +344,7 @@ func rawIDEEntry(entry config.ServerEntry) json.RawMessage {
 }
 
 func managedManifestPath() (string, error) {
-	path := config.CurrentConfigPath()
+	path := config.SavePath()
 	if strings.TrimSpace(path) == "" {
 		return "", fmt.Errorf("gateway config path is unavailable")
 	}

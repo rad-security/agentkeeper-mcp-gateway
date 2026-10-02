@@ -182,9 +182,11 @@ func HasUsableAPIKey(apiKey string) bool {
 //  2. $AGENTKEEPER_CONFIG
 //  3. $XDG_CONFIG_HOME/agentkeeper-mcp-gateway/config.json  (if file exists)
 //  4. ~/.config/agentkeeper-mcp-gateway/config.json          (if file exists)
-//  5. systemFallback (typically SystemConfigPath)           (if it is the
-//     Gateway's fleet config; see isGatewaySystemConfig)
+//  5. systemFallback (typically SystemConfigPath)           (if file exists)
 //  6. fallback to ~/.config/... (used for writes when nothing exists yet)
+//
+// This is the path the Gateway reads. Save writes to SavePath, which differs
+// in one case on Windows.
 func ResolveConfigPath(flag, systemFallback string) string {
 	return ResolveConfigPathForGOOS(flag, systemFallback, runtime.GOOS)
 }
@@ -206,15 +208,12 @@ func ResolveConfigPathForGOOS(flag, systemFallback, goos string) string {
 		}
 	}
 
-	homeCfg := ""
-	if home, err := os.UserHomeDir(); err == nil {
-		homeCfg = filepath.Join(home, ".config", "agentkeeper-mcp-gateway", "config.json")
-		if fileExists(homeCfg) {
-			return homeCfg
-		}
+	homeCfg := userConfigPath()
+	if homeCfg != "" && fileExists(homeCfg) {
+		return homeCfg
 	}
 
-	if systemFallback != "" && isGatewaySystemConfig(systemFallback, goos) {
+	if systemFallback != "" && systemConfigReadable(systemFallback, goos) {
 		return systemFallback
 	}
 
@@ -231,14 +230,33 @@ func fileExists(path string) bool {
 	return err == nil && !info.IsDir()
 }
 
-// gatewaySettingKeys are the config keys only the Gateway reads. api_key and
-// api_url are left out: the AgentKeeper runtime stores its own under the same
-// names.
-var gatewaySettingKeys = []string{
-	"mode", "verbose", "log_path",
-	"require_durable_events", "event_queue_max_events", "event_queue_max_bytes",
-	"detection", "servers",
-	"managed_runtime_socket", "managed_runtime_protocol", "credential_mode",
+// userConfigPath is the developer's own config, or "" when the home
+// directory is unknown.
+func userConfigPath() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".config", "agentkeeper-mcp-gateway", "config.json")
+}
+
+// systemConfigReadable reports whether the system config applies to this
+// account. On Windows the AgentKeeper runtime grants read access to one
+// account; another account on the machine can see the file but not open it,
+// and is better served by its own config than by an error on every command.
+func systemConfigReadable(path, goos string) bool {
+	if !fileExists(path) {
+		return false
+	}
+	if goos != "windows" {
+		return true
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	_ = file.Close()
+	return true
 }
 
 // Routing manifests the Gateway writes beside its config.
@@ -247,49 +265,79 @@ const (
 	ManagedRoutingManifestName = "managed-routing.json"
 )
 
-// isGatewaySystemConfig reports whether the file at the system location is
-// this Gateway's fleet config.
-//
-// /etc/agentkeeper-mcp-gateway holds nothing else, so there the file's
-// existence is the answer. The Windows location is shared: the AgentKeeper
-// runtime writes its own config.json to C:\ProgramData\AgentKeeper on every
-// install, readable by the developer and writable only by administrators.
-// Selecting that file made every command that saves (auth login,
-// configure-ide, add) fail with "Access is denied" for a developer, and
-// rewrite the runtime's config for an administrator. On Windows the file is
-// the Gateway's only when it holds a Gateway setting; the fleet installer and
-// the Gateway's own Save both write one. A routing manifest beside the file
-// also keeps it selected: an earlier release routed clients from there, and
-// the routed Gateway has been running on that file's credential. A file this
-// account cannot open is not its config either. A file that does not parse
-// stays selected, so loading reports the damage instead of starting from an
-// empty config.
-func isGatewaySystemConfig(path, goos string) bool {
-	if !fileExists(path) {
-		return false
-	}
-	if goos != "windows" {
-		return true
-	}
+// gatewaySettingKeys are the config keys only the Gateway reads, lower-cased.
+// api_key and api_url are left out: the AgentKeeper runtime stores its own
+// under the same names.
+var gatewaySettingKeys = map[string]bool{
+	"mode": true, "verbose": true, "log_path": true,
+	"require_durable_events": true, "event_queue_max_events": true, "event_queue_max_bytes": true,
+	"detection": true, "servers": true,
+	"managed_runtime_socket": true, "managed_runtime_protocol": true, "credential_mode": true,
+}
+
+// isRuntimeOnlyConfig reports whether the file at the Windows system location
+// is the AgentKeeper runtime's config and nothing the Gateway has written to:
+// it parses, holds no Gateway setting, and has no routing manifest beside it.
+// A manifest there is an administrator's routing from an earlier release,
+// which keeps its config and manifest together.
+func isRuntimeOnlyConfig(path string) bool {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return false
 	}
 	var keys map[string]json.RawMessage
 	if err := json.Unmarshal(stripUTF8BOM(data), &keys); err != nil {
-		return true
+		return false
 	}
-	for _, key := range gatewaySettingKeys {
-		if _, ok := keys[key]; ok {
-			return true
+	for key := range keys {
+		// encoding/json matches field names without regard to case.
+		if gatewaySettingKeys[strings.ToLower(key)] {
+			return false
 		}
 	}
 	for _, manifest := range []string{ManualRoutingManifestName, ManagedRoutingManifestName} {
 		if fileExists(filepath.Join(filepath.Dir(path), manifest)) {
-			return true
+			return false
 		}
 	}
-	return false
+	return true
+}
+
+// SavePathForGOOS is where Save writes for the given resolution inputs: the
+// resolved config path, except in one case.
+//
+// The Windows system location is shared. The AgentKeeper runtime keeps its
+// own config.json in C:\ProgramData\AgentKeeper, readable by the developer
+// and writable only by administrators, and a Gateway installed beside it
+// reads that file for its credential. Saving there failed for a developer
+// ("Access is denied" from auth login, configure-ide and add) and, for an
+// administrator, replaced the runtime's config with the Gateway's. When the
+// resolved config is that runtime file, and it was not named by --config or
+// AGENTKEEPER_CONFIG, the Gateway saves the developer's own config instead.
+// It starts from what was loaded, so it keeps the credential and API URL the
+// Gateway was running on, and from then on it is the config that resolves.
+//
+// A system config that holds Gateway settings is a fleet config. Saving
+// beside it is unchanged on every platform.
+func SavePathForGOOS(flag, systemFallback, goos string) string {
+	resolved := ResolveConfigPathForGOOS(flag, systemFallback, goos)
+	if goos != "windows" || resolved != systemFallback {
+		return resolved
+	}
+	if flag != "" || os.Getenv(envConfigPath) != "" {
+		return resolved
+	}
+	if user := userConfigPath(); user != "" && isRuntimeOnlyConfig(systemFallback) {
+		return user
+	}
+	return resolved
+}
+
+// SavePath is where Save writes. Files the Gateway keeps beside its config
+// and writes during a save (the manual routing manifest) belong beside it.
+func SavePath() string {
+	system, goos := systemConfigLocation()
+	return SavePathForGOOS(pathOverride, system, goos)
 }
 
 func stripUTF8BOM(data []byte) []byte {
@@ -363,12 +411,12 @@ func Load() (Config, error) {
 	return LoadWithPath(CurrentConfigPath())
 }
 
-// Save writes cfg to the resolved config path, creating the parent directory
-// if needed. In a fleet deploy where the resolved path is /etc/..., a non-root
-// developer will get EACCES — that is intentional. The fix is to re-render
-// via the config-management tool, not to silently write to a different path.
+// Save writes cfg to SavePath, creating the parent directory if needed. In a
+// fleet deploy where the resolved path is /etc/..., a non-root developer will
+// get EACCES — that is intentional. The fix is to re-render via the
+// config-management tool, not to silently write to a different path.
 func Save(cfg Config) error {
-	path := CurrentConfigPath()
+	path := SavePath()
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}

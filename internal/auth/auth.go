@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	neturl "net/url"
 	"os/exec"
 	"runtime"
 	"time"
@@ -163,7 +164,13 @@ func openBrowser(url string) {
 }
 
 // browserCommand picks the command that opens url in the default browser.
+// The URL comes from the server, and the operating system's opener launches
+// whatever handler its argument names, so only a web page is passed on.
 func browserCommand(goos string, available func(string) bool, url string) (string, []string, bool) {
+	parsed, err := neturl.Parse(url)
+	if err != nil || parsed.Host == "" || (parsed.Scheme != "https" && parsed.Scheme != "http") {
+		return "", nil, false
+	}
 	switch {
 	case goos == "windows":
 		// Not "cmd /c start": cmd reads the "&" in a query string as a

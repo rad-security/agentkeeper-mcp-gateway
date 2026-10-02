@@ -68,6 +68,27 @@ func TestBrowserCommand(t *testing.T) {
 		},
 	}
 
+	// The URL comes from the server. Only a web page is handed to the
+	// operating system's opener, which would otherwise launch whatever
+	// handler a file path or another scheme names.
+	for _, unsafe := range []string{
+		`\\files.example.test\share\run.exe`,
+		"file:///C:/Windows/System32/calc.exe",
+		"ms-settings:display",
+		"javascript:alert(1)",
+		"C:\\Windows\\System32\\calc.exe",
+		"",
+	} {
+		for _, goos := range []string{"windows", "darwin", "linux"} {
+			if name, args, ok := browserCommand(goos, has("open", "xdg-open"), unsafe); ok {
+				t.Fatalf("browserCommand(%s, %q) = (%q, %q), want no command", goos, unsafe, name, args)
+			}
+		}
+	}
+	if _, _, ok := browserCommand("windows", has(), "http://localhost:3000/auth/device?code=ABCD-1234"); !ok {
+		t.Fatalf("a local development URL over http must still open")
+	}
+
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			name, args, ok := browserCommand(tc.goos, tc.available, url)
