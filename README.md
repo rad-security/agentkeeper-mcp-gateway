@@ -77,7 +77,7 @@ Important directories:
 cmd/                       Cobra CLI commands
 internal/config/           Config path resolution and env overrides
 internal/detection/        Threat and sensitive-data detection
-internal/ideconfig/        Claude/Cursor IDE config rewrites
+internal/ideconfig/        MCP client config rewrites (Claude, Cursor, Windsurf, Gemini CLI, Antigravity, Kiro)
 internal/policy/           Audit/enforce policy behavior
 internal/proxy/            MCP proxy path
 internal/skillinventory/   Local skill inventory scan and check-in
@@ -167,7 +167,7 @@ agentkeeper-mcp-gateway auth login|status|logout
 agentkeeper-mcp-gateway completion zsh|bash|fish
 
 # IDE integration (zero-touch)
-agentkeeper-mcp-gateway configure-ide [--dry-run] [--ide=claude-code|claude-desktop|cursor|cowork]
+agentkeeper-mcp-gateway configure-ide [--dry-run] [--ide=claude-code|claude-desktop|cursor|cowork|windsurf|gemini-cli|antigravity|kiro]
 ```
 
 ## Explicit IDE routing
@@ -182,7 +182,20 @@ agentkeeper-mcp-gateway configure-ide --remove-routing # restore every route thi
 
 For Cowork sources created after setup, run `agentkeeper-mcp-gateway cowork guard` from a login item/service, or rerun `configure-ide`. Native Cowork cloud connectors that are not represented as local MCP sources require the AgentKeeper Cowork ZIP/guardrail path; the standalone gateway can only govern MCP traffic it can route.
 
-Supports **Claude Code** (`~/.claude.json`), **Claude Desktop** (macOS + Linux), and **Cursor** (`~/.cursor/mcp.json`). Claude Code's `~/.claude/settings.json` remains a preferences/hooks file and is never treated as the user MCP route. For each detected IDE it:
+Supports **Claude Code** (`~/.claude.json`), **Claude Desktop** (macOS + Linux), and **Cursor** (`~/.cursor/mcp.json`). Claude Code's `~/.claude/settings.json` remains a preferences/hooks file and is never treated as the user MCP route.
+
+Four more clients are routed when their MCP config exists, or when named with `--ide`. Without `--ide`, no config is created for a client that has none:
+
+| `--ide` | Config |
+|---|---|
+| `windsurf` | `~/.codeium/windsurf/mcp_config.json` |
+| `gemini-cli` | `~/.gemini/settings.json` |
+| `antigravity` | `~/.gemini/antigravity/mcp_config.json` |
+| `kiro` | `~/.kiro/settings/mcp.json` |
+
+In these four, a server entry may carry `autoApprove`, `alwaysAllow`, `trust`, `timeout`, `disabled: false`, or an empty `disabledTools` or `excludeTools` list and still be routed; the Gateway has no use for those fields and rollback restores them. A server that is switched off (`disabled: true`), has tools removed, or carries any other field the Gateway does not model (`cwd`, `includeTools`, `serverUrl`, `httpUrl`) stays in the client and is listed as `keep native`.
+
+For each detected IDE it:
 
 1. Backs up the existing config under the gateway backup directory, normally `~/.config/agentkeeper-mcp-gateway/backups/`
 2. Migrates routable local MCP servers and explicit-header HTTP servers into the gateway's own config (environment variables and all)

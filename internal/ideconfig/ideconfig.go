@@ -1,10 +1,11 @@
 // Package ideconfig rewrites per-developer IDE MCP configs to route through
 // the AgentKeeper gateway.
 //
-// Scope: Claude Code, Claude Desktop, Cursor. Windsurf does not speak MCP
-// (it uses a hooks-based integration) and is intentionally out of scope.
+// Scope: Claude Code, Claude Desktop and Cursor by default, plus Windsurf,
+// Gemini CLI, Antigravity and Kiro when the developer has them (see
+// OptionalAdapters).
 //
-// All three target IDEs share the same JSON shape at the config root:
+// Every target shares the same JSON shape at the config root:
 //
 //	{
 //	  "mcpServers": { "<name>": { "command": ..., "args": [...], "env": {...} } },
@@ -59,10 +60,19 @@ type NamedServer struct {
 }
 
 // Adapter represents one IDE's MCP config location. Behavior is shared across
-// all three targets — they differ only in path.
+// all targets — they differ only in path, and in which client-only settings
+// an entry may carry and still be routed.
 type Adapter struct {
-	Name         string                 // "claude-code", "claude-desktop", "cursor"
+	Name         string                 // "claude-code", "claude-desktop", "cursor", ...
 	PathResolver func() (string, error) // returns the per-OS path for this IDE
+	// Optional adapters are routed only when the client's config file exists
+	// or the client is named with --ide, so routing "everything" never
+	// creates a config for a client the developer does not have.
+	Optional bool
+	// ClientOnlySettings names entry fields the client reads and the Gateway
+	// has no use for. A value that reports true lets the server be routed
+	// without the field; any other unknown field keeps the server native.
+	ClientOnlySettings map[string]func(json.RawMessage) bool
 }
 
 // Plan describes what Apply would do for a single IDE, in one struct so the
@@ -81,13 +91,83 @@ type Plan struct {
 	RouteRevision      string        // deterministic route identity bound to final config + artifact
 }
 
-// Adapters returns the adapters applicable on the current OS.
+// Adapters returns the adapters routed by default on the current OS.
 func Adapters() []*Adapter {
 	return []*Adapter{
 		claudeCodeAdapter(),
 		claudeDesktopAdapter(),
 		cursorAdapter(),
 	}
+}
+
+// OptionalAdapters returns the clients that keep their servers under
+// `mcpServers` in a file of their own, as Cursor does.
+func OptionalAdapters() []*Adapter {
+	return []*Adapter{
+		homeFileAdapter("windsurf", ".codeium", "windsurf", "mcp_config.json"),
+		homeFileAdapter("gemini-cli", ".gemini", "settings.json"),
+		homeFileAdapter("antigravity", ".gemini", "antigravity", "mcp_config.json"),
+		homeFileAdapter("kiro", ".kiro", "settings", "mcp.json"),
+	}
+}
+
+// AllAdapters returns every adapter --ide can name.
+func AllAdapters() []*Adapter {
+	return append(Adapters(), OptionalAdapters()...)
+}
+
+func homeFileAdapter(name string, elements ...string) *Adapter {
+	return &Adapter{
+		Name:               name,
+		Optional:           true,
+		ClientOnlySettings: clientOnlySettings,
+		PathResolver: func() (string, error) {
+			home, err := os.UserHomeDir()
+			if err != nil {
+				return "", err
+			}
+			return filepath.Join(append([]string{home}, elements...)...), nil
+		},
+	}
+}
+
+// clientOnlySettings are the entry fields Windsurf, Gemini CLI, Antigravity
+// and Kiro add beside command, args and env. Dropping one must never widen
+// what the agent can reach: an approval list or a trust flag only saves the
+// developer a prompt, while a switched-off server or a trimmed tool list is
+// a restriction, so those keep the server in the client.
+var clientOnlySettings = map[string]func(json.RawMessage) bool{
+	"disabled":      isJSONFalse,
+	"autoApprove":   anyJSON,
+	"alwaysAllow":   anyJSON,
+	"trust":         anyJSON,
+	"timeout":       anyJSON,
+	"disabledTools": isEmptyJSONList,
+	"excludeTools":  isEmptyJSONList,
+}
+
+func anyJSON(json.RawMessage) bool { return true }
+
+func isJSONFalse(raw json.RawMessage) bool {
+	var value bool
+	return json.Unmarshal(raw, &value) == nil && !value
+}
+
+func isEmptyJSONList(raw json.RawMessage) bool {
+	var value []json.RawMessage
+	return json.Unmarshal(raw, &value) == nil && len(value) == 0
+}
+
+// keepsServerNative reports whether an entry carries a field the Gateway
+// cannot honour, so the server must stay in the client.
+func (a *Adapter) keepsServerNative(entry ServerEntry) bool {
+	for key, value := range entry.Extra {
+		droppable, known := a.ClientOnlySettings[key]
+		if !known || !droppable(value) {
+			return true
+		}
+	}
+	return false
 }
 
 func claudeCodeAdapter() *Adapter {
@@ -235,7 +315,7 @@ func (a *Adapter) Plan() (Plan, error) {
 		if name == GatewayServerName || isGatewayCommandEntry(entry) {
 			continue
 		}
-		if len(entry.Extra) > 0 || nativeauth.RequiresNativeClientAuth(entry.Type, entry.URL, entry.Headers) {
+		if a.keepsServerNative(entry) || nativeauth.RequiresNativeClientAuth(entry.Type, entry.URL, entry.Headers) {
 			p.NativeKept = append(p.NativeKept, NamedServer{Name: name, Entry: entry})
 			continue
 		}

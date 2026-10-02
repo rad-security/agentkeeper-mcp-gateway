@@ -36,6 +36,9 @@ and Cowork MCP sources), backs each one up, and rewrites the MCP server list so
 the client launches AgentKeeper Gateway. Any previously-registered MCP servers
 are migrated into the gateway's own config so no wiring is lost.
 
+Windsurf, Gemini CLI, Antigravity and Kiro are routed when their MCP config
+exists, or when named with --ide.
+
 This command is idempotent - if an IDE is already pointing at the gateway and
 nothing else, running it again is a no-op.
 
@@ -107,24 +110,27 @@ By default every detected IDE is configured. Use --ide to target just one.
 			return nil
 		}
 
-		adapters := ideconfig.Adapters()
-
-		// Filter by --ide if provided.
+		var adapters []*ideconfig.Adapter
 		if len(configureIDETarget) > 0 {
+			// --ide names any client, including one whose config is yet to exist.
 			wanted := map[string]bool{}
 			for _, t := range configureIDETarget {
 				wanted[strings.ToLower(t)] = true
 			}
-			wantsCowork := wanted[discovery.ClientCowork]
-			filtered := adapters[:0]
-			for _, a := range adapters {
+			for _, a := range ideconfig.AllAdapters() {
 				if wanted[a.Name] {
-					filtered = append(filtered, a)
+					adapters = append(adapters, a)
 				}
 			}
-			adapters = filtered
-			if len(adapters) == 0 && !wantsCowork {
-				return fmt.Errorf("no matching IDE (known: claude-code, claude-desktop, cursor, cowork)")
+			if len(adapters) == 0 && !wanted[discovery.ClientCowork] {
+				return fmt.Errorf("no matching IDE (known: %s)", strings.Join(routableClients(), ", "))
+			}
+		} else {
+			adapters = ideconfig.Adapters()
+			for _, a := range ideconfig.OptionalAdapters() {
+				if adapterConfigExists(a) {
+					adapters = append(adapters, a)
+				}
 			}
 		}
 
@@ -132,7 +138,8 @@ By default every detected IDE is configured. Use --ide to target just one.
 			// Without --ide, restore everything this command can route.
 			clients := configureIDETarget
 			if len(clients) == 0 {
-				clients = []string{discovery.ClientClaudeCode, discovery.ClientClaudeDesktop, discovery.ClientCursor, discovery.ClientCowork}
+				clients = routableClients()
+				adapters = ideconfig.AllAdapters()
 			}
 			report, err := manualrouting.Remove(manualrouting.RemoveOptions{Adapters: adapters, Clients: clients, DryRun: configureIDEDryRun})
 			if err != nil {
@@ -282,6 +289,13 @@ func renderCommand(e ideconfig.ServerEntry) string {
 		return e.URL
 	}
 	if e.Command == "" {
+		// Windsurf and Antigravity write serverUrl, Gemini CLI httpUrl.
+		for _, key := range []string{"serverUrl", "httpUrl"} {
+			var address string
+			if json.Unmarshal(e.Extra[key], &address) == nil && address != "" {
+				return address
+			}
+		}
 		return "(empty command)"
 	}
 	if len(e.Args) == 0 {
@@ -403,9 +417,33 @@ func printMigrationPlan(out interface {
 	}
 }
 
+// routableClients lists every value --ide accepts.
+func routableClients() []string {
+	clients := []string{}
+	for _, a := range ideconfig.Adapters() {
+		clients = append(clients, a.Name)
+	}
+	clients = append(clients, discovery.ClientCowork)
+	for _, a := range ideconfig.OptionalAdapters() {
+		clients = append(clients, a.Name)
+	}
+	return clients
+}
+
+// adapterConfigExists reports whether the client's MCP config is a file on
+// this workstation.
+func adapterConfigExists(a *ideconfig.Adapter) bool {
+	path, err := a.PathResolver()
+	if err != nil {
+		return false
+	}
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir()
+}
+
 func init() {
 	configureIDECmd.Flags().BoolVar(&configureIDEDryRun, "dry-run", false, "Preview changes without writing any files")
-	configureIDECmd.Flags().StringSliceVar(&configureIDETarget, "ide", nil, "Restrict to a specific MCP client (claude-code, claude-desktop, cursor, cowork). Repeatable.")
+	configureIDECmd.Flags().StringSliceVar(&configureIDETarget, "ide", nil, "Restrict to a specific MCP client ("+strings.Join(routableClients(), ", ")+"). Repeatable.")
 	configureIDECmd.Flags().StringVar(&configureIDECWD, "cwd", "", "Project directory for Claude Code project-scoped MCP migration")
 	configureIDECmd.Flags().StringVar(&configureIDEScope, "scope", "", "MCP scope to configure (project for Claude Code .mcp.json)")
 	configureIDECmd.Flags().BoolVar(&configureIDEJSON, "json", false, "Emit JSON for project-scoped migration")
