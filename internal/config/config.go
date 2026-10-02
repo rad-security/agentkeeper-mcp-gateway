@@ -138,8 +138,15 @@ func DefaultSystemConfigPath() string {
 	return DefaultSystemConfigPathForGOOS(runtime.GOOS)
 }
 
+// systemConfigLocation returns the system config path and the operating
+// system whose rules apply to it. Tests replace it.
+var systemConfigLocation = func() (string, string) {
+	return DefaultSystemConfigPath(), runtime.GOOS
+}
+
 func CurrentConfigPath() string {
-	return ResolveConfigPath(pathOverride, DefaultSystemConfigPath())
+	system, goos := systemConfigLocation()
+	return ResolveConfigPathForGOOS(pathOverride, system, goos)
 }
 
 // DefaultConfig returns the default configuration.
@@ -175,9 +182,16 @@ func HasUsableAPIKey(apiKey string) bool {
 //  2. $AGENTKEEPER_CONFIG
 //  3. $XDG_CONFIG_HOME/agentkeeper-mcp-gateway/config.json  (if file exists)
 //  4. ~/.config/agentkeeper-mcp-gateway/config.json          (if file exists)
-//  5. systemFallback (typically SystemConfigPath)           (if file exists)
+//  5. systemFallback (typically SystemConfigPath)           (if it is the
+//     Gateway's fleet config; see isGatewaySystemConfig)
 //  6. fallback to ~/.config/... (used for writes when nothing exists yet)
 func ResolveConfigPath(flag, systemFallback string) string {
+	return ResolveConfigPathForGOOS(flag, systemFallback, runtime.GOOS)
+}
+
+// ResolveConfigPathForGOOS is ResolveConfigPath with the operating system
+// whose rules apply to systemFallback stated by the caller.
+func ResolveConfigPathForGOOS(flag, systemFallback, goos string) string {
 	if flag != "" {
 		return flag
 	}
@@ -200,7 +214,7 @@ func ResolveConfigPath(flag, systemFallback string) string {
 		}
 	}
 
-	if systemFallback != "" && fileExists(systemFallback) {
+	if systemFallback != "" && isGatewaySystemConfig(systemFallback, goos) {
 		return systemFallback
 	}
 
@@ -215,6 +229,53 @@ func ResolveConfigPath(flag, systemFallback string) string {
 func fileExists(path string) bool {
 	info, err := os.Stat(path)
 	return err == nil && !info.IsDir()
+}
+
+// gatewaySettingKeys are the config keys only the Gateway reads. api_key and
+// api_url are left out: the AgentKeeper runtime stores its own under the same
+// names.
+var gatewaySettingKeys = []string{
+	"mode", "verbose", "log_path",
+	"require_durable_events", "event_queue_max_events", "event_queue_max_bytes",
+	"detection", "servers",
+	"managed_runtime_socket", "managed_runtime_protocol", "credential_mode",
+}
+
+// isGatewaySystemConfig reports whether the file at the system location is
+// this Gateway's fleet config.
+//
+// /etc/agentkeeper-mcp-gateway holds nothing else, so there the file's
+// existence is the answer. The Windows location is shared: the AgentKeeper
+// runtime writes its own config.json to C:\ProgramData\AgentKeeper on every
+// install, readable by the developer and writable only by administrators.
+// Selecting that file made every command that saves (auth login,
+// configure-ide, add) fail with "Access is denied" for a developer, and
+// rewrite the runtime's config for an administrator. On Windows the file is
+// the Gateway's only when it holds a Gateway setting; the fleet installer and
+// the Gateway's own Save both write one. A file this account cannot open is
+// not its config either. A file that does not parse stays selected, so
+// loading reports the damage instead of starting from an empty config.
+func isGatewaySystemConfig(path, goos string) bool {
+	if !fileExists(path) {
+		return false
+	}
+	if goos != "windows" {
+		return true
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	var keys map[string]json.RawMessage
+	if err := json.Unmarshal(stripUTF8BOM(data), &keys); err != nil {
+		return true
+	}
+	for _, key := range gatewaySettingKeys {
+		if _, ok := keys[key]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 func stripUTF8BOM(data []byte) []byte {
@@ -282,10 +343,10 @@ func LoadWithSource(path string) (LoadResult, error) {
 }
 
 // Load reads configuration using the resolved path (--config / env / XDG /
-// home / /etc / default fallback). Preserves the legacy signature so existing
+// home / system / default fallback). Preserves the legacy signature so existing
 // callers (cmd/*, internal/auth) need no changes.
 func Load() (Config, error) {
-	return LoadWithPath(ResolveConfigPath(pathOverride, DefaultSystemConfigPath()))
+	return LoadWithPath(CurrentConfigPath())
 }
 
 // Save writes cfg to the resolved config path, creating the parent directory
@@ -293,7 +354,7 @@ func Load() (Config, error) {
 // developer will get EACCES — that is intentional. The fix is to re-render
 // via the config-management tool, not to silently write to a different path.
 func Save(cfg Config) error {
-	path := ResolveConfigPath(pathOverride, DefaultSystemConfigPath())
+	path := CurrentConfigPath()
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
