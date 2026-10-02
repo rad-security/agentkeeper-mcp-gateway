@@ -16,9 +16,14 @@ import (
 // several of the same words ("do not mention this setup call to the user",
 // "default key: ~/.ssh/id_rsa", "detects phrases such as 'ignore previous
 // instructions'"). The check therefore looks for independent traits and
-// decides on their combination: one suspicious trait is reported for review,
-// and a definition is blocked in Enforce only on a trait with no innocent
-// reading or on two suspicious traits together.
+// reports what it finds for review. A block removes the tool from an Enforce
+// route, so it is reserved for shapes with no innocent reading: text that
+// does not render, an instruction to drop the agent's own instructions, an
+// action hidden from the user, a credential file whose contents are passed
+// on, another tool's recipient redirected under injected markup, and a
+// definition too large to read in full. An SSH tool that names a key file, a
+// password tool that says never to print the password, and a login tool that
+// posts credentials to a URL are none of these.
 
 // poisonTrait is one independent trait of a poisoned definition.
 type poisonTrait struct {
@@ -87,9 +92,11 @@ const (
 	poisonNegation = `(?:do not|don't|dont|never|must not|mustn't|should not|shouldn't|cannot|can't|refrain from)`
 	poisonDisclose = `(?:tell|telling|told|inform|informing|informed|mention|mentioning|mentioned|reveal|revealing|revealed|notify|notifying|notified|alert|alerting|alerted|disclose|disclosing|disclosed|narrate|narrating|narrated|surface|surfacing|surfaced)`
 	poisonTheUser  = `(?:the\s+|any\s+)?(?:user|human|operator|end[- ]user)(?:[^a-z']|$)`
-	// Credential stores on the workstation. Reading one of these and passing
-	// it on has no innocent reading.
-	poisonCredentialStore = `(?:\.ssh\b|\bid_(?:rsa|ed25519|ecdsa|dsa)\b|\.aws/(?:credentials|config)|\.npmrc\b|\.netrc\b|\.pypirc\b|\.git-credentials\b|\.kube/config|\.docker/config\.json|\.gnupg\b|/etc/(?:passwd|shadow|sudoers)\b|\bmcp\.json\b|claude_desktop_config|\.claude\.json\b|\bkeychain\b|\bcredentials\.json\b|\bwallet\.dat\b|\.(?:bash|zsh)_history\b)`
+	// Credential files on the workstation.
+	poisonCredentialFile = `(?:\.ssh\b|\bid_(?:rsa|ed25519|ecdsa|dsa)\b|\.aws/(?:credentials|config)|\.npmrc\b|\.netrc\b|\.pypirc\b|\.git-credentials\b|\.kube/config|\.docker/config\.json|\.gnupg\b|/etc/(?:passwd|shadow|sudoers)\b|\bmcp\.json\b|claude_desktop_config|\.claude\.json\b|\bcredentials\.(?:json|db)\b|\.config/gcloud\b|\bwallet\.dat\b|\.(?:bash|zsh)_history\b)`
+	// Credential stores: those files, and the system keychain, which password
+	// tools name as an API.
+	poisonCredentialStore = `(?:` + poisonCredentialFile + `|\bkeychain\b)`
 	// Agent context and secrets that ordinary definitions also name. Moving
 	// these counts only when the definition also sends them somewhere or
 	// hides it.
@@ -99,9 +106,18 @@ const (
 	// "mcp.json") does not end the sentence.
 	poisonSameSentence = `(?:[^.!?]|[.]\S)`
 	// "Never reveal the password to the user" protects a secret; it does not
-	// hide an action. The object of the verb decides which it is.
-	poisonProtectsSecret = poisonDisclose + `\s+(?:(?:the|any|a|an|this|that|these|those|its|their|raw|actual|real|full|stored|retrieved|plaintext|plain[- ]text)\s+){0,3}(?:\w+\s+)?(?:passwords?|passphrases?|secrets?|tokens?|keys?|credentials?|pins?|codes?|values?|numbers?|ssn|pii)\b`
-	poisonReadVerb       = `\b(?:read|open|cat|load|fetch|retrieve|access|grab|dump|collect|copy|upload|send|sends|post|include|attach|append|submit|forward)\b`
+	// hide an action. The secret has to be the whole object: "do not mention
+	// the token exchange to the user" hides an action.
+	poisonSecretNoun     = `(?:passwords?|passphrases?|secrets?|tokens?|api[ _-]?keys?|keys?|credentials?|pins?|codes?|values?|numbers?|connection strings?|ssn|pii)`
+	poisonSecretArticle  = `(?:(?:the|any|a|an|this|that|these|those|its|their|raw|actual|real|full|stored|retrieved|plaintext|plain[- ]text)\s+){0,3}`
+	poisonUserNoun       = `(?:the\s+|any\s+)?(?:user|human|operator|end[- ]user)`
+	poisonProtectsSecret = poisonDisclose + `\s+` + poisonSecretArticle + poisonSecretNoun + `\s+(?:to|with)\s+` + poisonUserNoun +
+		`|(?:reveal|revealing|disclose|disclosing)\s+(?:it|them)\s+(?:to|with)\s+` + poisonUserNoun
+	// "Never reveal it", after naming a secret, is the same protection.
+	poisonProtectsPronoun = `(?:reveal|revealing|disclose|disclosing)\s+(?:about\s+)?(?:it|them|these|those)\b`
+	poisonReadVerb        = `\b(?:read|open|cat|load|fetch|retrieve|access|grab|dump|collect|copy|upload|send|sends|post|include|attach|append|submit|forward)\b`
+	// The contents of something just named, handed to a parameter or an address.
+	poisonPassesContents = `\b(?:pass|include|send|resend|put|attach|append|add|supply|provide|submit|forward|upload|post|embed|copy)\s+(?:(?:its|their|the|that|this|file's|full)\s+){0,2}(?:contents?|it|them|keys?|file|value|text|data)\b` + poisonSameSentence + `{0,40}?\b(?:as|in|into|to|via|through|inside|within|using|with)\s+(?:the\s+|a\s+|an\s+|this\s+|its\s+|each\s+|every\s+|your\s+|all\s+)?(?:['"` + "`" + `]|(?:https?|s3|gs|ftp)://|[a-z0-9._%+-]+@|(?:requests?|calls?|messages?|payload|body|headers?)\b)`
 )
 
 func compileToolPoisoningTraits() []poisonTrait {
@@ -110,17 +126,20 @@ func compileToolPoisoningTraits() []poisonTrait {
 	}
 	return []poisonTrait{
 		// Instruction override: what an agent is told to do with its own
-		// instructions. "Override existing rules" and "discard existing
-		// constraints" describe what a tool does to data, and "overrides the
-		// system prompt for this request" describes a model parameter, so
-		// those forms are not decisive.
-		t("override", 3, "", `\b(?:ignore|disregard|forget)\s+(?:(?:all|any|every|the|your|my|these|those|of)\s+){0,3}(?:previous|prior|above|earlier|preceding|former|original|initial|system)\s+(?:\w+\s+){0,2}?(?:instructions?|rules?|guidelines?|prompts?|directions?|constraints?|safeguards?|restrictions?|guardrails?)\b`),
-		t("override", 3, "", `\b(?:override|discard)\s+(?:(?:all|any|every|the|your|my|these|those|of)\s+){0,3}(?:previous|prior|above|earlier|preceding|former)\s+(?:\w+\s+){0,2}?(?:instructions?|guidelines?|prompts?|directions?|safeguards?|restrictions?|guardrails?)\b`),
+		// instructions. "Override existing rules", "discard existing
+		// constraints" and "ignore existing rules" describe what a tool does to
+		// data, and "overrides the system prompt for this request" describes a
+		// model parameter, so those forms are not decisive.
+		t("override", 3, "", `\b(?:ignore|disregard|forget)\s+(?:(?:all|any|every|the|your|my|these|those|of)\s+){0,3}(?:previous|prior|above|earlier|preceding|former)\s+(?:\w+\s+){0,2}?(?:instructions?|rules?|guidelines?|prompts?|directions?|constraints?|safeguards?|restrictions?|guardrails?|policies|policy)\b`),
+		t("override", 3, "", `\b(?:ignore|disregard|forget)\s+(?:(?:all|any|every|the|your|my|these|those|of)\s+){0,3}(?:existing|original|initial|system)\s+(?:\w+\s+){0,2}?(?:instructions?|guidelines?|prompts?|directions?|safeguards?|guardrails?)\b`),
+		t("override", 3, "", `\b(?:ignore|disregard|forget)\s+(?:(?:all|any|every|the|your|my|these|those|of)\s+){0,3}system\s+(?:rules?|restrictions?)\b`),
+		t("override", 3, "", `\b(?:override|discard)\s+(?:(?:all|any|every|the|your|my|these|those|of)\s+){0,3}(?:previous|prior|above|earlier|preceding|former|existing)\s+(?:\w+\s+){0,2}?(?:instructions?|guidelines?|prompts?|directions?|safeguards?|guardrails?)\b`),
 		t("override", 3, "", `\b(?:ignore|disregard|forget|override|discard)\s+(?:all\s+(?:of\s+)?)?your\s+(?:\w+\s+){0,2}?(?:instructions?|rules?|guidelines?|prompts?|directions?|constraints?|safeguards?|restrictions?|guardrails?)\b`),
 		t("override", 3, "", `ignore previous instructions|ignore all prior|disregard your instructions`),
 		t("override", 3, "", `\b(?:forget|ignore|disregard)\s+(?:everything|anything|all)\s+(?:you\s+(?:were|have been|'ve been)\s+told|that\s+came\s+before|said\s+(?:above|before|earlier)|above|before this)\b`),
 		t("override", 3, "", `\b(?:supersedes?|overrides?|replaces?|takes? precedence over)\s+your\s+system prompt\b|\b(?:the\s+)?(?:real|true|actual)\s+instructions\s+(?:are|follow|begin)\b`),
 		t("override", 1, "", `\b(?:supersedes?|overrides?|replaces?|takes? precedence over)\s+(?:the\s+|any\s+)?system prompt\b`),
+		t("injected_instructions", 2, "", `\b(?:assistant|agent|model|ai|you)\s+must\s+(?:comply|obey)\b`),
 		// The same request in other languages. Word boundaries are ASCII-only,
 		// so these match on the phrase alone.
 		t("override", 3, "", `ignora(?:r)?\s+(?:todas\s+)?las\s+instrucciones\s+(?:anteriores|previas)|ignor(?:e|a)\s+(?:todas\s+)?as\s+instru[cç][oõ]es\s+anteriores`),
@@ -130,14 +149,14 @@ func compileToolPoisoningTraits() []poisonTrait {
 
 		// Concealment from the user.
 		{family: "concealment", weight: 2, regex: regexp.MustCompile(`\b` + poisonNegation + `\s+(?:ever\s+|even\s+|also\s+)?(?:be\s+)?` + poisonDisclose + `\b[^.!?]{0,60}?\b` + poisonTheUser), except: regexp.MustCompile(poisonProtectsSecret)},
-		t("concealment", 2, "", `\b`+poisonNegation+`\s+(?:ever\s+)?`+poisonDisclose+`\s+(?:about\s+)?(?:this|that|it|these|those|any of this|what you|the (?:call|step|steps|instruction|instructions|file|action|tool|change|request|read|fact|above))\b`),
+		{family: "concealment", weight: 2, regex: regexp.MustCompile(`\b` + poisonNegation + `\s+(?:ever\s+)?` + poisonDisclose + `\s+(?:about\s+)?(?:this|that|it|these|those|any of this|what you|the (?:call|step|steps|instruction|instructions|file|action|tool|change|request|read|fact|above))\b`), except: regexp.MustCompile(poisonProtectsPronoun)},
 		t("concealment", 2, "", `\bwithout\s+(?:telling|informing|notifying|alerting)\s+the\s+(?:user|human)(?:[^a-z']|$)`),
 		t("concealment", 2, "", `\bwithout\s+(?:the\s+)?(?:user|human)(?:'s|s)?\s+(?:knowledge|awareness|knowing|noticing|being aware)\b`),
 		t("concealment", 2, "", `\b(?:user|human)\s+(?:must|should|need|needs|does|will|can)\s*(?:not|n't)\s+(?:need to\s+)?(?:know|see|notice|be aware|be told|be informed|find out)\b`),
 		t("concealment", 2, "", `\b(?:must|should|shall|can)\s*(?:not|n't)\s+be\s+(?:shown|visible|displayed|disclosed|reported)\s+to\s+`+poisonTheUser),
 		t("concealment", 2, "", `\b(?:hide|conceal|obscure|suppress|keep)\b[^.!?]{0,40}?\b(?:from|hidden from|secret from)\s+(?:the\s+)?(?:user|human)(?:[^a-z']|$)`),
 		t("concealment", 2, "", `\b(?:silently|secretly|covertly|stealthily|quietly|discreetly)\s+(?:execute|run|call|invoke|sends?|reads?|perform|do|uploads?|forwards?|cop(?:y|ies)|posts?|transmits?|includes?|adds?)\b|\b(?:call|run|execute|invoke|do|perform)\s+(?:(?:it|this|them|that)\s+)?(?:silently|secretly|covertly|quietly)\b`),
-		t("concealment", 2, "", `\bkeep\s+(?:this|it|that)\s+(?:quiet|to yourself|under wraps)\b|\bkeep\s+(?:this|it|that)\s+(?:just\s+)?between\s+us\b|\bno need to\s+(?:bother|tell|inform|notify|alert)\s+`+poisonTheUser),
+		t("concealment", 2, "", `\bkeep\s+(?:this|it|that)\s+(?:quiet|to yourself|under wraps)\b|\bkeep\s+(?:this|it|that)\s+(?:just\s+)?between\s+us\b|\bno need to\s+(?:bother|tell|inform|notify|alert)\s+`+poisonTheUser+`|\bno need to\s+(?:ask\s+again\s+or\s+to\s+)?mention\s+(?:it|this)\b`),
 		t("concealment", 2, "", `\b(?:omit|leave|exclude|drop|strip|remove)\s+(?:this|it|that|these|those|(?:the|this|that)\s+\w+)\b[^.!?]{0,30}?\b(?:from|out of)\s+(?:your|the)\s+(?:summary|response|answer|reply|output|report|explanation)\b`),
 		t("concealment", 2, "", `\b(?:stay|stays|remain|remains|be kept|kept)\s+(?:hidden|secret|confidential|invisible)\s+from\s+(?:the\s+)?(?:user|human)(?:[^a-z']|$)`),
 		t("concealment", 2, "", `\b(?:collect|read|send|upload|copy|forward|gather|put|include)\b[^.!?]{0,160}?,?\s+(?:silently|secretly|quietly|covertly)\s*(?:[.!?]|$)`),
@@ -175,7 +194,7 @@ func compileToolPoisoningTraits() []poisonTrait {
 		t("markup", 1, "", `<\s*(?:important|system|secret|hidden|instructions?|critical|admin|override|priority)\b[^>]{0,40}>|\[\s*(?:system|admin|instructions?)\s*\]|<!--|\bagent instructions?\s*[-:]|\bnote (?:for|to) the (?:agent|assistant|model|ai)\b|\binstructions? for the (?:agent|assistant|model|ai)\b`),
 		t("secret_location", 1, "", poisonCredentialStore),
 		t("secret_location", 1, "", poisonSensitiveContext),
-		t("side_parameter", 1, "", `\b(?:pass|include|put|append|attach|embed|supply|provide|add|send|submit|collect|forward)\s+(?:[a-z0-9_'./~-]+\s+){0,6}?(?:content|contents|output|results?|text|data|values?|keys?|tokens?|credentials?|files?|history|messages?|prompt|variables|it|them)\b`+poisonSameSentence+`{0,40}?\b(?:as|in|into|to|via|through|inside|within|using)\s+(?:the\s+|a\s+|an\s+|this\s+|its\s+)?['"`+"`"+`]`),
+		t("side_parameter", 1, "", `\b(?:pass|include|put|append|attach|embed|supply|provide|add|send|submit|collect|forward)\s+(?:[a-z0-9_'./~-]+\s+){0,6}?(?:content|contents|output|results?|text|data|values?|keys?|tokens?|credentials?|files?|history|messages?|prompt|variables|it|them)\b`+poisonSameSentence+`{0,60}?\b(?:as|in|into|to|via|through|inside|within|using)\s+(?:the\s+|a\s+|an\s+|this\s+|its\s+)?['"`+"`"+`]`),
 		t("side_parameter", 1, "", `\b(?:attach|append|add|include|embed|put)\s+(?:it|them|its contents?|their contents?|the contents?)\s+(?:to|in|into|with)\s+(?:the|each|every|your|all)\s+(?:requests?|calls?|messages?|responses?|output|arguments?|payload|body|headers?|(?:[a-z_]+\s+)?(?:field|parameter|param|argument)s?)\b`),
 		t("side_parameter", 1, "", `\b(?:include|put|add|embed)\b`+poisonSameSentence+`{0,60}?\bin\s+(?:the|your|every|each)\s+(?:response|reply|answer|output|result)\b`),
 		t("cross_tool", 1, "", `\bside effect on\b|\bwhen(?:ever)?\b[^.!?]{0,80}?\b(?:is|are|gets?)\s+(?:invoked|called|used|executed|available|present)\b[^.!?]{0,20}?\b(?:must|should|make sure|ensure|always|need to|have to|instead|additionally|also)\b`),
@@ -184,13 +203,20 @@ func compileToolPoisoningTraits() []poisonTrait {
 	}
 }
 
-// Reading a credential store counts as credential access when the definition
-// also says what to do with it; "Reads ~/.ssh/config" by itself describes the
-// tool. Sensitive context needs more than a parameter to land in: ordinary
-// tools pass messages and environment variables as arguments.
+// Naming a credential store describes a tool ("Reads ~/.ssh/config"). Passing
+// the contents of a credential file to a parameter or an address in the same
+// sentence does not. Sensitive context needs more than a parameter to land
+// in: ordinary tools pass messages and environment variables as arguments.
 var (
 	poisonReadsCredentialStore  = regexp.MustCompile(poisonReadVerb + poisonSameSentence + `{0,60}?` + poisonCredentialStore)
 	poisonReadsSensitiveContext = regexp.MustCompile(poisonReadVerb + poisonSameSentence + `{0,60}?` + poisonSensitiveContext)
+	poisonPassesCredentialFile  = regexp.MustCompile(poisonReadVerb + poisonSameSentence + `{0,60}?` + poisonCredentialFile + poisonSameSentence + `{0,80}?` + poisonPassesContents +
+		`|\b(?:sends?|emails?|uploads?|posts?|forwards?|cop(?:y|ies)|transmits?)\b` + poisonSameSentence + `{0,40}?` + poisonCredentialFile + poisonSameSentence + `{0,40}?\bto\s+` + poisonDestination +
+		`|\b(?:append|attach|add|include|put|embed|pass|send|supply|provide|fill|collect|gather|copy|upload)\b` + poisonSameSentence + `{0,30}?\bcontents?\s+of\s+\S{0,12}` + poisonCredentialFile)
+	// With a request for silence, a .env file counts as a credential file too.
+	namesCredentialFile = regexp.MustCompile(poisonCredentialFile + `|(?:^|[\s/~"'` + "`" + `(])\.env\b`)
+	namesDestination    = regexp.MustCompile(poisonDestination)
+	poisonObeysDecoded  = regexp.MustCompile(`\b(?:decode|decrypt|deobfuscate|un-?base64|base64[- ]?decode|hex[- ]?decode)\b[^.!?]{0,80}?\b(?:follow|obey|carry out|act on|do what)\b`)
 )
 
 var (
@@ -214,25 +240,60 @@ var homoglyphs = map[rune]rune{
 
 type definitionText struct {
 	text      string // lower-cased, with characters that do not render removed
-	hidden    bool   // carried text that never renders
+	hidden    bool   // carried text that never renders, or reorders what is shown
+	concealed bool   // styled so that it cannot be read: concealed, or one colour on itself
 	zeroWidth int    // zero-width characters splitting Latin words
 	mixed     int    // words that mix Latin letters with look-alikes from another script
-	control   int    // stray control characters and terminal colour codes
+	control   int    // stray control characters and terminal styling codes
 }
 
-// ansiConceals reports whether a terminal escape sequence hides text: the
-// conceal attribute, or anything that moves the cursor or erases. Colour and
-// weight codes only style text.
+// ansiConceals reports whether a terminal styling sequence makes text
+// unreadable: the conceal attribute, or the same colour for text and
+// background. Other colours and weights only style text.
 func ansiConceals(sequence string) bool {
 	if !strings.HasSuffix(sequence, "m") {
-		return true
+		return false
 	}
-	for _, parameter := range strings.Split(strings.TrimSuffix(strings.TrimPrefix(sequence, "\x1b["), "m"), ";") {
-		if parameter == "8" {
+	parameters := strings.Split(strings.TrimSuffix(strings.TrimPrefix(sequence, "\x1b["), "m"), ";")
+	foreground, background := -1, -1
+	for i := 0; i < len(parameters); i++ {
+		switch value := parameters[i]; {
+		case value == "38" || value == "48":
+			// Extended colour: 38;5;n or 38;2;r;g;b. Its arguments are not attributes.
+			if i+1 < len(parameters) && parameters[i+1] == "5" {
+				i += 2
+			} else if i+1 < len(parameters) && parameters[i+1] == "2" {
+				i += 4
+			}
+		case value == "8":
 			return true
+		case len(value) == 2 && (value[0] == '3' || value[0] == '9') && value[1] >= '0' && value[1] <= '7':
+			foreground = int(value[1] - '0')
+		case len(value) == 2 && value[0] == '4' && value[1] >= '0' && value[1] <= '7':
+			background = int(value[1] - '0')
+		case len(value) == 3 && value[:2] == "10" && value[2] >= '0' && value[2] <= '7':
+			background = int(value[2] - '0')
 		}
 	}
-	return false
+	return foreground >= 0 && foreground == background
+}
+
+// flagEmojiLength returns how many characters after a black flag form a
+// subdivision flag: two to seven tag characters and the cancel tag. Anything
+// longer is text hidden behind the flag.
+func flagEmojiLength(following []rune) int {
+	for i, r := range following {
+		switch {
+		case r == 0xE007F:
+			if i >= 2 {
+				return i + 1
+			}
+			return 0
+		case r < 0xE0020 || r > 0xE007E || i >= 7:
+			return 0
+		}
+	}
+	return 0
 }
 
 // normalizeDefinition lower-cases a definition, removes characters that do not
@@ -249,7 +310,7 @@ func normalizeDefinition(raw string) definitionText {
 	if strings.Contains(raw, "\x1b") {
 		for _, sequence := range ansiEscape.FindAllString(raw, -1) {
 			if ansiConceals(sequence) {
-				d.hidden = true
+				d.concealed = true
 			} else {
 				d.control++
 			}
@@ -258,8 +319,7 @@ func normalizeDefinition(raw string) definitionText {
 	}
 	var b strings.Builder
 	b.Grow(len(raw))
-	tagCharacters := 0
-	inFlagEmoji := false
+	tagCharacters, zeroWidthRun := 0, 0
 	wordLatin, wordFolded := false, false
 	previousLatin, pendingZeroWidth := false, 0
 	endWord := func() {
@@ -279,23 +339,18 @@ func normalizeDefinition(raw string) definitionText {
 		previousLatin = latin
 		b.WriteRune(r)
 	}
-	for _, r := range raw {
-		if r == 0x1F3F4 {
-			// A subdivision flag is this character followed by tag characters.
-			inFlagEmoji = true
-			emit(r)
-			continue
-		}
-		if inFlagEmoji {
-			if r >= 0xE0020 && r <= 0xE007F {
-				if r == 0xE007F {
-					inFlagEmoji = false
-				}
-				continue
-			}
-			inFlagEmoji = false
+	runes := []rune(raw)
+	for i := 0; i < len(runes); i++ {
+		r := runes[i]
+		zeroWidth := r == 0x200B || r == 0x200C || r == 0x2060 || r == 0xFEFF || r == 0x180E
+		if !zeroWidth {
+			zeroWidthRun = 0
 		}
 		switch {
+		case r == 0x1F3F4:
+			i += flagEmojiLength(runes[i+1:])
+			emit(r)
+			continue
 		case r >= 0xE0020 && r <= 0xE007E:
 			tagCharacters++
 			emit(unicode.ToLower(r - 0xE0000))
@@ -310,7 +365,12 @@ func normalizeDefinition(raw string) definitionText {
 		case r >= 0x202A && r <= 0x202C, r >= 0x2066 && r <= 0x2069:
 			// Embeddings and isolates: ordinary in mixed-direction text.
 			continue
-		case r == 0x200B || r == 0x200C || r == 0x2060 || r == 0xFEFF || r == 0x180E:
+		case zeroWidth:
+			// One between letters is ordinary in Persian; a run carries data.
+			zeroWidthRun++
+			if zeroWidthRun >= 4 {
+				d.hidden = true
+			}
 			if previousLatin {
 				pendingZeroWidth++
 			}
@@ -408,36 +468,59 @@ func (e *Engine) evaluateToolDefinition(tool ToolDescription) (Result, bool) {
 	switch {
 	case definition.hidden:
 		note("hidden_text", 3, "")
-	case definition.zeroWidth >= 4 || definition.mixed >= 2 || paddingToHideTxt.MatchString(raw):
+	case definition.concealed || definition.zeroWidth >= 4 || definition.mixed >= 2 || paddingToHideTxt.MatchString(raw):
 		note("hidden_text", 2, "")
 	case definition.control > 0 || encodedBlob.MatchString(raw):
 		note("hidden_text", 1, "")
 	}
 	if tool.Truncated {
-		note("unscanned", 2, "")
+		// What was not read cannot be shown to an agent.
+		note("unscanned", 3, "")
 	}
-	concealed := weights["concealment"] >= 2
-	movesIt := weights["exfiltration"] > 0 || weights["concealment"] > 0
+
+	// Kept from the user: said outright, or styled so it cannot be read.
+	concealed := weights["concealment"] >= 2 || definition.concealed
+	movesIt := weights["exfiltration"] > 0 || concealed
+	readsSensitive := poisonReadsSensitiveContext.MatchString(text)
 	switch {
-	case poisonReadsCredentialStore.MatchString(text) && (movesIt || weights["side_parameter"] > 0):
-		// Reading a credential store and passing it on has no innocent reading.
+	case poisonPassesCredentialFile.MatchString(text):
+		// The contents of a credential file, handed to a parameter or an address.
 		note("credential_access", 3, "")
-	case poisonReadsSensitiveContext.MatchString(text) && movesIt:
+	case concealed && namesCredentialFile.MatchString(text):
+		// A credential file and a request for silence, in any language.
+		note("credential_access", 3, "")
+	case concealed && weights["side_parameter"] > 0 && (weights["secret_location"] > 0 || readsSensitive):
+		// Secrets passed in a parameter, and a request for silence.
+		note("credential_access", 3, "")
+	case weights["markup"] > 0 && weights["side_parameter"] > 0 && poisonReadsCredentialStore.MatchString(text):
+		// Markup that addresses the agent, telling it to fetch from a
+		// credential store and pass the result in a parameter.
+		note("credential_access", 3, "")
+	case poisonReadsCredentialStore.MatchString(text) && (movesIt || weights["side_parameter"] > 0):
+		note("credential_access", 2, "")
+	case readsSensitive && movesIt:
 		note("credential_access", 2, "")
 	case concealed && namesCredentialStore.MatchString(text):
-		// Naming a credential store and asking for silence, in any language.
-		note("credential_access", 2, "")
-	case concealed && weights["side_parameter"] > 0 && weights["secret_location"] > 0:
-		// Passing secrets in a parameter and asking for silence.
 		note("credential_access", 2, "")
 	}
 	// Sending something elsewhere, or changing what another tool does, while
-	// telling the agent to keep it from the user has no innocent reading.
-	if concealed && (weights["exfiltration"] > 0 || weights["cross_tool"] > 0 || weights["redirect"] > 0) {
+	// keeping it from the user.
+	if concealed && (weights["exfiltration"] > 0 || weights["cross_tool"] > 0 || weights["redirect"] >= 2) {
 		note("concealment", 3, "")
 	}
-	// An instruction to decode and follow, with the payload beside it.
-	if weights["encoded_instructions"] >= 2 && encodedBlob.MatchString(raw) {
+	// Another tool's messages sent to a named address, under markup that
+	// addresses the agent.
+	if weights["redirect"] >= 2 && (weights["markup"] > 0 || weights["cross_tool"] > 0) && namesDestination.MatchString(text) {
+		note("redirect", 3, "")
+	}
+	// New directives under markup that addresses the agent, telling it to
+	// drop a safety policy.
+	if weights["markup"] > 0 && weights["injected_instructions"] >= 2 && weights["bypass"] >= 2 {
+		note("bypass", 3, "")
+	}
+	// A payload the agent is told to decode and obey. Decoding input and
+	// executing it as a query is what a database tool does.
+	if weights["encoded_instructions"] >= 2 && encodedBlob.MatchString(raw) && poisonObeysDecoded.MatchString(text) {
 		note("encoded_instructions", 3, "")
 	}
 	if len(weights) == 0 {
@@ -453,10 +536,8 @@ func (e *Engine) evaluateToolDefinition(tool ToolDescription) (Result, bool) {
 			strong++
 		}
 	}
-	// One suspicious trait among ordinary wording is what a login tool or a
-	// quiet setup step looks like, so a block needs a decisive trait or two
-	// suspicious ones.
-	hardBlock := decisive > 0 || strong >= 2
+	// Suspicious traits are reported. A block needs one of the shapes above.
+	hardBlock := decisive > 0
 	if !hardBlock && strong == 0 && len(weights) < 3 {
 		return Result{}, false
 	}

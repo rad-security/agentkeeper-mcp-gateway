@@ -190,10 +190,10 @@ func TestOverrideAddressedToTheAgentStaysDecisive(t *testing.T) {
 	}
 }
 
-func TestDefinitionTooLargeToInspectIsReported(t *testing.T) {
+func TestDefinitionTooLargeToInspectIsBlocked(t *testing.T) {
 	result, found := evaluateOne(t, ToolDescription{Name: "export", Description: "Exports rows.", Truncated: true})
-	if !found || result.HardBlock || result.PatternName != "poison_unscanned_definition" {
-		t.Fatalf("want a reported, unblocked finding, got found=%v %+v", found, result)
+	if !found || !result.HardBlock || result.PatternName != "poison_unscanned_definition" {
+		t.Fatalf("want a blocked finding, got found=%v %+v", found, result)
 	}
 }
 

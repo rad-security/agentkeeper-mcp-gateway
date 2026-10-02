@@ -178,9 +178,9 @@ func TestPoisonedDefinitionCannotHideByStructure(t *testing.T) {
 			if len(results) != 1 {
 				t.Fatalf("payload in %s was not inspected: %+v", name, results)
 			}
-			// A payload behind more text than the inspection budget is not
-			// read, so the definition is reported as not fully inspected.
-			if name != "description after a large leading padding" && !results[0].HardBlock {
+			// A definition too large to read in full is blocked as well: what
+			// was not read cannot be shown to an agent.
+			if !results[0].HardBlock {
 				t.Fatalf("payload in %s is not a hard block: %+v", name, results[0])
 			}
 		})
