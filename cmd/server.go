@@ -196,6 +196,7 @@ are blocked.`,
 			ClientName:           os.Getenv(gatewayentry.EnvClientName),
 			ConfigSourceHash:     os.Getenv(gatewayentry.EnvConfigSourceHash),
 			RouteRevision:        os.Getenv(gatewayentry.EnvRouteRevision),
+			DefinitionPinsPath:   definitionPinsPath(receiptRoot),
 		}, mgr, authorityClient)
 		dashboardConnected := false
 		if tc != nil {
@@ -384,4 +385,13 @@ func init() {
 	serverCmd.Flags().BoolVar(&enforce, "enforce", false, "Enable enforce mode (block policy violations)")
 	serverCmd.Flags().BoolVar(&noAutoAuth, "no-auto-auth", false, "Disable automatic device authentication")
 	rootCmd.AddCommand(serverCmd)
+}
+
+// definitionPinsPath places the tool definition record with the rest of the
+// Gateway's state. Without a state directory the check is off.
+func definitionPinsPath(receiptRoot string) string {
+	if receiptRoot == "" {
+		return ""
+	}
+	return filepath.Join(filepath.Dir(receiptRoot), "tool-definitions-v1.json")
 }

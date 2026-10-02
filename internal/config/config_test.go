@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -278,5 +279,109 @@ func TestLoadWithSource_LabelsFieldOrigins(t *testing.T) {
 	}
 	if res.APIURLSource != SourceEnv {
 		t.Errorf("APIURLSource = %q, want %q", res.APIURLSource, SourceEnv)
+	}
+}
+
+// brokenConfig carries a trailing comma, the kind of syntax error a hand edit
+// leaves behind, around settings that must survive a refused write.
+const brokenConfig = `{
+  "mode": "enforce",
+  "api_key": "ak_test_synthetic",
+  "servers": [{"name": "keep", "command": "python3 keep.py"},]
+}
+`
+
+// useConfigFile points the resolver at a scratch config holding content.
+func useConfigFile(t *testing.T, content string) string {
+	t.Helper()
+	isolateEnv(t)
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	t.Setenv(envConfigPath, path)
+	return path
+}
+
+func TestMutatorsRefuseToReplaceUnparseableConfig(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func() error
+	}{
+		{"AddServer", func() error { return AddServer(ServerEntry{Name: "newone", Command: "python3 x.py"}) }},
+		{"RemoveServer", func() error { return RemoveServer("keep") }},
+		{"SaveAPIKey", func() error { return SaveAPIKey("ak_test_replacement") }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := useConfigFile(t, brokenConfig)
+
+			err := tc.mutate()
+			if err == nil {
+				t.Fatal("expected an error for an unparseable config, got nil")
+			}
+			if !strings.Contains(err.Error(), path) || !strings.Contains(err.Error(), "invalid character") {
+				t.Errorf("error must name the file and the parse error, got: %v", err)
+			}
+			after, readErr := os.ReadFile(path)
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			if string(after) != brokenConfig {
+				t.Errorf("config was rewritten:\n%s", after)
+			}
+		})
+	}
+}
+
+func TestAddServer_MissingFileCreatesConfig(t *testing.T) {
+	isolateEnv(t)
+	path := filepath.Join(t.TempDir(), "nested", "config.json")
+	t.Setenv(envConfigPath, path)
+
+	if err := AddServer(ServerEntry{Name: "first", Command: "python3 x.py"}); err != nil {
+		t.Fatalf("first run must create the config, got %v", err)
+	}
+	cfg, err := LoadWithPath(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Servers) != 1 || cfg.Servers[0].Name != "first" || cfg.Mode != "audit" {
+		t.Errorf("unexpected config: %+v", cfg)
+	}
+}
+
+func TestRemoveServer_UnknownNameIsAnErrorAndLeavesFileUntouched(t *testing.T) {
+	// Not the layout Save produces, so any rewrite would change the bytes.
+	const original = `{"mode":"enforce","servers":[{"name":"keep","command":"python3 keep.py"}]}`
+	path := useConfigFile(t, original)
+
+	err := RemoveServer("nope")
+	if err == nil {
+		t.Fatal("expected an error for an unknown server, got nil")
+	}
+	if want := `no server named "nope" in ` + path; err.Error() != want {
+		t.Errorf("error = %q, want %q", err.Error(), want)
+	}
+	after, readErr := os.ReadFile(path)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if string(after) != original {
+		t.Errorf("config was rewritten:\n%s", after)
+	}
+}
+
+func TestRemoveServer_RemovesOnlyTheNamedServer(t *testing.T) {
+	path := useConfigFile(t, `{"mode":"enforce","servers":[{"name":"keep","command":"python3 keep.py"},{"name":"drop","command":"python3 drop.py"}]}`)
+
+	if err := RemoveServer("drop"); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadWithPath(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Servers) != 1 || cfg.Servers[0].Name != "keep" || cfg.Mode != "enforce" {
+		t.Errorf("unexpected config: %+v", cfg)
 	}
 }

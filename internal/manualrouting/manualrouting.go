@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"sort"
 	"strings"
 
@@ -1244,13 +1245,24 @@ func writeManifest(path string, value manifest) (bool, error) {
 	return true, writeAtomic(path, raw, 0o600)
 }
 
+// manifestModeIsPrivate reports whether a manifest's mode shows a regular file
+// only its owner can read. Windows reports 0666 for every writable file and
+// governs access through the ACL of the user's profile, so there the mode
+// carries no information and only the file type is checked.
+func manifestModeIsPrivate(goos string, mode os.FileMode) bool {
+	if !mode.IsRegular() {
+		return false
+	}
+	return goos == "windows" || mode.Perm()&0o077 == 0
+}
+
 func readManifest(path string) (manifest, error) {
 	var value manifest
 	info, err := os.Lstat(path)
 	if err != nil {
 		return value, err
 	}
-	if !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 {
+	if !manifestModeIsPrivate(runtime.GOOS, info.Mode()) {
 		return value, fmt.Errorf("manual routing manifest must be a private regular file")
 	}
 	file, err := os.Open(path)

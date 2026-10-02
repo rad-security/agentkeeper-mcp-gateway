@@ -5,6 +5,7 @@ package proxy
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -71,6 +72,9 @@ type Config struct {
 	ClientName           string
 	ConfigSourceHash     string
 	RouteRevision        string
+	// DefinitionPinsPath is where tool definition fingerprints are recorded.
+	// Empty turns the definition-change check off.
+	DefinitionPinsPath string
 }
 
 // Proxy manages the MCP protocol proxy.
@@ -85,27 +89,31 @@ type Proxy struct {
 	mu        sync.Mutex
 	modeMu    sync.RWMutex
 	// Map from namespaced tool name to server name
-	toolMap            map[string]string
-	poisonedTools      map[string]detection.Result
-	resourceMap        map[string]resourceRoute
-	resourceContentMap map[string]resourceRoute
-	resourceTemplates  []resourceTemplateRoute
-	promptMap          map[string]string
-	toolCache          map[string][]interface{}
-	emptyToolLists     map[string]int
-	toolStatus         map[string]toolRefreshStatus
-	toolRefreshMu      sync.Mutex
-	toolRefreshDone    chan struct{}
-	clientReady        bool
-	activeToolsList    int
-	pendingListNote    bool
-	writeMu            sync.Mutex
-	outputMu           sync.RWMutex
-	output             io.Writer
-	inflightMu         sync.Mutex
-	inflight           map[string]context.CancelFunc
-	policySkippedMu    sync.Mutex
-	policySkipped      map[string]bool
+	toolMap       map[string]string
+	poisonedTools map[string]detection.Result
+	// definitionVerdicts holds the inspection result for each distinct tool
+	// definition seen, so a call does not re-inspect unchanged definitions.
+	definitionVerdictMu sync.Mutex
+	definitionVerdicts  map[[sha256.Size]byte]definitionVerdict
+	resourceMap         map[string]resourceRoute
+	resourceContentMap  map[string]resourceRoute
+	resourceTemplates   []resourceTemplateRoute
+	promptMap           map[string]string
+	toolCache           map[string][]interface{}
+	emptyToolLists      map[string]int
+	toolStatus          map[string]toolRefreshStatus
+	toolRefreshMu       sync.Mutex
+	toolRefreshDone     chan struct{}
+	clientReady         bool
+	activeToolsList     int
+	pendingListNote     bool
+	writeMu             sync.Mutex
+	outputMu            sync.RWMutex
+	output              io.Writer
+	inflightMu          sync.Mutex
+	inflight            map[string]context.CancelFunc
+	policySkippedMu     sync.Mutex
+	policySkipped       map[string]bool
 }
 
 type toolRefreshStatus struct {
@@ -414,6 +422,12 @@ func (p *Proxy) handleBackendLifecycle(serverName, state string, lifecycleErr er
 		p.setToolStatus(serverName, toolRefreshStatus{Status: "ready", UpdatedAt: time.Now().UTC().Format(time.RFC3339Nano)})
 		return
 	}
+	// The Gateway stopping its own backends is not a backend failure. The
+	// tools it last listed stay cached so the next session can offer them
+	// while a slow server starts.
+	if p.ctx != nil && p.ctx.Err() != nil {
+		return
+	}
 	p.mu.Lock()
 	delete(p.toolCache, serverName)
 	delete(p.emptyToolLists, serverName)
@@ -652,6 +666,7 @@ func (p *Proxy) applyToolList(serverName string, tools []interface{}, err error)
 		UpdatedAt: time.Now().UTC().Format(time.RFC3339Nano),
 	})
 	p.logToolDescriptionDetections(serverName, tools)
+	p.logChangedToolDefinitions(serverName, tools)
 	p.rebuildToolMapFromCache()
 	if changed {
 		p.emitToolsListChanged()
@@ -764,10 +779,8 @@ func (p *Proxy) logToolDescriptionDetections(serverName string, tools []interfac
 		if !ok {
 			continue
 		}
-		desc := toolDescriptionFromMap(tm)
-		results := p.config.DetectionEngine.EvaluateToolDescriptions([]detection.ToolDescription{desc})
-		for _, r := range results {
-			found[publicMCPName(serverName, desc.Name)] = r
+		if result, flagged := p.toolDescriptionDetection(tm); flagged {
+			found[publicMCPName(serverName, definitionString(tm["name"]))] = result
 		}
 	}
 	newFindings := make(map[string]detection.Result)
@@ -787,8 +800,20 @@ func (p *Proxy) logToolDescriptionDetections(serverName string, tools []interfac
 	}
 	p.mu.Unlock()
 	if p.config.Logger != nil {
+		var synced telemetry.SyncPolicy
+		if p.telemetry != nil {
+			synced = p.telemetry.Policy()
+		}
+		mode, enforcing := "observe", p.enforceMode()
+		if enforcing {
+			mode = "enforce"
+		}
 		for name, result := range newFindings {
-			p.config.Logger.LogDetection(serverName, originalMCPName(serverName, name), result)
+			// Record the decision the route would apply, so a definition that
+			// Enforce blocks reads as a block in Observe too.
+			decided := applyDetectionPolicy(result, synced, p.config.Detection)
+			listed := !(enforcing && decided.Verdict == detection.VerdictBlock)
+			p.config.Logger.LogDefinitionFinding(serverName, originalMCPName(serverName, name), decided, mode, listed)
 		}
 	}
 }
@@ -805,7 +830,7 @@ func (p *Proxy) filterPoisonedTools(tools []interface{}) []interface{} {
 			continue
 		}
 		name, _ := tool["name"].(string)
-		result, found := p.toolDescriptionDetection(tool)
+		result, found := p.toolDescriptionDetection(definitionAsAdvertised(tool))
 		if !found {
 			// Retain the asynchronous index as a compatibility fallback when
 			// descriptor inspection is unavailable. Enforcement must not depend
@@ -828,18 +853,57 @@ func (p *Proxy) toolDescriptionDetection(tool map[string]interface{}) (detection
 	if p.config.DetectionEngine == nil {
 		return detection.Result{}, false
 	}
-	desc := toolDescriptionFromMap(tool)
-	results := p.config.DetectionEngine.EvaluateToolDescriptions([]detection.ToolDescription{desc})
-	if len(results) == 0 {
-		return detection.Result{}, false
-	}
-	strongest := results[0]
-	for _, result := range results[1:] {
-		if verdictRank(string(result.Verdict)) > verdictRank(string(strongest.Verdict)) {
-			strongest = result
+	// Every call re-checks its server's definitions, so the result for an
+	// unchanged definition is kept rather than recomputed.
+	var key [sha256.Size]byte
+	encoded, err := json.Marshal(tool)
+	keyed := err == nil
+	if keyed {
+		key = sha256.Sum256(encoded)
+		p.definitionVerdictMu.Lock()
+		cached, ok := p.definitionVerdicts[key]
+		p.definitionVerdictMu.Unlock()
+		if ok {
+			return cached.result, cached.found
 		}
 	}
-	return strongest, true
+	verdict := definitionVerdict{}
+	desc := toolDescriptionFromMap(tool)
+	results := p.config.DetectionEngine.EvaluateToolDescriptions([]detection.ToolDescription{desc})
+	if len(results) > 0 {
+		verdict = definitionVerdict{result: results[0], found: true}
+		for _, result := range results[1:] {
+			if verdictRank(string(result.Verdict)) > verdictRank(string(verdict.result.Verdict)) {
+				verdict.result = result
+			}
+		}
+	}
+	if keyed {
+		p.definitionVerdictMu.Lock()
+		if p.definitionVerdicts == nil || len(p.definitionVerdicts) >= maxDefinitionVerdicts {
+			p.definitionVerdicts = make(map[[sha256.Size]byte]definitionVerdict)
+		}
+		p.definitionVerdicts[key] = verdict
+		p.definitionVerdictMu.Unlock()
+	}
+	return verdict.result, verdict.found
+}
+
+// definitionAsAdvertised returns a listed tool under the name its server
+// advertised. The list a client sees carries namespaced names, a call checks
+// the server's own definition, and both must reach the same verdict.
+func definitionAsAdvertised(tool map[string]interface{}) map[string]interface{} {
+	name, _ := tool["name"].(string)
+	separator := strings.Index(name, "__")
+	if separator < 0 {
+		return tool
+	}
+	advertised := make(map[string]interface{}, len(tool))
+	for key, value := range tool {
+		advertised[key] = value
+	}
+	advertised["name"] = strings.NewReplacer(".u", "_", ".d", ".").Replace(name[separator+2:])
+	return advertised
 }
 
 // ToolDescription extracts the text of an advertised tool definition that the
@@ -849,9 +913,15 @@ func ToolDescription(tool map[string]interface{}) detection.ToolDescription {
 }
 
 func toolDescriptionFromMap(tool map[string]interface{}) detection.ToolDescription {
-	desc := detection.ToolDescription{
-		Name:        fmt.Sprintf("%v", tool["name"]),
-		Description: fmt.Sprintf("%v", tool["description"]),
+	desc := detection.ToolDescription{Name: definitionString(tool["name"])}
+	walk := definitionWalk{budget: maxDefinitionFragmentBytes}
+	switch description := tool["description"].(type) {
+	case string:
+		desc.Description = walk.take(description)
+	case nil:
+	default:
+		// A description that is not a string is still text an agent may read.
+		walk.collect(description, 0)
 	}
 	if inputSchema, ok := tool["inputSchema"].(map[string]interface{}); ok {
 		if props, ok := inputSchema["properties"].(map[string]interface{}); ok {
@@ -859,13 +929,114 @@ func toolDescriptionFromMap(tool map[string]interface{}) detection.ToolDescripti
 				if param, ok := paramValue.(map[string]interface{}); ok {
 					desc.Parameters = append(desc.Parameters, detection.ToolParam{
 						Name:        paramName,
-						Description: fmt.Sprintf("%v", param["description"]),
+						Description: definitionString(param["description"]),
 					})
 				}
 			}
 		}
 	}
+	// An instruction can sit anywhere the agent reads: a title, a nested
+	// property, an enum or default value, an annotation, the output schema.
+	// The parts an agent is most likely shown are read first, so unrelated
+	// bulk elsewhere in the definition cannot use up the budget before them.
+	first := []string{"inputSchema", "title", "outputSchema", "annotations"}
+	read := map[string]bool{"name": true, "description": true}
+	for _, key := range first {
+		read[key] = true
+		walk.collect(tool[key], 0)
+	}
+	keys := make([]string, 0, len(tool))
+	for key := range tool {
+		if !read[key] {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		walk.collect(tool[key], 0)
+	}
+	desc.Fragments = walk.fragments
+	desc.Truncated = walk.truncated
 	return desc
+}
+
+// maxDefinitionFragmentBytes bounds the inspection cost of one definition.
+const maxDefinitionFragmentBytes = 256 << 10
+
+// maxDefinitionDepth bounds how deeply a definition is read.
+const maxDefinitionDepth = 64
+
+// maxDefinitionVerdicts bounds the record of inspected definitions.
+const maxDefinitionVerdicts = 8192
+
+type definitionVerdict struct {
+	result detection.Result
+	found  bool
+}
+
+func definitionString(value interface{}) string {
+	text, _ := value.(string)
+	return text
+}
+
+// definitionWalk gathers the strings of a definition within a size and depth
+// bound, and records when the bound left part of the definition unread.
+type definitionWalk struct {
+	fragments []string
+	budget    int
+	truncated bool
+}
+
+func (w *definitionWalk) take(text string) string {
+	if len(text) > w.budget {
+		text = text[:w.budget]
+		w.truncated = true
+	}
+	w.budget -= len(text)
+	return text
+}
+
+func (w *definitionWalk) collect(value interface{}, depth int) {
+	if depth > maxDefinitionDepth {
+		w.truncated = true
+		return
+	}
+	switch typed := value.(type) {
+	case string:
+		if typed == "" {
+			return
+		}
+		if w.budget <= 0 {
+			w.truncated = true
+			return
+		}
+		w.fragments = append(w.fragments, w.take(typed))
+	case []interface{}:
+		for _, item := range typed {
+			w.collect(item, depth+1)
+		}
+	case map[string]interface{}:
+		keys := make([]string, 0, len(typed))
+		for key := range typed {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			w.collect(key, depth+1)
+			if value, ok := typed[key].([]interface{}); ok && (key == "examples" || key == "example") {
+				// Sample values are quotations, not text addressed to the agent.
+				for _, item := range value {
+					if text, ok := item.(string); ok {
+						w.collect("\""+text+"\"", depth+1)
+					} else {
+						w.collect(item, depth+1)
+					}
+				}
+				continue
+			}
+			w.collect(typed[key], depth+1)
+		}
+	}
 }
 
 func (p *Proxy) cachedToolDescriptionDetection(serverName, originalName string) (detection.Result, bool) {
@@ -1137,9 +1308,15 @@ func (p *Proxy) handleToolsCallContext(ctx context.Context, msg JSONRPCMessage) 
 		Arguments map[string]interface{} `json:"arguments"`
 		Meta      json.RawMessage        `json:"_meta,omitempty"`
 	}
-	if err := json.Unmarshal(msg.Params, &callParams); err != nil {
+	if err := unmarshalExactNumbers(msg.Params, &callParams); err != nil {
 		return nil, fmt.Errorf("invalid tools/call params: %w", err)
 	}
+	// The upstream is sent forwardArguments, whose numbers are the client's
+	// own literals. Everything below that inspects or logs the call reads
+	// callParams.Arguments, which keeps the float64 values those checks have
+	// always seen.
+	forwardArguments := callParams.Arguments
+	callParams.Arguments = inspectionArguments(forwardArguments)
 
 	// Check for built-in tools
 	if strings.HasPrefix(callParams.Name, "agentkeeper_") {
@@ -1359,8 +1536,8 @@ func (p *Proxy) handleToolsCallContext(ctx context.Context, msg JSONRPCMessage) 
 	forwardParams := map[string]interface{}{"name": originalName}
 	// MCP lets a client omit arguments; do not turn that into a JSON null,
 	// which servers validating the field as an object reject.
-	if callParams.Arguments != nil {
-		forwardParams["arguments"] = callParams.Arguments
+	if forwardArguments != nil {
+		forwardParams["arguments"] = forwardArguments
 	}
 	if len(callParams.Meta) > 0 && string(callParams.Meta) != "null" {
 		forwardParams["_meta"] = callParams.Meta
@@ -1460,6 +1637,55 @@ func (p *Proxy) handleToolsCallContext(ctx context.Context, msg JSONRPCMessage) 
 	return &JSONRPCMessage{JSONRPC: "2.0", ID: msg.ID, Result: response}, nil
 }
 
+// unmarshalExactNumbers is json.Unmarshal, except that a number decoded into
+// an interface{} keeps the text the sender wrote (json.Number) and is written
+// back unchanged. The default float64 cannot hold an integer beyond 2^53, so
+// a decoded and re-encoded 9007199254740993 arrived as 9007199254740992.
+func unmarshalExactNumbers(data []byte, v interface{}) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	if err := decoder.Decode(v); err != io.EOF {
+		return err
+	}
+	// No input at all: report it the way json.Unmarshal does.
+	return json.Unmarshal(data, v)
+}
+
+// inspectionArguments copies exactly decoded arguments into the form policy,
+// detection and the evaluation API have always received: numbers as float64.
+// A number float64 cannot represent (1e400), which used to fail the whole
+// call, stays a json.Number; it prints and marshals as its literal.
+func inspectionArguments(arguments map[string]interface{}) map[string]interface{} {
+	if arguments == nil {
+		return nil
+	}
+	return inspectionValue(arguments).(map[string]interface{})
+}
+
+func inspectionValue(value interface{}) interface{} {
+	switch typed := value.(type) {
+	case json.Number:
+		if number, err := typed.Float64(); err == nil {
+			return number
+		}
+		return typed
+	case map[string]interface{}:
+		copied := make(map[string]interface{}, len(typed))
+		for key, entry := range typed {
+			copied[key] = inspectionValue(entry)
+		}
+		return copied
+	case []interface{}:
+		copied := make([]interface{}, len(typed))
+		for i, entry := range typed {
+			copied[i] = inspectionValue(entry)
+		}
+		return copied
+	default:
+		return value
+	}
+}
+
 func (p *Proxy) logToolOutcome(serverName, toolName string, params map[string]interface{}, result detection.Result, outcome logging.ToolCallOutcome) {
 	outcome.ClientName = p.config.ClientName
 	outcome.ConfigSourceHash = p.config.ConfigSourceHash
@@ -1555,8 +1781,22 @@ func applyDetectionPolicy(result detection.Result, p telemetry.SyncPolicy, local
 		if strings.EqualFold(p.Detection.SensitiveData, "block") || strings.EqualFold(local.SensitiveData, "block") {
 			result.Verdict = detection.VerdictBlock
 		}
-	case "threat", "tool_poisoning":
+	case "threat":
 		if strings.EqualFold(p.Detection.Threat, "block") || strings.EqualFold(local.Threat, "block") {
+			result.Verdict = detection.VerdictBlock
+		}
+	case "tool_poisoning":
+		blocking := strings.EqualFold(p.Detection.Threat, "block") || strings.EqualFold(local.Threat, "block")
+		monitoring := strings.EqualFold(p.Detection.Threat, "monitor") || strings.EqualFold(local.Threat, "monitor")
+		switch {
+		case blocking && result.Severity == "critical":
+			// Wording was judged, so a definition is blocked for it only
+			// where detections are set to block, and only on a critical
+			// finding: one suspicious trait is what ordinary tools have.
+			result.Verdict = detection.VerdictBlock
+		case result.HardBlock && !monitoring:
+			// Text that does not render is blocked without that setting.
+			// Setting the threat action to monitor opts out.
 			result.Verdict = detection.VerdictBlock
 		}
 	}
@@ -1856,7 +2096,7 @@ func (p *Proxy) handlePromptsGet(msg JSONRPCMessage) (*JSONRPCMessage, error) {
 }
 func (p *Proxy) handlePromptsGetContext(ctx context.Context, msg JSONRPCMessage) (*JSONRPCMessage, error) {
 	var params map[string]interface{}
-	if err := json.Unmarshal(msg.Params, &params); err != nil {
+	if err := unmarshalExactNumbers(msg.Params, &params); err != nil {
 		return nil, fmt.Errorf("invalid prompts/get params")
 	}
 	namespacedName, _ := params["name"].(string)
@@ -2067,22 +2307,7 @@ func (p *Proxy) handleBuiltinToolCall(id *json.RawMessage, name string, args map
 		}
 	case "agentkeeper_audit":
 		p.startToolRefresh()
-		servers := p.manager.ConfiguredNames()
-		sort.Strings(servers)
-		text = fmt.Sprintf("MCP Security Audit\nServers: %d\n", len(servers))
-		for _, s := range servers {
-			tools := p.cachedTools(s)
-			status := p.getToolStatus(s)
-			state := status.Status
-			if state == "" {
-				state = "refreshing"
-			}
-			if status.LastError != "" {
-				text += fmt.Sprintf("  %s: %d cached tools (%s: %s)\n", s, len(tools), state, status.LastError)
-				continue
-			}
-			text += fmt.Sprintf("  %s: %d cached tools (%s)\n", s, len(tools), state)
-		}
+		text = p.auditReport()
 	default:
 		text = "Unknown built-in tool: " + name
 	}
@@ -2094,6 +2319,72 @@ func (p *Proxy) handleBuiltinToolCall(id *json.RawMessage, name string, args map
 	}
 	resultJSON, _ := json.Marshal(result)
 	return &JSONRPCMessage{JSONRPC: "2.0", ID: id, Result: resultJSON}, nil
+}
+
+// auditReport lists each configured server with its cached tool count, then
+// the tool definitions the inspection flagged and what the route does with
+// each. It reads cached definitions only.
+func (p *Proxy) auditReport() string {
+	servers := p.manager.ConfiguredNames()
+	sort.Strings(servers)
+	var synced telemetry.SyncPolicy
+	if p.telemetry != nil {
+		synced = p.telemetry.Policy()
+	}
+	enforcing := p.enforceMode()
+	text := fmt.Sprintf("MCP Security Audit\nServers: %d\n", len(servers))
+	var flagged []string
+	for _, s := range servers {
+		tools := p.cachedTools(s)
+		status := p.getToolStatus(s)
+		state := status.Status
+		if state == "" {
+			state = "refreshing"
+		}
+		if status.LastError != "" {
+			text += fmt.Sprintf("  %s: %d cached tools (%s: %s)\n", s, len(tools), state, status.LastError)
+		} else {
+			text += fmt.Sprintf("  %s: %d cached tools (%s)\n", s, len(tools), state)
+		}
+		for _, value := range tools {
+			tool, ok := value.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			result, found := p.toolDescriptionDetection(tool)
+			if !found {
+				continue
+			}
+			decided := applyDetectionPolicy(result, synced, p.config.Detection)
+			outcome := "reported, still listed"
+			if decided.Verdict == detection.VerdictBlock {
+				outcome = "reported, still listed; Enforce hides it"
+				if enforcing {
+					outcome = "hidden from clients, calls blocked"
+				}
+			}
+			flagged = append(flagged, fmt.Sprintf("  %s/%s: %s %s (%s)\n", s, auditToolName(definitionString(tool["name"])), decided.Severity, decided.PatternName, outcome))
+		}
+	}
+	text += fmt.Sprintf("Flagged tool definitions: %d\n", len(flagged))
+	return text + strings.Join(flagged, "")
+}
+
+// auditToolName renders a server-controlled tool name for the audit report,
+// which the agent reads: identifier characters only, bounded.
+func auditToolName(name string) string {
+	var b strings.Builder
+	for _, r := range name {
+		if b.Len() >= 64 {
+			break
+		}
+		if r == '_' || r == '-' || r == '.' || (r >= '0' && r <= '9') || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') {
+			b.WriteRune(r)
+		} else {
+			b.WriteRune('?')
+		}
+	}
+	return b.String()
 }
 
 func (p *Proxy) cachedToolSummary() (backendCount int, toolCount int, degradedBackendCount int) {

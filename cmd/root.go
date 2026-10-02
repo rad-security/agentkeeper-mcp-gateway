@@ -33,8 +33,13 @@ threat detection, sensitive data scanning, and policy enforcement.`,
 
 // Execute runs the root command.
 func Execute() {
-	if err := rootCmd.Execute(); err != nil {
-		fmt.Fprintln(os.Stderr, err)
+	cmd, err := rootCmd.ExecuteC()
+	if err != nil {
+		// cobra has already printed the error, unless the command that
+		// failed silences that (scan). Print it exactly once either way.
+		if cmd.SilenceErrors {
+			fmt.Fprintln(os.Stderr, err)
+		}
 		os.Exit(1)
 	}
 }

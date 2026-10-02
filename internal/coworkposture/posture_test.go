@@ -152,6 +152,78 @@ func TestScan_RedactsSecretsAndCookieContents(t *testing.T) {
 	}
 }
 
+// A path with spaces is one executable, not a command with arguments, when it
+// names a real file. Anything else still reports the first field only.
+func TestCommandBasenameKeepsAnExistingPathWithSpaces(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "Application Support", "Example")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	server := filepath.Join(dir, "server")
+	spaced := filepath.Join(dir, "example server")
+	for _, path := range []string{server, spaced} {
+		if err := os.WriteFile(path, []byte("#!/bin/sh\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	firstField := filepath.Base(strings.Fields(server)[0])
+	for _, tc := range []struct{ name, command, want string }{
+		{"existing file under a spaced directory", server, "server"},
+		{"existing file with a spaced name", spaced, "example server"},
+		{"surrounding whitespace", "  " + server + "\n", "server"},
+		{"existing file followed by arguments", server + " --token abc", firstField},
+		{"spaced directory", filepath.Dir(dir), firstField},
+		{"missing path with spaces", filepath.Join(dir, "missing server"), firstField},
+		{"command with arguments", "python3 /tmp/x.py --token abc", "python3"},
+		{"assignment first", "API_KEY=sk-test " + server, ""},
+	} {
+		if got := commandBasename(tc.command); got != tc.want {
+			t.Errorf("%s: commandBasename(%q) = %q, want %q", tc.name, tc.command, got, tc.want)
+		}
+	}
+}
+
+// A command string can embed its own arguments. Only the binary's base name
+// may reach the payload, whichever path separator the config uses.
+func TestScan_ReportsOnlyCommandBaseName(t *testing.T) {
+	home := t.TempDir()
+	appDir := macClaudeDir(home)
+	writeFixture(t, filepath.Join(appDir, "claude_desktop_config.json"), `{
+		"mcpServers": {
+			"inline": {"command": "npx -y pg-mcp postgresql://app:conn-pw-0001@db.example.test/prod --api-key sk-test-inline-0002"},
+			"win": {"command": "C:\\Users\\dev\\private-tools-dir\\server.exe --password pw-windows-0003"},
+			"envprefix": {"command": "API_KEY=key-env-prefix-0004 npx server"},
+			"plain": {"command": "/usr/local/bin/python3", "args": ["server.py"]}
+		}
+	}`)
+
+	payload, err := Scan(ScanOptions{Home: home, OS: "darwin"})
+	if err != nil {
+		t.Fatalf("scan error: %v", err)
+	}
+	got := map[string]bool{}
+	for _, server := range payload.RawReport.MCPServers {
+		got[server.CommandBasename] = true
+	}
+	for _, want := range []string{"npx", "server.exe", "python3", ""} {
+		if !got[want] {
+			t.Errorf("missing command basename %q in %+v", want, payload.RawReport.MCPServers)
+		}
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{
+		"conn-pw-0001", "db.example.test", "sk-test-inline-0002", "pw-windows-0003",
+		"key-env-prefix-0004", "--api-key", "--password", "private-tools-dir",
+	} {
+		if strings.Contains(string(body), forbidden) {
+			t.Errorf("payload leaked %q: %s", forbidden, body)
+		}
+	}
+}
+
 func TestScan_WindowsAppDataLayout(t *testing.T) {
 	home := t.TempDir()
 	appDir := filepath.Join(home, "AppData", "Roaming", "Claude")

@@ -139,7 +139,11 @@ func Status() error {
 
 // Logout removes the stored API key.
 func Logout() error {
-	cfg, _ := config.Load()
+	// An unreadable config must not be replaced by an empty one.
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
 	cfg.APIKey = ""
 	if err := config.Save(cfg); err != nil {
 		return err

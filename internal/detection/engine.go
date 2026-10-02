@@ -25,6 +25,10 @@ type Result struct {
 	Severity    string // "critical", "high", "medium"
 	Description string
 	Category    string // "threat", "sensitive_data", "tool_poisoning"
+	// HardBlock marks a finding that is blocked in Enforce without the
+	// organization opting detections into blocking: a tool definition that
+	// carries instructions for the agent has no legitimate reading.
+	HardBlock bool
 }
 
 // Engine runs threat detection on MCP tool calls.
@@ -33,7 +37,7 @@ type Engine struct {
 	promptPatterns    []Pattern
 	webPatterns       []Pattern
 	sensitivePatterns []Pattern
-	poisonPatterns    []Pattern
+	poisonTraits      []poisonTrait
 }
 
 // Pattern is a compiled detection rule.
@@ -55,7 +59,7 @@ func NewEngine() *Engine {
 	e.promptPatterns = compilePromptPatterns()
 	e.webPatterns = compileWebPatterns()
 	e.sensitivePatterns = compileSensitiveDataPatterns()
-	e.poisonPatterns = compileToolPoisoningPatterns()
+	e.poisonTraits = compileToolPoisoningTraits()
 	return e
 }
 
@@ -96,36 +100,19 @@ type ToolDescription struct {
 	Name        string
 	Description string
 	Parameters  []ToolParam
+	// Fragments holds every other string in the advertised definition (title,
+	// nested schema descriptions, enum and default values, annotations), so an
+	// instruction cannot hide outside the description field.
+	Fragments []string
+	// Truncated reports that the definition was larger or more deeply nested
+	// than the inspection reads, so part of it was not inspected.
+	Truncated bool
 }
 
 // ToolParam represents a parameter in an MCP tool definition.
 type ToolParam struct {
 	Name        string
 	Description string
-}
-
-// EvaluateToolDescriptions inspects tool descriptions for poisoning.
-func (e *Engine) EvaluateToolDescriptions(tools []ToolDescription) []Result {
-	var results []Result
-	for _, tool := range tools {
-		text := tool.Name + " " + tool.Description
-		for _, p := range tool.Parameters {
-			text += " " + p.Name + " " + p.Description
-		}
-		lower := strings.ToLower(text)
-		for _, pat := range e.poisonPatterns {
-			if pat.Regex.MatchString(lower) {
-				results = append(results, Result{
-					Verdict:     VerdictWarn,
-					PatternName: pat.Name,
-					Severity:    pat.Severity,
-					Description: pat.Description + " in tool: " + tool.Name,
-					Category:    "tool_poisoning",
-				})
-			}
-		}
-	}
-	return results
 }
 
 func (e *Engine) checkSensitiveData(content string) Result {

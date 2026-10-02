@@ -13,3 +13,43 @@ jobs:
           go-version: "1.23.3"
       - run: go vet ./...
       - run: go test -race -timeout 5m ./...
+
+  # Runs the built binary end to end on every OS we release for.
+  smoke:
+    name: smoke (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python: python3
+          - os: macos-latest
+            python: python3
+          - os: windows-latest
+            python: python
+            exe: .exe
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23.3"
+      - run: go build -o agentkeeper-mcp-gateway${{ matrix.exe }} .
+      - run: ${{ matrix.python }} scripts/smoke/smoke.py ./agentkeeper-mcp-gateway${{ matrix.exe }}
+
+  # The unit tests that hold on Windows. The other packages' tests assume Unix
+  # file modes, shell fixtures or $HOME, and are covered there by the smoke job.
+  windows-unit:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23.3"
+      - run: go build ./...
+      - run: >-
+          go test -timeout 10m
+          ./internal/detection/ ./internal/policy/ ./internal/fslock/
+          ./internal/machineid/ ./internal/gatewayentry/ ./internal/discovery/
+          ./internal/coworkposture/ ./skillinventory/

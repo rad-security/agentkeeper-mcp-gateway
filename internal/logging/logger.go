@@ -277,9 +277,11 @@ func (l *Logger) LogToolCallOutcome(serverName, toolName string, params map[stri
 	l.writeEvent(event)
 }
 
-// LogDetection logs a detection event (tool poisoning, sensitive data, etc.)
-func (l *Logger) LogDetection(serverName, toolName string, result detection.Result) {
-	event := Event{
+// LogDefinitionFinding logs a finding about a tool's advertised definition.
+// It is not a call: there is no dispatch and no receipt. The context says so,
+// and records whether the route kept the tool in the client's tool list.
+func (l *Logger) LogDefinitionFinding(serverName, toolName string, result detection.Result, effectiveMode string, toolListed bool) {
+	l.writeEvent(Event{
 		Timestamp:   time.Now().UTC().Format(time.RFC3339Nano),
 		EventType:   "mcp.threat_detected",
 		ServerName:  serverName,
@@ -289,9 +291,12 @@ func (l *Logger) LogDetection(serverName, toolName string, result detection.Resu
 		PatternName: result.PatternName,
 		Category:    result.Category,
 		Description: result.Description,
-	}
-
-	l.writeEvent(event)
+		Context: map[string]interface{}{
+			"finding_scope":  "tool_definition",
+			"effective_mode": effectiveMode,
+			"tool_listed":    toolListed,
+		},
+	})
 }
 
 // LogSessionStart logs gateway startup.

@@ -1374,11 +1374,31 @@ func isSensitiveKey(key string) bool {
 	return false
 }
 
+// commandBasename reduces a configured command to the binary's base name. A
+// command string may embed its own arguments or a leading KEY=value
+// assignment, and those can carry secrets, so only the first field is
+// considered and an assignment reports nothing. The one exception is a string
+// that as a whole names an existing file: that is a path with spaces, so its
+// own base name is reported. Both path separators are honoured so a Windows
+// path reduces the same way on any OS.
 func commandBasename(command string) string {
-	if command == "" {
+	fields := strings.Fields(command)
+	if len(fields) == 0 || strings.Contains(fields[0], "=") {
 		return ""
 	}
-	return filepath.Base(command)
+	name := fields[0]
+	if len(fields) > 1 {
+		// "/Library/Application Support/Example/server" is one executable,
+		// not a command with arguments, when the whole string is a file.
+		whole := strings.TrimSpace(command)
+		if info, err := os.Stat(whole); err == nil && !info.IsDir() {
+			name = whole
+		}
+	}
+	if i := strings.LastIndexAny(name, `/\`); i >= 0 {
+		name = name[i+1:]
+	}
+	return name
 }
 
 func bridgeStateCounts(v any) (entries, consented int, configured bool) {
