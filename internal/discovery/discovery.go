@@ -26,6 +26,13 @@ const (
 	ClientCowork        = "cowork"
 	ClientCursor        = "cursor"
 
+	// Clients that keep their servers under `mcpServers` in a file of their
+	// own. configure-ide routes them when that file exists.
+	ClientWindsurf    = "windsurf"
+	ClientGeminiCLI   = "gemini-cli"
+	ClientAntigravity = "antigravity"
+	ClientKiro        = "kiro"
+
 	RouteDirect  = "direct"
 	RouteRouted  = "routed"
 	RouteUnknown = "unknown"
@@ -81,7 +88,8 @@ type DiscoveredServer struct {
 }
 
 // Discover returns MCP servers configured for the requested client. Client may
-// be "all", "claude-code", "claude-desktop", "cowork", or "cursor".
+// be "all", "claude-code", "claude-desktop", "cowork", "cursor", or one of the
+// optional clients.
 func Discover(opts Options) (Result, error) {
 	home := opts.Home
 	if home == "" {
@@ -113,6 +121,9 @@ func Discover(opts Options) (Result, error) {
 		add(discoverClaudeDesktop(home))
 		add(discoverCowork(home))
 		add(discoverCursor(home))
+		for _, optional := range optionalClientConfigs {
+			add(discoverOptionalClient(home, optional.client))
+		}
 	case ClientClaudeCode:
 		add(discoverClaudeCode(home, cwd))
 	case ClientClaudeDesktop:
@@ -122,7 +133,10 @@ func Discover(opts Options) (Result, error) {
 	case ClientCursor:
 		add(discoverCursor(home))
 	default:
-		return Result{}, fmt.Errorf("unknown client %q", opts.Client)
+		if _, known := OptionalClientConfigPaths(home)[client]; !known {
+			return Result{}, fmt.Errorf("unknown client %q", opts.Client)
+		}
+		add(discoverOptionalClient(home, client))
 	}
 
 	res.Servers = dedupeAndSort(servers)
@@ -150,6 +164,37 @@ func discoverClaudeDesktop(home string) []DiscoveredServer {
 
 func discoverCursor(home string) []DiscoveredServer {
 	return readMCPServers(filepath.Join(home, ".cursor", "mcp.json"), ClientCursor, "global", "cursor_mcp_json", RouteabilityLocalRoutable)
+}
+
+var optionalClientConfigs = []struct {
+	client     string
+	sourceKind string
+	elements   []string
+}{
+	{ClientWindsurf, "windsurf_mcp_config", []string{".codeium", "windsurf", "mcp_config.json"}},
+	{ClientGeminiCLI, "gemini_cli_settings", []string{".gemini", "settings.json"}},
+	{ClientAntigravity, "antigravity_mcp_config", []string{".gemini", "antigravity", "mcp_config.json"}},
+	{ClientKiro, "kiro_mcp_json", []string{".kiro", "settings", "mcp.json"}},
+}
+
+// OptionalClientConfigPaths returns where each optional client keeps its MCP
+// servers under home.
+func OptionalClientConfigPaths(home string) map[string]string {
+	paths := make(map[string]string, len(optionalClientConfigs))
+	for _, optional := range optionalClientConfigs {
+		paths[optional.client] = filepath.Join(append([]string{home}, optional.elements...)...)
+	}
+	return paths
+}
+
+func discoverOptionalClient(home, client string) []DiscoveredServer {
+	for _, optional := range optionalClientConfigs {
+		if optional.client == client {
+			path := filepath.Join(append([]string{home}, optional.elements...)...)
+			return readMCPServers(path, client, "global", optional.sourceKind, RouteabilityLocalRoutable)
+		}
+	}
+	return nil
 }
 
 func discoverCowork(home string) []DiscoveredServer {

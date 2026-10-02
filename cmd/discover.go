@@ -51,7 +51,7 @@ var discoverCmd = &cobra.Command{
 }
 
 func init() {
-	discoverCmd.Flags().StringVar(&discoverClient, "client", "all", "Client to scan (all, claude-code, claude-desktop, cowork)")
+	discoverCmd.Flags().StringVar(&discoverClient, "client", "all", "Client to scan (all, claude-code, claude-desktop, cowork, cursor, windsurf, gemini-cli, antigravity, kiro)")
 	discoverCmd.Flags().StringVar(&discoverIDE, "ide", "", "Alias for --client")
 	discoverCmd.Flags().StringVar(&discoverCWD, "cwd", "", "Project directory for project/local scoped MCP discovery")
 	discoverCmd.Flags().BoolVar(&discoverJSON, "json", false, "Emit JSON")
