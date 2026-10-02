@@ -344,11 +344,11 @@ func rawIDEEntry(entry config.ServerEntry) json.RawMessage {
 }
 
 func managedManifestPath() (string, error) {
-	path := config.CurrentConfigPath()
+	path := config.SavePath()
 	if strings.TrimSpace(path) == "" {
 		return "", fmt.Errorf("gateway config path is unavailable")
 	}
-	return filepath.Join(filepath.Dir(path), "managed-routing.json"), nil
+	return filepath.Join(filepath.Dir(path), config.ManagedRoutingManifestName), nil
 }
 
 func readServerMap(path string) (map[string]json.RawMessage, error) {

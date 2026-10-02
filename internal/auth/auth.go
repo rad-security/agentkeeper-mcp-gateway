@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	neturl "net/url"
 	"os/exec"
+	"runtime"
 	"time"
 
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/config"
@@ -154,22 +156,35 @@ func Logout() error {
 
 func openBrowser(url string) {
 	// Best-effort browser open
-	var cmd string
-	var args []string
-	switch {
-	case isCommandAvailable("open"):
-		cmd = "open"
-		args = []string{url}
-	case isCommandAvailable("xdg-open"):
-		cmd = "xdg-open"
-		args = []string{url}
-	case isCommandAvailable("wslview"):
-		cmd = "wslview"
-		args = []string{url}
-	default:
+	name, args, ok := browserCommand(runtime.GOOS, isCommandAvailable, url)
+	if !ok {
 		return
 	}
-	exec.Command(cmd, args...).Start()
+	exec.Command(name, args...).Start()
+}
+
+// browserCommand picks the command that opens url in the default browser.
+// The URL comes from the server, and the operating system's opener launches
+// whatever handler its argument names, so only a web page is passed on.
+func browserCommand(goos string, available func(string) bool, url string) (string, []string, bool) {
+	parsed, err := neturl.Parse(url)
+	if err != nil || parsed.Host == "" || (parsed.Scheme != "https" && parsed.Scheme != "http") {
+		return "", nil, false
+	}
+	switch {
+	case goos == "windows":
+		// Not "cmd /c start": cmd reads the "&" in a query string as a
+		// command separator.
+		return "rundll32", []string{"url.dll,FileProtocolHandler", url}, true
+	case available("open"):
+		return "open", []string{url}, true
+	case available("xdg-open"):
+		return "xdg-open", []string{url}, true
+	case available("wslview"):
+		return "wslview", []string{url}, true
+	default:
+		return "", nil, false
+	}
 }
 
 func isCommandAvailable(name string) bool {

@@ -333,6 +333,8 @@ The gateway is designed to work under a fleet config-management tool (Kandji, An
 | 5 | `/etc/agentkeeper-mcp-gateway/config.json` (if file exists) | system-wide, fleet-deploy target |
 | fallback | `~/.config/agentkeeper-mcp-gateway/config.json` | created on first write |
 
+On Windows the system-wide location is `C:\ProgramData\AgentKeeper\config.json`. The AgentKeeper runtime keeps its own `config.json` there, and a Gateway with no per-user config reads that file for its credential. The Gateway does not write the runtime's file: `auth login`, `configure-ide` and `add` save a per-user config in the developer's profile, which starts from the credential and API URL in use and is the config used from then on. A system file that holds Gateway settings such as `mode` or `servers` is a fleet config and is saved in place.
+
 **Where gateway state lives:** the signer, receipt queue and route state sit beside the event log when `log_path` is set, otherwise beside the config file. When the config directory is not writable by the user (the system-wide layout above), they live under `~/.config/agentkeeper-mcp-gateway/state/<id>/`, one directory per config path, and stay there even if the config directory later becomes writable.
 
 **Environment overrides:**
