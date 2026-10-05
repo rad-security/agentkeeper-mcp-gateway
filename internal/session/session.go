@@ -204,16 +204,24 @@ func (t *Tracker) observeFragment(server, raw string, scan detection.ScanResult)
 		window := t.fragments[len(t.fragments)-k:]
 		for _, sep := range []string{" ", ""} {
 			joined := joinFragments(window, sep)
-			if _, desc, ok := t.engine.MatchesInstruction(joined); ok {
-				return &Finding{
-					Pattern:     patternInjectionFrags,
-					Severity:    severityHigh,
-					Description: "Instructions split across results from " + serverList(window) + " in this session: " + desc,
-					Correlation: map[string]interface{}{
-						"source_server": window[0].server,
-						"steps":         fragmentSteps(window),
-					},
-				}
+			_, desc, ok := t.engine.MatchesInstruction(joined)
+			if !ok {
+				continue
+			}
+			// The newest result must complete the instruction. One already
+			// present in the earlier results was reported when it arrived, and
+			// the results after it are not part of it.
+			if _, _, before := t.engine.MatchesInstruction(joinFragments(window[:len(window)-1], sep)); before {
+				continue
+			}
+			return &Finding{
+				Pattern:     patternInjectionFrags,
+				Severity:    severityHigh,
+				Description: "Instructions split across results from " + serverList(window) + " in this session: " + desc,
+				Correlation: map[string]interface{}{
+					"source_server": window[0].server,
+					"steps":         fragmentSteps(window),
+				},
 			}
 		}
 	}
