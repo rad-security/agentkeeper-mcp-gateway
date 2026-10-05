@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/detection"
+	"github.com/rad-security/agentkeeper-mcp-gateway/internal/fslock"
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/logging"
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/policy"
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/receipt"
@@ -1709,7 +1710,7 @@ func (p *Proxy) logToolOutcome(serverName, toolName string, params map[string]in
 		syncedPolicy = p.telemetry.Policy()
 	}
 	rawSnapshotID, effectiveViewHash := p.manifestEvidence(serverName, syncedPolicy)
-	if _, err := p.config.ReceiptStore.Enqueue(receipt.Input{
+	if err := p.enqueueReceipt(receipt.Input{
 		CallID:              outcome.CallID,
 		AttemptID:           outcome.AttemptID,
 		DecisionID:          outcome.DecisionID,
@@ -1736,6 +1737,22 @@ func (p *Proxy) logToolOutcome(serverName, toolName string, params map[string]in
 	}); err != nil && p.config.Logger != nil {
 		p.config.Logger.Warn("could not persist signed application receipt: %v", err)
 	}
+}
+
+// receiptEnqueueAttempts bounds how often a terminal receipt waits out a busy
+// queue. Gateway processes sharing one home take turns on it, and the receipt
+// is the signed record of the call, so it waits a little longer rather than
+// being dropped; without contention the first attempt succeeds.
+const receiptEnqueueAttempts = 3
+
+func (p *Proxy) enqueueReceipt(input receipt.Input) error {
+	var err error
+	for attempt := 0; attempt < receiptEnqueueAttempts; attempt++ {
+		if _, err = p.config.ReceiptStore.Enqueue(input); !errors.Is(err, fslock.ErrBusy) {
+			return err
+		}
+	}
+	return err
 }
 
 func (p *Proxy) durableEvidenceAvailable() bool {
