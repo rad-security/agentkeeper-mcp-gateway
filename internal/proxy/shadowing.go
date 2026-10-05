@@ -110,16 +110,21 @@ func (p *Proxy) emitShadowFinding(key, serverName, pattern, description, mode st
 }
 
 func (p *Proxy) routedServersWithTools() []string {
-	var names []string
-	for _, s := range p.manager.ServerNames() {
-		if p.serverBlockedByPolicy(s) {
-			continue
-		}
-		if len(p.cachedTools(s)) > 0 {
-			names = append(names, s)
+	p.mu.Lock()
+	names := make([]string, 0, len(p.toolCache))
+	for name, tools := range p.toolCache {
+		if len(tools) > 0 {
+			names = append(names, name)
 		}
 	}
-	return names
+	p.mu.Unlock()
+	routed := names[:0]
+	for _, name := range names {
+		if !p.serverBlockedByPolicy(name) {
+			routed = append(routed, name)
+		}
+	}
+	return routed
 }
 
 // serversLookAlike reports whether two server names are confusable: equal after
