@@ -147,6 +147,24 @@ func (e *Engine) ScanToolResponse(serverName, toolName string, response string) 
 	return e.scanContent(response, true)
 }
 
+// ContentViews returns the case-preserved normalized and decoded views of a
+// piece of content. Session correlation uses these to look for a remembered
+// value in a later tool call, including one hidden by base64/hex encoding.
+func (e *Engine) ContentViews(content string) []string {
+	views, _ := e.buildViews(content)
+	out := make([]string, 0, len(views))
+	for i := range views {
+		out = append(out, views[i].preserved)
+	}
+	return out
+}
+
+// FlattenArguments renders tool-call arguments as the flat text the detection
+// engine and session correlation inspect.
+func FlattenArguments(args map[string]interface{}) string {
+	return flattenParams(args)
+}
+
 // Primary returns the finding that should drive the decision before the
 // configured modes are applied: sensitive data before threats, strictest first.
 // It preserves the single-Result contract the legacy engine exposed.
