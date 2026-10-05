@@ -103,6 +103,65 @@ files or disposable dashboard keys.
 | Tool poisoning | Hidden instructions in MCP tool descriptions |
 | Sensitive data | Stripe/AWS/GitHub keys, credit cards, SSNs, private keys, JWTs |
 
+### Normalized and decoded scanning
+
+Tool-call arguments and tool results are matched not only as raw text but in
+normalized and decoded views, so a payload cannot slip past the patterns by
+escaping or encoding it:
+
+- **Normalization.** JSON string leaves are decoded (handling `\uXXXX`),
+  compatibility and full-width forms are folded to ASCII, look-alike letters
+  from other scripts are folded to Latin, zero-width, bidi and Unicode tag
+  characters are stripped, ANSI styling is removed, and whitespace is collapsed.
+- **Decoding.** base64 (standard and URL alphabets, padded or not), hex,
+  percent-encoding and HTML entities are decoded and rescanned, up to two levels
+  deep, within bounded segment and byte budgets. A finding reached through
+  decoding records how, in `decoded_from` (for example `base64`, or `base64>hex`
+  for a nested payload).
+- **Every finding.** A message that matches more than one rule reports them all.
+  The strictest outcome under the configured detection modes drives the
+  decision; the other findings are recorded in the event's `additional_findings`.
+- **Bounds.** Scanning is capped at 256 KiB per message; a larger message is
+  scanned head and tail and the event is marked `scan_truncated`.
+
+Tool results, `resources/read` and `prompts/get` additionally run the decisive
+tool-poisoning instruction families as `threat` findings named `result_poison_*`
+(`result_poison_ignore_instructions`, `result_poison_conceal_from_user`,
+`result_poison_exfil_data`, `result_poison_persona_override`,
+`result_poison_bypass_security`, `result_poison_credential_access`), so a
+poisoned document returned by a tool is caught the same way a poisoned tool
+definition is.
+
+### Session correlation
+
+Some attacks are invisible in any single call. The Gateway correlates activity
+across the calls of one client session, in memory in the per-session process,
+bounded and never persisted, storing only hashes of a secret (never the secret
+itself):
+
+| Pattern | Severity | What it catches |
+|---|---|---|
+| `session_secret_egress` | critical | A sensitive value returned by one tool is later sent somewhere it did not come from — whole, in pieces, or base64/hex-encoded. |
+| `session_injection_fragments` | high | An instruction split across several results that is harmless in each one but complete when they are joined. |
+| `session_staged_execution` | high | A tool call that stages a helper reading a credential source and pointing at an external destination, followed by a call that runs it. |
+
+These findings carry a `correlation` object in the event context
+(`source_server`, `source_tool`, `steps`). They are `threat` findings, so in
+Enforce with `detection.threat = block` they are blocked before dispatch (or the
+result is withheld) like any other threat.
+
+### Tool shadowing
+
+At `tools/list` the Gateway reports — without ever hiding a tool — when two
+routed servers compete for the same identity:
+
+- `tool_shadowing_duplicate` (`tool_poisoning`, medium): the same tool name is
+  offered by two routed servers. Generic names (`search`, `list`, `get`, …) are
+  exempt unless the server names look alike or a definition is poisoned.
+- `tool_shadowing_lookalike_server` (`tool_poisoning`, medium): one server's
+  name looks like another's (an added `proxy`/`shadow`/`mirror`/… token, a short
+  edit distance, or confusable letters).
+
 ## Two Modes
 
 **Observe (default; legacy config value `audit`):** Routed calls are inspected and reported, but a deny decision is recorded as `would block` and the downstream call is still forwarded.
@@ -116,6 +175,16 @@ agentkeeper-mcp-gateway server
 ```bash
 agentkeeper-mcp-gateway server --enforce
 ```
+
+A blocked tool is not silently removed. It stays in `tools/list` under the same
+name, with its description replaced by `Blocked by AgentKeeper: <reason>. Calls
+to this tool are refused.` and an empty input schema, so the agent sees why the
+tool is unavailable and the server's original (possibly poisoned) wording is
+never forwarded. A server blocked by policy is represented by a single
+placeholder tool named `<server>__agentkeeper_blocked`. Calls to either return
+the standard `Blocked by AgentKeeper: …` result. When a policy sync changes the
+effective mode, the blocked lists, or the detection modes, the Gateway sends
+`notifications/tools/list_changed` so the client re-lists.
 
 Local event files and their containing directory are owner-only (`0600` and
 `0700`). If the configured event path is a symlink or another non-regular file,
