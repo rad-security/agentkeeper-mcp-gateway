@@ -179,10 +179,16 @@ func TestEnforceBlockedServerIsNeverStartedOrServed(t *testing.T) {
 	tools := gw.request(t, 100, "tools/list", map[string]interface{}{})
 	resources := gw.request(t, 101, "resources/list", map[string]interface{}{})
 	prompts := gw.request(t, 102, "prompts/list", map[string]interface{}{})
-	for label, listing := range map[string]string{"tools/list": tools, "resources/list": resources, "prompts/list": prompts} {
-		if strings.Contains(listing, "blocked") {
-			t.Fatalf("%s exposes the blocked server: %s", label, listing)
-		}
+	// The blocked server's real tool, resources and prompts are never offered.
+	if strings.Contains(tools, "blocked__echo") {
+		t.Fatalf("tools/list exposes the blocked server's tool: %s", tools)
+	}
+	if strings.Contains(resources, "fixture://blocked") || strings.Contains(prompts, "blocked__greet") {
+		t.Fatalf("blocked server content was listed: %s %s", resources, prompts)
+	}
+	// It is represented instead by a single refusal placeholder tool.
+	if !strings.Contains(tools, "blocked__agentkeeper_blocked") || !strings.Contains(tools, "AgentKeeper blocked the blocked MCP server") {
+		t.Fatalf("blocked server placeholder missing from tools/list: %s", tools)
 	}
 	if !strings.Contains(resources, "fixture://allowed/notes") || !strings.Contains(prompts, "allowed__greet") {
 		t.Fatalf("allowed server content is missing: %s %s", resources, prompts)

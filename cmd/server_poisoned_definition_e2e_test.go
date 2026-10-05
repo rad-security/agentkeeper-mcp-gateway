@@ -112,8 +112,13 @@ func poisoningEvents(events []map[string]any, eventType string) []map[string]any
 
 func TestE2EEnforceBlocksPoisonedDefinitionWhereDetectionsBlock(t *testing.T) {
 	list, call, upstreamRan, events := runPoisonedDefinitionGateway(t, "enforce", `"detection": {"threat": "block"}, `, poisonedDefinitionBackend)
-	if strings.Contains(list, `"weather__get_weather"`) {
-		t.Fatalf("poisoned tool was listed in Enforce: %s", list)
+	// The poisoned tool stays listed under the same name as a refusal, with its
+	// upstream wording replaced; the ordinary tool is untouched.
+	if !strings.Contains(list, `"weather__get_weather"`) || !strings.Contains(list, "Blocked by AgentKeeper") {
+		t.Fatalf("poisoned tool was not neutered into a refusal in Enforce: %s", list)
+	}
+	if strings.Contains(list, "id_rsa") {
+		t.Fatalf("upstream poisoned description was forwarded: %s", list)
 	}
 	if !strings.Contains(list, `"weather__get_time"`) {
 		t.Fatalf("the same server's ordinary tool must stay listed: %s", list)
@@ -142,8 +147,10 @@ func TestE2EEnforceBlocksPoisonedDefinitionWhereDetectionsBlock(t *testing.T) {
 // Text that does not render is removed without a detector setting.
 func TestE2EEnforceBlocksInvisiblePayloadOnDefaultPolicy(t *testing.T) {
 	list, call, upstreamRan, events := runPoisonedDefinitionGateway(t, "enforce", "", invisiblePayloadBackend())
-	if strings.Contains(list, `"weather__get_weather"`) || !strings.Contains(list, `"weather__get_time"`) {
-		t.Fatalf("want the tool with the invisible payload hidden and the ordinary tool listed: %s", list)
+	// The tool with the invisible payload is neutered into a refusal; the
+	// ordinary tool stays listed.
+	if !strings.Contains(list, `"weather__get_weather"`) || !strings.Contains(list, "Blocked by AgentKeeper") || !strings.Contains(list, `"weather__get_time"`) {
+		t.Fatalf("want the invisible-payload tool neutered and the ordinary tool listed: %s", list)
 	}
 	if !strings.Contains(call, `"isError":true`) || !strings.Contains(call, "Blocked by AgentKeeper") || upstreamRan {
 		t.Fatalf("call to the tool was not blocked: upstreamRan=%v response=%s", upstreamRan, call)

@@ -165,6 +165,20 @@ func FlattenArguments(args map[string]interface{}) string {
 	return flattenParams(args)
 }
 
+// FoldConfusables lowercases a string and folds look-alike letters from other
+// scripts to Latin. Tool-shadowing detection uses it to compare server names.
+func FoldConfusables(s string) string {
+	return foldConfusablesLower(s)
+}
+
+// HasPoisonTrait reports whether an advertised tool definition carries any
+// tool-poisoning trait. Tool-shadowing detection uses it to decide whether a
+// duplicate of a generic tool name is worth reporting.
+func (e *Engine) HasPoisonTrait(tool ToolDescription) bool {
+	_, found := e.evaluateToolDefinition(tool)
+	return found
+}
+
 // Primary returns the finding that should drive the decision before the
 // configured modes are applied: sensitive data before threats, strictest first.
 // It preserves the single-Result contract the legacy engine exposed.

@@ -92,6 +92,7 @@ type Client struct {
 	modeAuthorityUnavailable bool
 	modeMu                   sync.RWMutex
 	modeChange               func(mode string, revision int64)
+	policyApplied            func()
 	gatewayVersion           string
 	servers                  []ServerInfo
 	discovered               []DiscoveredServerInfo
@@ -184,6 +185,24 @@ func (c *Client) SetModeChangeHandler(handler func(mode string, revision int64))
 	c.modeMu.Unlock()
 	if handler != nil && revision > 0 {
 		handler(modeLabel(mode), revision)
+	}
+}
+
+// SetPolicyAppliedHandler registers a callback the client invokes whenever a
+// fresh policy (mode, blocked lists or detection modes) is applied, so the
+// proxy can tell the client its tool list may have changed.
+func (c *Client) SetPolicyAppliedHandler(handler func()) {
+	c.modeMu.Lock()
+	c.policyApplied = handler
+	c.modeMu.Unlock()
+}
+
+func (c *Client) notifyPolicyApplied() {
+	c.modeMu.RLock()
+	handler := c.policyApplied
+	c.modeMu.RUnlock()
+	if handler != nil {
+		handler()
 	}
 }
 
@@ -522,6 +541,7 @@ func (c *Client) sync() bool {
 			if err := c.persistPolicyCache(); err != nil && c.logger != nil {
 				c.logger.Warn("could not persist last-known-good policy: %v", err)
 			}
+			c.notifyPolicyApplied()
 		}
 	}
 	if status != http.StatusOK {

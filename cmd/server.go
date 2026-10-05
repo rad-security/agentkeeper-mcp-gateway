@@ -202,7 +202,11 @@ are blocked.`,
 		if tc != nil {
 			tc.SetModeChangeHandler(func(mode string, _ int64) {
 				p.SetEnforceMode(mode == "enforce")
+				p.OnPolicyApplied()
 			})
+			// A policy sync that changes blocked lists or detection modes also
+			// changes what tools/list returns; notify the client when it does.
+			tc.SetPolicyAppliedHandler(p.OnPolicyApplied)
 			dashboardConnected = tc.Start()
 			// Every exit path (stdin EOF, client disconnect, SIGINT/SIGTERM)
 			// reaches this after the proxy has recorded terminal evidence for

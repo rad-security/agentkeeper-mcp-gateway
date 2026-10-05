@@ -28,6 +28,7 @@ import (
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/policy"
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/receipt"
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/server"
+	"github.com/rad-security/agentkeeper-mcp-gateway/internal/session"
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/telemetry"
 )
 
@@ -91,6 +92,14 @@ type Proxy struct {
 	// Map from namespaced tool name to server name
 	toolMap       map[string]string
 	poisonedTools map[string]detection.Result
+	// session correlates activity across the calls of this client session to
+	// catch multi-step exfiltration and split injection. Nil without an engine.
+	session *session.Tracker
+	// shadowReported records tool-shadowing findings already emitted this
+	// process, so each duplicate or look-alike pair is reported once.
+	shadowMu        sync.Mutex
+	shadowReported  map[string]bool
+	policySignature string
 	// definitionVerdicts holds the inspection result for each distinct tool
 	// definition seen, so a call does not re-inspect unchanged definitions.
 	definitionVerdictMu sync.Mutex
@@ -160,6 +169,10 @@ func NewProxy(cfg Config, mgr *server.Manager, tc *telemetry.Client) *Proxy {
 		emptyToolLists: make(map[string]int),
 		toolStatus:     make(map[string]toolRefreshStatus),
 		inflight:       make(map[string]context.CancelFunc),
+		shadowReported: make(map[string]bool),
+	}
+	if cfg.DetectionEngine != nil {
+		p.session = session.New(cfg.DetectionEngine)
 	}
 	if mgr != nil {
 		mgr.SetNotificationHandler(p.forwardBackendNotification)
@@ -536,11 +549,14 @@ func (p *Proxy) handleToolsList(msg JSONRPCMessage) (*JSONRPCMessage, error) {
 	if p.enforceMode() && p.config.RequireDurableEvents && !p.durableEvidenceAvailable() {
 		cachedTools = nil
 	}
-	if p.enforceMode() && p.telemetry != nil {
-		cachedTools = filterToolsForPolicy(cachedTools, nextToolMap, p.telemetry.Policy())
-	}
 	if p.enforceMode() {
-		cachedTools = p.filterPoisonedTools(cachedTools)
+		var synced telemetry.SyncPolicy
+		if p.telemetry != nil {
+			synced = p.telemetry.Policy()
+		}
+		// Enforce keeps blocked tools and servers in the list as refusals rather
+		// than hiding them, so the client sees why a tool is unavailable.
+		cachedTools = p.effectiveToolList(cachedTools, nextToolMap, synced)
 	}
 
 	allTools := p.getBuiltinTools()
@@ -555,27 +571,6 @@ func (p *Proxy) handleToolsList(msg JSONRPCMessage) (*JSONRPCMessage, error) {
 		ID:      msg.ID,
 		Result:  resultJSON,
 	}, nil
-}
-
-// filterToolsForPolicy enforces list/call parity without mutating the raw
-// manifest cache. Observe mode deliberately skips this function so users see
-// their normal tool catalog while the dashboard reports would-block impact.
-func filterToolsForPolicy(tools []interface{}, toolMap map[string]string, synced telemetry.SyncPolicy) []interface{} {
-	filtered := make([]interface{}, 0, len(tools))
-	for _, tool := range tools {
-		tm, ok := tool.(map[string]interface{})
-		if !ok {
-			continue
-		}
-		namespacedName, _ := tm["name"].(string)
-		serverName := toolMap[namespacedName]
-		originalName := originalMCPName(serverName, namespacedName)
-		if policy.Evaluate(synced, serverName, originalName, nil).Verdict == "block" {
-			continue
-		}
-		filtered = append(filtered, tool)
-	}
-	return filtered
 }
 
 func (p *Proxy) startToolRefresh() <-chan struct{} {
@@ -642,6 +637,7 @@ func (p *Proxy) refreshTools() {
 		result := <-results
 		p.applyToolList(result.name, result.tools, result.err)
 	}
+	p.reportToolShadowing()
 }
 
 // applyToolList records one upstream's tools/list outcome in the manifest
@@ -816,37 +812,6 @@ func (p *Proxy) logToolDescriptionDetections(serverName string, tools []interfac
 			p.config.Logger.LogDefinitionFinding(serverName, originalMCPName(serverName, name), decided, mode, listed)
 		}
 	}
-}
-
-func (p *Proxy) filterPoisonedTools(tools []interface{}) []interface{} {
-	var synced telemetry.SyncPolicy
-	if p.telemetry != nil {
-		synced = p.telemetry.Policy()
-	}
-	filtered := make([]interface{}, 0, len(tools))
-	for _, value := range tools {
-		tool, ok := value.(map[string]interface{})
-		if !ok {
-			continue
-		}
-		name, _ := tool["name"].(string)
-		result, found := p.toolDescriptionDetection(definitionAsAdvertised(tool))
-		if !found {
-			// Retain the asynchronous index as a compatibility fallback when
-			// descriptor inspection is unavailable. Enforcement must not depend
-			// on that index because a freshly refreshed or restored cache can be
-			// visible before the background evidence map is populated.
-			result, found = p.poisonedTool(name)
-		}
-		if found {
-			result = applyDetectionPolicy(result, synced, p.config.Detection)
-			if result.Verdict == detection.VerdictBlock {
-				continue
-			}
-		}
-		filtered = append(filtered, value)
-	}
-	return filtered
 }
 
 func (p *Proxy) toolDescriptionDetection(tool map[string]interface{}) (detection.Result, bool) {
@@ -1380,6 +1345,14 @@ func (p *Proxy) handleToolsCallContext(ctx context.Context, msg JSONRPCMessage) 
 	var syncPolicy telemetry.SyncPolicy
 	evaluationStatus := "evaluated"
 	decisionID := ""
+	// evidence describes the finding that drove the decision (its additional
+	// findings, decoding, correlation lineage) and sticks scan truncation.
+	var evidence scanEvidence
+	setEvidence := func(ev scanEvidence) {
+		truncated := evidence.truncated || ev.truncated
+		evidence = ev
+		evidence.truncated = truncated
+	}
 
 	if p.telemetry != nil {
 		syncPolicy = p.telemetry.Policy()
@@ -1445,14 +1418,30 @@ func (p *Proxy) handleToolsCallContext(ctx context.Context, msg JSONRPCMessage) 
 		}
 	}
 
-	// --- 2. Embedded detection ---
+	// --- 2. Embedded detection (normalized + decoded argument views) ---
 
 	if p.config.DetectionEngine != nil {
-		embeddedResult := p.config.DetectionEngine.EvaluateToolCall(serverName, originalName, callParams.Arguments)
-		embeddedResult = applyDetectionPolicy(embeddedResult, syncPolicy, p.config.Detection)
+		scan := p.config.DetectionEngine.ScanToolCall(serverName, originalName, callParams.Arguments)
+		embeddedResult, scanEv := p.applyScan(scan, syncPolicy)
+		if scan.Truncated {
+			evidence.truncated = true
+		}
 		if verdictRank(string(embeddedResult.Verdict)) > verdictRank(finalVerdict) {
 			finalVerdict = string(embeddedResult.Verdict)
 			finalResult = embeddedResult
+			setEvidence(scanEv)
+		}
+	}
+
+	// --- 2b. Session correlation on arguments (secret egress, staged run) ---
+	if p.session != nil {
+		if sf := p.session.InspectCall(serverName, originalName, callParams.Arguments); sf != nil {
+			sessionResult := applyDetectionPolicy(sf.Result(), syncPolicy, p.config.Detection)
+			if verdictRank(string(sessionResult.Verdict)) > verdictRank(finalVerdict) {
+				finalVerdict = string(sessionResult.Verdict)
+				finalResult = sessionResult
+				setEvidence(scanEvidence{correlation: sf.Correlation})
+			}
 		}
 	}
 
@@ -1481,12 +1470,12 @@ func (p *Proxy) handleToolsCallContext(ctx context.Context, msg JSONRPCMessage) 
 
 	// --- 4. Enforce merged verdict ---
 	if finalVerdict == "block" && enforceThisCall {
-		p.logToolOutcome(serverName, originalName, callParams.Arguments, finalResult, logging.ToolCallOutcome{
+		p.logToolOutcome(serverName, originalName, callParams.Arguments, finalResult, evidence.attach(logging.ToolCallOutcome{
 			CallID: callID, AttemptID: attemptID, Mode: effectiveMode,
 			PolicyDecision: finalVerdict, EvaluationStatus: evaluationStatus,
 			DecisionID:          decisionID,
 			RequiredDisposition: "deny_before_dispatch", AppliedDisposition: "denied_before_dispatch",
-		})
+		}))
 		errResult := map[string]interface{}{
 			"content": []map[string]interface{}{
 				{
@@ -1560,18 +1549,22 @@ func (p *Proxy) handleToolsCallContext(ctx context.Context, msg JSONRPCMessage) 
 			// Error message/data are provider-controlled response content too.
 			rawError, _ := json.Marshal(upstreamError)
 			if p.config.DetectionEngine != nil {
-				result := p.config.DetectionEngine.EvaluateToolResponse(serverName, originalName, string(rawError))
-				result = applyDetectionPolicy(result, syncPolicy, p.config.Detection)
+				scan := p.config.DetectionEngine.ScanToolResponse(serverName, originalName, string(rawError))
+				result, scanEv := p.applyScan(scan, syncPolicy)
+				if scan.Truncated {
+					evidence.truncated = true
+				}
 				if verdictRank(string(result.Verdict)) > verdictRank(finalVerdict) {
 					finalVerdict, finalResult = string(result.Verdict), result
+					setEvidence(scanEv)
 				}
 			}
-			outcome := logging.ToolCallOutcome{
+			outcome := evidence.attach(logging.ToolCallOutcome{
 				CallID: callID, AttemptID: attemptID, Mode: effectiveMode,
 				PolicyDecision: finalVerdict, EvaluationStatus: evaluationStatus,
 				DecisionID: decisionID, RequiredDisposition: "forward", AppliedDisposition: "result_returned",
 				Dispatched: true, ResultReceived: true, ResultReturned: true, FailureReason: "upstream_rpc_error",
-			}
+			})
 			if finalVerdict == "block" && enforceThisCall {
 				outcome.RequiredDisposition, outcome.AppliedDisposition = "withhold_result", "result_withheld"
 				outcome.ResultReturned, outcome.ResponseWithheld = false, true
@@ -1593,24 +1586,39 @@ func (p *Proxy) handleToolsCallContext(ctx context.Context, msg JSONRPCMessage) 
 	}
 	p.manager.MarkHealthy(serverName)
 
-	// --- 6. Post-execution response scan ---
+	// --- 6. Post-execution response scan (normalized + decoded result views) ---
 	if p.config.DetectionEngine != nil {
 		respStr := string(response)
-		result := p.config.DetectionEngine.EvaluateToolResponse(serverName, originalName, respStr)
-		result = applyDetectionPolicy(result, syncPolicy, p.config.Detection)
+		scan := p.config.DetectionEngine.ScanToolResponse(serverName, originalName, respStr)
+		result, respEv := p.applyScan(scan, syncPolicy)
+		// Session correlation: remember any secret returned here, and catch an
+		// instruction split across this and earlier results.
+		if p.session != nil {
+			if sf := p.session.ObserveContent(serverName, originalName, respStr, scan); sf != nil {
+				sessionResult := applyDetectionPolicy(sf.Result(), syncPolicy, p.config.Detection)
+				if verdictRank(string(sessionResult.Verdict)) > verdictRank(string(result.Verdict)) {
+					result = sessionResult
+					respEv = scanEvidence{correlation: sf.Correlation, truncated: scan.Truncated}
+				}
+			}
+		}
+		if scan.Truncated {
+			evidence.truncated = true
+		}
 		if result.Verdict != detection.VerdictPass {
 			if verdictRank(string(result.Verdict)) > verdictRank(finalVerdict) {
 				finalVerdict = string(result.Verdict)
 				finalResult = result
+				setEvidence(respEv)
 			}
 			if result.Verdict == detection.VerdictBlock && enforceThisCall {
-				p.logToolOutcome(serverName, originalName, callParams.Arguments, finalResult, logging.ToolCallOutcome{
+				p.logToolOutcome(serverName, originalName, callParams.Arguments, finalResult, evidence.attach(logging.ToolCallOutcome{
 					CallID: callID, AttemptID: attemptID, Mode: effectiveMode,
 					PolicyDecision: finalVerdict, EvaluationStatus: evaluationStatus,
 					DecisionID:          decisionID,
 					RequiredDisposition: "withhold_result", AppliedDisposition: "result_withheld",
 					Dispatched: true, ResultReceived: true, ResponseWithheld: true,
-				})
+				}))
 				errResult := map[string]interface{}{
 					"content": []map[string]interface{}{
 						{
@@ -1626,13 +1634,13 @@ func (p *Proxy) handleToolsCallContext(ctx context.Context, msg JSONRPCMessage) 
 		}
 	}
 
-	p.logToolOutcome(serverName, originalName, callParams.Arguments, finalResult, logging.ToolCallOutcome{
+	p.logToolOutcome(serverName, originalName, callParams.Arguments, finalResult, evidence.attach(logging.ToolCallOutcome{
 		CallID: callID, AttemptID: attemptID, Mode: effectiveMode,
 		PolicyDecision: finalVerdict, EvaluationStatus: evaluationStatus,
 		DecisionID:          decisionID,
 		RequiredDisposition: "forward", AppliedDisposition: "result_returned",
 		Dispatched: true, ResultReceived: true, ResultReturned: true,
-	})
+	}))
 
 	return &JSONRPCMessage{JSONRPC: "2.0", ID: msg.ID, Result: response}, nil
 }
@@ -1750,8 +1758,7 @@ func (p *Proxy) manifestEvidence(serverName string, syncedPolicy telemetry.SyncP
 	namespacedTools := make([]interface{}, 0, len(rawTools))
 	toolMap := make(map[string]string, len(rawTools))
 	appendNamespacedTools(&namespacedTools, toolMap, serverName, rawTools)
-	effectiveTools := filterToolsForPolicy(namespacedTools, toolMap, syncedPolicy)
-	effectiveTools = p.filterPoisonedTools(effectiveTools)
+	effectiveTools := p.neuterBlockedTools(namespacedTools, toolMap, syncedPolicy)
 	return rawSnapshotID, hashJSON(effectiveTools)
 }
 
@@ -2204,8 +2211,8 @@ func (p *Proxy) inspectContentResult(id *json.RawMessage, serverName, method str
 }
 func (p *Proxy) inspectContentResultMode(id *json.RawMessage, serverName, method string, response json.RawMessage, enforceThisCall bool) (*JSONRPCMessage, error) {
 	result := detection.Result{Verdict: detection.VerdictPass}
+	var evidence scanEvidence
 	if p.config.DetectionEngine != nil {
-		result = p.config.DetectionEngine.EvaluateToolResponse(serverName, method, string(response))
 		syncedPolicy := telemetry.SyncPolicy{}
 		if p.telemetry != nil {
 			syncedPolicy = p.telemetry.Policy()
@@ -2214,18 +2221,31 @@ func (p *Proxy) inspectContentResultMode(id *json.RawMessage, serverName, method
 		// offline or intentionally deployed without cloud telemetry. Resources
 		// and prompts must honor the same Observe/Enforce contract as tool
 		// results; cloud policy augments that contract but is not a prerequisite.
-		result = applyDetectionPolicy(result, syncedPolicy, p.config.Detection)
+		scan := p.config.DetectionEngine.ScanToolResponse(serverName, method, string(response))
+		result, evidence = p.applyScan(scan, syncedPolicy)
+		// Resources and prompts feed the same session correlation as tool
+		// results: a secret returned here can be exfiltrated by a later call,
+		// and an instruction can be split across them.
+		if p.session != nil {
+			if sf := p.session.ObserveContent(serverName, method, string(response), scan); sf != nil {
+				sessionResult := applyDetectionPolicy(sf.Result(), syncedPolicy, p.config.Detection)
+				if verdictRank(string(sessionResult.Verdict)) > verdictRank(string(result.Verdict)) {
+					result = sessionResult
+					evidence = scanEvidence{correlation: sf.Correlation, truncated: scan.Truncated}
+				}
+			}
+		}
 	}
 	decision := string(result.Verdict)
 	if decision == "" {
 		decision = "pass"
 	}
-	outcome := logging.ToolCallOutcome{
+	outcome := evidence.attach(logging.ToolCallOutcome{
 		CallID: newEvidenceID("call"), AttemptID: newEvidenceID("attempt"),
 		Mode: "observe", PolicyDecision: decision, EvaluationStatus: "evaluated",
 		RequiredDisposition: "forward", AppliedDisposition: "result_returned",
 		Dispatched: true, ResultReceived: true, ResultReturned: true,
-	}
+	})
 	if enforceThisCall {
 		outcome.Mode = "enforce"
 	}

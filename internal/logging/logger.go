@@ -50,6 +50,14 @@ type ToolCallOutcome struct {
 	ResultReturned      bool
 	ResponseWithheld    bool
 	FailureReason       string
+	// Detection evidence beyond the primary finding. AdditionalFindings lists
+	// the other distinct findings for the same message; DecodedFrom names the
+	// decoding the primary finding was reached through; ScanTruncated reports a
+	// message too large to inspect in full; Correlation carries session lineage.
+	AdditionalFindings []map[string]interface{}
+	DecodedFrom        string
+	ScanTruncated      bool
+	Correlation        map[string]interface{}
 }
 
 // Logger writes structured events to a JSONL file.
@@ -260,6 +268,18 @@ func (l *Logger) LogToolCallOutcome(serverName, toolName string, params map[stri
 	context["response_withheld"] = outcome.ResponseWithheld
 	if outcome.FailureReason != "" {
 		context["failure_reason"] = outcome.FailureReason
+	}
+	if len(outcome.AdditionalFindings) > 0 {
+		context["additional_findings"] = outcome.AdditionalFindings
+	}
+	if outcome.DecodedFrom != "" {
+		context["decoded_from"] = outcome.DecodedFrom
+	}
+	if outcome.ScanTruncated {
+		context["scan_truncated"] = true
+	}
+	if len(outcome.Correlation) > 0 {
+		context["correlation"] = outcome.Correlation
 	}
 	event := Event{
 		Timestamp:   time.Now().UTC().Format(time.RFC3339Nano),
