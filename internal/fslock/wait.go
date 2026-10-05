@@ -2,7 +2,14 @@
 // Gateway processes of one user.
 package fslock
 
-import "time"
+import (
+	"errors"
+	"time"
+)
+
+// ErrBusy reports that another Gateway process held the lock for the whole
+// wait. The text is the one the Gateway has always logged.
+var ErrBusy = errors.New("storage lock busy")
 
 // acquireWait bounds how long Acquire waits for a lock another Gateway
 // process holds. Holders write one small file and release, so the wait is

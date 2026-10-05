@@ -478,6 +478,57 @@ func ManifestPath() (string, error) {
 	return filepath.Join(filepath.Dir(path), config.ManualRoutingManifestName), nil
 }
 
+// SetupRecord is what the ownership record says a routed mcpServers document
+// held before AgentKeeper last routed it.
+type SetupRecord struct {
+	// Servers is the document's top-level mcpServers map before routing.
+	Servers map[string]json.RawMessage
+	// Projects holds the mcpServers map of each Claude Code project under
+	// `projects` before routing.
+	Projects map[string]map[string]json.RawMessage
+	// Migrated names the servers routing moved into the Gateway: those it
+	// took out of the top-level map, and the Gateway servers the route owns.
+	Migrated map[string]bool
+}
+
+// ReadSetupRecord returns the ownership record of one routed client file.
+// found is false when no route of that file is recorded. It never writes.
+func ReadSetupRecord(path string) (record SetupRecord, found bool, err error) {
+	manifestPath, err := ManifestPath()
+	if err != nil {
+		return SetupRecord{}, false, err
+	}
+	state, err := readManifest(manifestPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return SetupRecord{}, false, nil
+	}
+	if err != nil {
+		return SetupRecord{}, false, fmt.Errorf("read manual routing manifest: %w", err)
+	}
+	if state.Version != manifestVersion || state.OwnershipID != ownershipID {
+		return SetupRecord{}, false, fmt.Errorf("manual routing manifest version is incompatible")
+	}
+	client, ok := findClient(state.Clients, path)
+	if !ok {
+		// Adopt records a symlinked client file under the file it resolves to.
+		if resolved, resolveErr := filepath.EvalSymlinks(path); resolveErr == nil && resolved != path {
+			client, ok = findClient(state.Clients, resolved)
+		}
+	}
+	if !ok || client.Kind == KindCoworkRemote {
+		return SetupRecord{}, false, nil
+	}
+	servers, err := serverMap(client.OriginalBytes)
+	if err != nil {
+		return SetupRecord{}, false, fmt.Errorf("parse recorded pre-route servers for %s: %w", path, err)
+	}
+	record = SetupRecord{Servers: servers, Projects: projectServerMaps(client.OriginalBytes), Migrated: map[string]bool{}}
+	for _, name := range append(append([]string(nil), client.MigratedServers...), client.GatewayServers...) {
+		record.Migrated[name] = true
+	}
+	return record, true, nil
+}
+
 func prepareRestore(state clientState) (restoreAction, error) {
 	current, err := snapshotFile(state.Path)
 	if err != nil {

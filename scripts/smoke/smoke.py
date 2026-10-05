@@ -407,14 +407,19 @@ class Smoke:
         home, state, env = self.scenario("enforce poisoned", mode="enforce", upstream_env={"SMOKE_POISON": "1"},
                                          detection={"threat": "block"})
         server, names = self.connect(home, env, {UPSTREAM + "__echo"})
-        expect(UPSTREAM + "__get_weather" not in names, "poisoned tool was listed in Enforce: %s" % sorted(names))
+        # The poisoned tool stays listed under the same name as a refusal, with
+        # its upstream wording replaced, and its calls are refused.
+        listed = {tool["name"]: tool.get("description", "") for tool in server.request("tools/list")["tools"]}
+        weather = listed.get(UPSTREAM + "__get_weather", "")
+        expect("Blocked by AgentKeeper" in weather, "poisoned tool was not neutered into a refusal: %s" % sorted(listed))
+        expect("id_rsa" not in weather, "upstream poisoned description was forwarded: %s" % weather)
         blocked = server.request("tools/call", {"name": UPSTREAM + "__get_weather", "arguments": {"city": "Austin"}})
         text = blocked["content"][0]["text"]
         expect(blocked.get("isError") and "Blocked by AgentKeeper" in text, "call was not blocked: %s" % blocked)
         echoed = server.request("tools/call", {"name": UPSTREAM + "__echo", "arguments": {"text": "ok"}})
         expect(echoed["content"][0]["text"] == "ok", "the ordinary tool stopped working: %s" % echoed)
         self.finish(server)
-        return "hidden from tools/list, call refused, ordinary tool still works"
+        return "listed as a refusal, call refused, ordinary tool still works"
 
     def observe_reports_poisoned_tool(self):
         home, state, env = self.scenario("observe poisoned", upstream_env={"SMOKE_POISON": "1"})

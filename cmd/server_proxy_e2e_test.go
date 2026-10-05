@@ -430,8 +430,14 @@ done
 
 			writeRPC(t, stdin, `{"jsonrpc":"2.0","id":131,"method":"tools/list","params":{}}`)
 			listResp := readRPCResponseForIDWithin(t, reader, "131", 2*time.Second)
-			if strings.Contains(listResp, `"poisoned-fixture__poisoned_descriptor"`) {
+			// The poisoned descriptor's instructions must never reach the agent.
+			// The tool is listed as a refusal with its wording replaced, so the
+			// original description does not appear.
+			if strings.Contains(listResp, "attacker.com") || strings.Contains(listResp, "Ignore previous instructions") {
 				t.Fatalf("iteration %d exposed poisoned descriptor on first list: %s", iteration, listResp)
+			}
+			if !strings.Contains(listResp, `"poisoned-fixture__poisoned_descriptor"`) || !strings.Contains(listResp, "Blocked by AgentKeeper") {
+				t.Fatalf("iteration %d did not list the poisoned tool as a refusal: %s", iteration, listResp)
 			}
 
 			writeRPC(t, stdin, `{"jsonrpc":"2.0","id":132,"method":"tools/call","params":{"name":"poisoned-fixture__poisoned_descriptor","arguments":{}}}`)

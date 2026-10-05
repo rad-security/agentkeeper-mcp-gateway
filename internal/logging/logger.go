@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/detection"
@@ -50,6 +51,14 @@ type ToolCallOutcome struct {
 	ResultReturned      bool
 	ResponseWithheld    bool
 	FailureReason       string
+	// Detection evidence beyond the primary finding. AdditionalFindings lists
+	// the other distinct findings for the same message; DecodedFrom names the
+	// decoding the primary finding was reached through; ScanTruncated reports a
+	// message too large to inspect in full; Correlation carries session lineage.
+	AdditionalFindings []map[string]interface{}
+	DecodedFrom        string
+	ScanTruncated      bool
+	Correlation        map[string]interface{}
 }
 
 // Logger writes structured events to a JSONL file.
@@ -72,6 +81,7 @@ type Logger struct {
 	queueMaxEvents int
 	queueMaxBytes  int64
 	queueLastError string
+	sessionID      atomic.Value // string
 }
 
 // EventQueueStatus is safe to expose through local health output. It contains
@@ -261,6 +271,18 @@ func (l *Logger) LogToolCallOutcome(serverName, toolName string, params map[stri
 	if outcome.FailureReason != "" {
 		context["failure_reason"] = outcome.FailureReason
 	}
+	if len(outcome.AdditionalFindings) > 0 {
+		context["additional_findings"] = outcome.AdditionalFindings
+	}
+	if outcome.DecodedFrom != "" {
+		context["decoded_from"] = outcome.DecodedFrom
+	}
+	if outcome.ScanTruncated {
+		context["scan_truncated"] = true
+	}
+	if len(outcome.Correlation) > 0 {
+		context["correlation"] = outcome.Correlation
+	}
 	event := Event{
 		Timestamp:   time.Now().UTC().Format(time.RFC3339Nano),
 		EventType:   "mcp.tool_call",
@@ -314,6 +336,33 @@ func (l *Logger) LogSessionStart(hostname, osName, gatewayVersion string, server
 	}
 
 	l.writeEvent(event)
+}
+
+// SetSessionID records the Gateway process session in the context of every
+// event written from now on. It is stamped when the event is written, so an
+// event replayed from the durable queue by a later process keeps the session
+// of the process that observed it.
+func (l *Logger) SetSessionID(sessionID string) {
+	l.sessionID.Store(sessionID)
+}
+
+// withSessionID returns event with the session in its context, leaving the
+// caller's context map untouched.
+func (l *Logger) withSessionID(event Event) Event {
+	sessionID, _ := l.sessionID.Load().(string)
+	if sessionID == "" {
+		return event
+	}
+	if _, present := event.Context["session_id"]; present {
+		return event
+	}
+	context := make(map[string]interface{}, len(event.Context)+1)
+	for key, value := range event.Context {
+		context[key] = value
+	}
+	context["session_id"] = sessionID
+	event.Context = context
+	return event
 }
 
 // Warn logs a warning message to stderr.
@@ -487,6 +536,7 @@ func (l *Logger) Close() error {
 }
 
 func (l *Logger) writeEvent(event Event) {
+	event = l.withSessionID(event)
 	persisted := false
 	if remoteIngestable(event) && event.EventID == "" {
 		event.EventID = newEventID()

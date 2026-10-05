@@ -501,31 +501,60 @@ func TestAppendNamespacedToolsDoesNotMutateOriginalTools(t *testing.T) {
 	}
 }
 
-func TestFilterToolsForPolicyHidesDeniedToolsButPreservesDirectCallMap(t *testing.T) {
+// isBlockedStub reports whether a listed tool was neutered into a refusal.
+func isBlockedStub(v interface{}) bool {
+	m, ok := v.(map[string]interface{})
+	if !ok {
+		return false
+	}
+	d, _ := m["description"].(string)
+	schema, _ := m["inputSchema"].(map[string]interface{})
+	return strings.HasPrefix(d, "Blocked by AgentKeeper:") && strings.Contains(d, "refused") &&
+		schema != nil && schema["type"] == "object" && len(schema) == 1
+}
+
+func toolByName(tools []interface{}, name string) map[string]interface{} {
+	for _, v := range tools {
+		if m, ok := v.(map[string]interface{}); ok && m["name"] == name {
+			return m
+		}
+	}
+	return nil
+}
+
+func TestNeuterBlockedToolsKeepsThemListedAsRefusalsAndPreservesRoutingMap(t *testing.T) {
 	tools := []interface{}{
-		map[string]interface{}{"name": "atlas__search"},
-		map[string]interface{}{"name": "atlas__delete_account"},
-		map[string]interface{}{"name": "github__list_repos"},
+		map[string]interface{}{"name": "atlas__search", "description": "Search"},
+		map[string]interface{}{"name": "atlas__delete_account", "description": "Delete"},
+		map[string]interface{}{"name": "github__list_repos", "description": "List"},
 	}
 	toolMap := map[string]string{
 		"atlas__search":         "atlas",
 		"atlas__delete_account": "atlas",
 		"github__list_repos":    "github",
 	}
-
-	filtered := filterToolsForPolicy(tools, toolMap, telemetry.SyncPolicy{
+	p := &Proxy{}
+	neutered := p.neuterBlockedTools(tools, toolMap, telemetry.SyncPolicy{
 		BlockedTools:   map[string][]string{"atlas": {"delete_account"}},
 		BlockedServers: []string{"github"},
 	})
 
-	if len(filtered) != 1 {
-		t.Fatalf("filtered tools = %d, want 1", len(filtered))
+	// Blocked tools stay listed under the same name, as refusals; the allowed
+	// one is unchanged; the routing map is not mutated.
+	if len(neutered) != 3 {
+		t.Fatalf("neutered tools = %d, want 3", len(neutered))
 	}
-	if got := filtered[0].(map[string]interface{})["name"]; got != "atlas__search" {
-		t.Fatalf("remaining tool = %#v, want atlas__search", got)
+	if search := toolByName(neutered, "atlas__search"); search == nil || search["description"] != "Search" {
+		t.Fatalf("allowed tool was changed: %#v", search)
+	}
+	if !isBlockedStub(toolByName(neutered, "atlas__delete_account")) {
+		t.Fatalf("blocked tool is not a refusal stub")
+	}
+	if !isBlockedStub(toolByName(neutered, "github__list_repos")) {
+		t.Fatalf("blocked-server tool is not a refusal stub")
 	}
 	if toolMap["atlas__delete_account"] != "atlas" {
-		t.Fatal("filter mutated the direct-call routing map")
+		t.Fatal("neutering mutated the direct-call routing map")
 	}
 }
 
@@ -626,9 +655,9 @@ func TestEnforceFiltersPoisonedDescriptionAndKeepsDirectEvidence(t *testing.T) {
 		map[string]interface{}{"name": "atlas__danger"},
 		map[string]interface{}{"name": "atlas__search"},
 	}
-	filtered := p.filterPoisonedTools(tools)
-	if len(filtered) != 1 || filtered[0].(map[string]interface{})["name"] != "atlas__search" {
-		t.Fatalf("filtered poisoned tools = %+v", filtered)
+	neutered := p.neuterBlockedTools(tools, map[string]string{"atlas__danger": "atlas", "atlas__search": "atlas"}, telemetry.SyncPolicy{})
+	if len(neutered) != 2 || !isBlockedStub(toolByName(neutered, "atlas__danger")) || toolByName(neutered, "atlas__search") == nil {
+		t.Fatalf("poisoned tool was not neutered in place: %+v", neutered)
 	}
 	if result, found := p.poisonedTool("atlas__danger"); !found || result.Category != "tool_poisoning" {
 		t.Fatalf("direct-call poisoning evidence missing: found=%t result=%+v", found, result)
@@ -676,8 +705,9 @@ func TestEnforceInspectsCachedDescriptionWithoutBackgroundPoisonIndex(t *testing
 
 	namespaced := cloneTools([]interface{}{poisoned})
 	namespaced[0].(map[string]interface{})["name"] = "atlas__danger"
-	if filtered := p.filterPoisonedTools(namespaced); len(filtered) != 0 {
-		t.Fatalf("poisoned descriptor remained visible without background index: %+v", filtered)
+	neutered := p.neuterBlockedTools(namespaced, map[string]string{"atlas__danger": "atlas"}, telemetry.SyncPolicy{})
+	if len(neutered) != 1 || !isBlockedStub(neutered[0]) {
+		t.Fatalf("poisoned descriptor was not neutered without the background index: %+v", neutered)
 	}
 
 	id := json.RawMessage(`10`)

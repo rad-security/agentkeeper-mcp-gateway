@@ -103,6 +103,65 @@ files or disposable dashboard keys.
 | Tool poisoning | Hidden instructions in MCP tool descriptions |
 | Sensitive data | Stripe/AWS/GitHub keys, credit cards, SSNs, private keys, JWTs |
 
+### Normalized and decoded scanning
+
+Tool-call arguments and tool results are matched not only as raw text but in
+normalized and decoded views, so a payload cannot slip past the patterns by
+escaping or encoding it:
+
+- **Normalization.** JSON string leaves are decoded (handling `\uXXXX`),
+  compatibility and full-width forms are folded to ASCII, look-alike letters
+  from other scripts are folded to Latin, zero-width, bidi and Unicode tag
+  characters are stripped, ANSI styling is removed, and whitespace is collapsed.
+- **Decoding.** base64 (standard and URL alphabets, padded or not), hex,
+  percent-encoding and HTML entities are decoded and rescanned, up to two levels
+  deep, within bounded segment and byte budgets. A finding reached through
+  decoding records how, in `decoded_from` (for example `base64`, or `base64>hex`
+  for a nested payload).
+- **Every finding.** A message that matches more than one rule reports them all.
+  The strictest outcome under the configured detection modes drives the
+  decision; the other findings are recorded in the event's `additional_findings`.
+- **Bounds.** Scanning is capped at 256 KiB per message; a larger message is
+  scanned head and tail and the event is marked `scan_truncated`.
+
+Tool results, `resources/read` and `prompts/get` additionally run the decisive
+tool-poisoning instruction families as `threat` findings named `result_poison_*`
+(`result_poison_ignore_instructions`, `result_poison_conceal_from_user`,
+`result_poison_exfil_data`, `result_poison_persona_override`,
+`result_poison_bypass_security`, `result_poison_credential_access`), so a
+poisoned document returned by a tool is caught the same way a poisoned tool
+definition is.
+
+### Session correlation
+
+Some attacks are invisible in any single call. The Gateway correlates activity
+across the calls of one client session, in memory in the per-session process,
+bounded and never persisted, storing only hashes of a secret (never the secret
+itself):
+
+| Pattern | Severity | What it catches |
+|---|---|---|
+| `session_secret_egress` | critical | A sensitive value returned by one tool is later sent somewhere it did not come from — whole, in pieces, or base64/hex-encoded. |
+| `session_injection_fragments` | high | An instruction split across several results that is harmless in each one but complete when they are joined. |
+| `session_staged_execution` | high | A tool call that stages a helper reading a credential source and pointing at an external destination, followed by a call that runs it. |
+
+These findings carry a `correlation` object in the event context
+(`source_server`, `source_tool`, `steps`). They are `threat` findings, so in
+Enforce with `detection.threat = block` they are blocked before dispatch (or the
+result is withheld) like any other threat.
+
+### Tool shadowing
+
+At `tools/list` the Gateway reports — without ever hiding a tool — when two
+routed servers compete for the same identity:
+
+- `tool_shadowing_duplicate` (`tool_poisoning`, medium): the same tool name is
+  offered by two routed servers. Generic names (`search`, `list`, `get`, …) are
+  exempt unless the server names look alike or a definition is poisoned.
+- `tool_shadowing_lookalike_server` (`tool_poisoning`, medium): one server's
+  name looks like another's (an added `proxy`/`shadow`/`mirror`/… token, a short
+  edit distance, or confusable letters).
+
 ## Two Modes
 
 **Observe (default; legacy config value `audit`):** Routed calls are inspected and reported, but a deny decision is recorded as `would block` and the downstream call is still forwarded.
@@ -116,6 +175,16 @@ agentkeeper-mcp-gateway server
 ```bash
 agentkeeper-mcp-gateway server --enforce
 ```
+
+A blocked tool is not silently removed. It stays in `tools/list` under the same
+name, with its description replaced by `Blocked by AgentKeeper: <reason>. Calls
+to this tool are refused.` and an empty input schema, so the agent sees why the
+tool is unavailable and the server's original (possibly poisoned) wording is
+never forwarded. A server blocked by policy is represented by a single
+placeholder tool named `<server>__agentkeeper_blocked`. Calls to either return
+the standard `Blocked by AgentKeeper: …` result. When a policy sync changes the
+effective mode, the blocked lists, or the detection modes, the Gateway sends
+`notifications/tools/list_changed` so the client re-lists.
 
 Local event files and their containing directory are owner-only (`0600` and
 `0700`). If the configured event path is a symlink or another non-regular file,
@@ -145,7 +214,7 @@ Optional. Get fleet-wide visibility, team policies, and identity-aware access co
 agentkeeper-mcp-gateway auth login
 ```
 
-Opens your browser for device authorization. Once connected, events stream to the dashboard and team policies sync every 60 seconds.
+Opens your browser for device authorization. Once connected, events upload every 5 seconds and the Gateway syncs every 30 seconds: it fetches team policy and reports its servers, including a hash of each server's tool definitions and, when they change, the definitions themselves, so the dashboard keeps a history of definition changes. Every evaluation and event carries the session id of the Gateway process that handled the call. See [What the Gateway reports](docs/gateway-sync-fields.md) for the fields.
 
 ## CLI Reference
 
@@ -206,6 +275,26 @@ For each detected IDE it:
 A second invocation is a no-op when the exact current Gateway shape is already present. Every write creates a backup and uses a source-hash compare-and-swap check, so a file edited after planning is left unchanged. The applying form writes a private manual-ownership manifest. `--remove-routing` uses that manifest to restore byte-exact original client files when nothing drifted, or to remove only the owned Gateway entry and restore migrated servers while preserving later customer changes. It refuses inferred cleanup if ownership evidence is missing or a migrated Gateway server has drifted. The same flag covers every route `configure-ide`, `cowork configure` and the Cowork guard make: global Claude Code, Claude Desktop and Cursor routes, Claude Code project-scoped servers in `~/.claude.json`, project `.mcp.json` files, and Cowork sources. With `--ide`, only that client's routes are restored. Routes made by a release that did not record project or Cowork ownership are restored to the extent the manifest and backups allow; their servers stay in the gateway config and can be removed with `remove`. A routed file that is missing when rollback runs is skipped and reported under `skipped_missing`; its record and gateway servers are kept, so running rollback again restores it if it comes back (remove leftover servers with `remove <name>` if it will not). Stop a running `cowork guard` before rolling back, or its next pass routes the restored Cowork sources again.
 
 Package installation must remain stage-only: do not run the applying form from a postinstall script or broad MDM assignment. Managed routing is a separate, explicitly approved activation step after preview and client-state checks.
+
+## Routing watch
+
+A client reads its MCP config when it starts, and so does the Gateway it launches. A server added afterwards (`claude mcp add`, an edited `mcp.json`) reaches the client directly the next time the client starts. A Gateway launched by a `configure-ide` route, when it is connected to the dashboard or in Enforce, therefore watches the config files `configure-ide` routes for its own client: for Claude Code `~/.claude.json` (user servers and every project under `projects`) and the project's `.mcp.json`, for the other clients their config file listed above. It checks them every 5 seconds (a stat first, the contents only when a file changed) and also lists the MCP servers bundled with installed Claude Code plugins. Cowork sources are covered by `cowork guard`.
+
+Every server that reaches the client without passing through the Gateway is reported to the dashboard within seconds, with why it is direct:
+
+| Reason | Meaning |
+|---|---|
+| `added_after_setup` | Added after setup: first seen after the Gateway started, or missing from the file when `configure-ide` routed it |
+| `oauth` | A remote server the client authenticates itself; `configure-ide` leaves it in the client by design |
+| `plugin` | Provided by an installed Claude Code plugin; reported only |
+
+**Observe** never writes anything. **Enforce** routes a server added after setup the way `configure-ide` does: the server moves into the Gateway config, the client file gets a backup in the gateway backup directory, and the change is recorded so `configure-ide --remove-routing` can undo it. Only the added server's entry leaves the client file. The edit is a compare-and-swap: the file is read and hashed, and re-checked right before the atomic rename; if the client wrote it in between, nothing is replaced and the edit is retried on the next check, at most three times. The Gateway prints one line per routed server:
+
+```text
+[agentkeeper] routing watch: routed MCP server "weather", added to /Users/dev/.claude.json after setup, through the Gateway as "weather"; claude-code uses the routed server after it restarts (backup: …)
+```
+
+The client keeps any direct connection it already has until it restarts, so the dashboard shows the server as `routed_pending_restart` until then. The watch does not route a server the client must keep (OAuth, or an entry with a field the Gateway does not model), a server in a file that carries no Gateway route (never routed, or its route was removed), a project `.mcp.json` inside a git repository, or anything on a machine whose routing a managed deployment owns. Set `AGENTKEEPER_AUTO_ROUTE=0` in the Gateway's environment to keep reporting but never route automatically.
 
 ## AgentKeeper Linux runtime integration
 

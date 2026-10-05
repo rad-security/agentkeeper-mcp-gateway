@@ -3,7 +3,6 @@
 package fslock
 
 import (
-	"fmt"
 	"golang.org/x/sys/unix"
 	"os"
 	"time"
@@ -27,7 +26,7 @@ func Acquire(path string) (func(), error) {
 		}
 		if time.Now().After(deadline) {
 			_ = file.Close()
-			return nil, fmt.Errorf("storage lock busy")
+			return nil, ErrBusy
 		}
 		time.Sleep(time.Millisecond)
 	}

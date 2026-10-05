@@ -38,6 +38,9 @@ type Engine struct {
 	webPatterns       []Pattern
 	sensitivePatterns []Pattern
 	poisonTraits      []poisonTrait
+	// prefilter indexes every rule's literal triggers so one Aho-Corasick pass
+	// per view tells each rule whether it can skip its regex.
+	prefilter *literalIndex
 }
 
 // Pattern is a compiled detection rule.
@@ -50,6 +53,43 @@ type Pattern struct {
 	// Some patterns need a secondary check
 	SecondaryRegex *regexp.Regexp
 	TertiaryRegex  *regexp.Regexp
+	// Triggers is a single OR-group of lowercase literals: at least one must be
+	// present for the regex to have any chance of matching. TriggerGroups adds
+	// further OR-groups that must each also be satisfied (a conjunction). When
+	// both are empty and Prefilter is nil the regex always runs.
+	Triggers      []string
+	TriggerGroups [][]string
+	// Prefilter, when set, decides whether to run the regex instead of the
+	// literal groups. It is used for patterns with no usable literal (card and
+	// SSN shapes), which are gated by a cheap numeric scan instead.
+	Prefilter func(preserved, lower string) bool
+}
+
+// literalGroups returns every OR-group a pattern uses, for registration in the
+// shared literal index.
+func (p Pattern) literalGroups() [][]string {
+	var groups [][]string
+	if len(p.Triggers) > 0 {
+		groups = append(groups, p.Triggers)
+	}
+	groups = append(groups, p.TriggerGroups...)
+	return groups
+}
+
+// admits reports whether a pattern's cheap prefilter lets its regex run.
+func (p Pattern) admits(present presentSet, preserved, lower string) bool {
+	if p.Prefilter != nil {
+		return p.Prefilter(preserved, lower)
+	}
+	if len(p.Triggers) > 0 && !present.anyOf(p.Triggers) {
+		return false
+	}
+	for _, group := range p.TriggerGroups {
+		if !present.anyOf(group) {
+			return false
+		}
+	}
+	return true
 }
 
 // NewEngine creates a detection engine with all patterns compiled.
@@ -60,39 +100,100 @@ func NewEngine() *Engine {
 	e.webPatterns = compileWebPatterns()
 	e.sensitivePatterns = compileSensitiveDataPatterns()
 	e.poisonTraits = compileToolPoisoningTraits()
+	e.prefilter = e.buildPrefilter()
 	return e
 }
 
-// EvaluateToolCall inspects an MCP tool call (request).
-func (e *Engine) EvaluateToolCall(serverName, toolName string, params map[string]interface{}) Result {
-	paramsStr := flattenParams(params)
-
-	// Check sensitive data in params (always, regardless of tool)
-	if r := e.checkSensitiveData(paramsStr); r.Verdict != VerdictPass {
-		return r
+// buildPrefilter collects every rule's literal triggers (pattern groups, the
+// result-instruction signal set, and the poison family gates) into one
+// Aho-Corasick index searched once per view.
+func (e *Engine) buildPrefilter() *literalIndex {
+	var groups [][]string
+	for _, set := range [][]Pattern{e.bashPatterns, e.promptPatterns, e.webPatterns, e.sensitivePatterns} {
+		for _, pat := range set {
+			groups = append(groups, pat.literalGroups()...)
+		}
 	}
-
-	// Check threat patterns based on content
-	if r := e.checkThreatPatterns(paramsStr); r.Verdict != VerdictPass {
-		return r
-	}
-
-	return Result{Verdict: VerdictPass}
+	groups = append(groups, resultPrefilterGroups()...)
+	// The documentation-example neutralization only needs to run when its
+	// phrase is present, so the phrase is indexed too.
+	groups = append(groups, []string{"ignore all previous instructions"})
+	return newLiteralIndex(groups...)
 }
 
-// EvaluateToolResponse inspects an MCP tool response.
+// EvaluateToolCall inspects an MCP tool call (request). It returns the primary
+// finding; callers that need every finding use ScanToolCall.
+func (e *Engine) EvaluateToolCall(serverName, toolName string, params map[string]interface{}) Result {
+	return e.ScanToolCall(serverName, toolName, params).Primary()
+}
+
+// EvaluateToolResponse inspects an MCP tool response. It returns the primary
+// finding; callers that need every finding use ScanToolResponse.
 func (e *Engine) EvaluateToolResponse(serverName, toolName string, response string) Result {
-	// Check sensitive data in response
-	if r := e.checkSensitiveData(response); r.Verdict != VerdictPass {
-		return r
-	}
+	return e.ScanToolResponse(serverName, toolName, response).Primary()
+}
 
-	// Check threat patterns in response
-	if r := e.checkThreatPatterns(response); r.Verdict != VerdictPass {
-		return r
-	}
+// ScanToolCall inspects tool-call arguments in normalized and decoded views and
+// returns every distinct finding. Arguments do not run the result-instruction
+// families: an argument is the client's request, not content returned to it.
+func (e *Engine) ScanToolCall(serverName, toolName string, params map[string]interface{}) ScanResult {
+	return e.scanContent(flattenParams(params), false)
+}
 
-	return Result{Verdict: VerdictPass}
+// ScanToolResponse inspects a tool result in normalized and decoded views and
+// returns every distinct finding, including the decisive instruction families a
+// result must not carry.
+func (e *Engine) ScanToolResponse(serverName, toolName string, response string) ScanResult {
+	return e.scanContent(response, true)
+}
+
+// ContentViews returns the case-preserved normalized and decoded views of a
+// piece of content. Session correlation uses these to look for a remembered
+// value in a later tool call, including one hidden by base64/hex encoding.
+func (e *Engine) ContentViews(content string) []string {
+	views, _ := e.buildViews(content)
+	out := make([]string, 0, len(views))
+	for i := range views {
+		out = append(out, views[i].preserved)
+	}
+	return out
+}
+
+// FlattenArguments renders tool-call arguments as the flat text the detection
+// engine and session correlation inspect.
+func FlattenArguments(args map[string]interface{}) string {
+	return flattenParams(args)
+}
+
+// FoldConfusables lowercases a string and folds look-alike letters from other
+// scripts to Latin. Tool-shadowing detection uses it to compare server names.
+func FoldConfusables(s string) string {
+	return foldConfusablesLower(s)
+}
+
+// HasPoisonTrait reports whether an advertised tool definition carries any
+// tool-poisoning trait. Tool-shadowing detection uses it to decide whether a
+// duplicate of a generic tool name is worth reporting.
+func (e *Engine) HasPoisonTrait(tool ToolDescription) bool {
+	_, found := e.evaluateToolDefinition(tool)
+	return found
+}
+
+// Primary returns the finding that should drive the decision before the
+// configured modes are applied: sensitive data before threats, strictest first.
+// It preserves the single-Result contract the legacy engine exposed.
+func (s ScanResult) Primary() Result {
+	if len(s.Findings) == 0 {
+		return Result{Verdict: VerdictPass}
+	}
+	f := s.Findings[0]
+	return Result{
+		Verdict:     VerdictWarn,
+		PatternName: f.PatternName,
+		Severity:    f.Severity,
+		Description: f.Description,
+		Category:    f.Category,
+	}
 }
 
 // ToolDescription represents an MCP tool definition.
@@ -113,89 +214,6 @@ type ToolDescription struct {
 type ToolParam struct {
 	Name        string
 	Description string
-}
-
-func (e *Engine) checkSensitiveData(content string) Result {
-	for _, pat := range e.sensitivePatterns {
-		matched := pat.Regex.MatchString(content)
-		if matched && pat.Name == "credit_card" {
-			matched = false
-			for _, candidate := range pat.Regex.FindAllString(content, -1) {
-				if validCardCandidate(candidate) {
-					matched = true
-					break
-				}
-			}
-		}
-		if matched {
-			return Result{
-				Verdict:     VerdictWarn,
-				PatternName: pat.Name,
-				Severity:    pat.Severity,
-				Description: pat.Description,
-				Category:    "sensitive_data",
-			}
-		}
-	}
-	return Result{Verdict: VerdictPass}
-}
-
-func (e *Engine) checkThreatPatterns(content string) Result {
-	lower := strings.ToLower(content)
-
-	// Check bash-like patterns (commands in MCP tool params)
-	for _, pat := range e.bashPatterns {
-		if pat.Regex.MatchString(lower) {
-			if pat.SecondaryRegex != nil {
-				if !pat.SecondaryRegex.MatchString(lower) {
-					continue
-				}
-			}
-			if pat.TertiaryRegex != nil {
-				// Case-sensitive for tertiary check
-				if !pat.TertiaryRegex.MatchString(content) {
-					continue
-				}
-			}
-			return Result{
-				Verdict:     VerdictWarn,
-				PatternName: pat.Name,
-				Severity:    pat.Severity,
-				Description: pat.Description,
-				Category:    "threat",
-			}
-		}
-	}
-
-	// Check prompt injection patterns. A narrowly described literal example is
-	// not an instruction to the agent; active text outside it remains scanned.
-	promptText := instructionDocumentationExample.ReplaceAllString(lower, "documented malicious-input example")
-	for _, pat := range e.promptPatterns {
-		if pat.Regex.MatchString(promptText) {
-			return Result{
-				Verdict:     VerdictWarn,
-				PatternName: pat.Name,
-				Severity:    pat.Severity,
-				Description: pat.Description,
-				Category:    "threat",
-			}
-		}
-	}
-
-	// Check web/URL patterns
-	for _, pat := range e.webPatterns {
-		if pat.Regex.MatchString(lower) {
-			return Result{
-				Verdict:     VerdictWarn,
-				PatternName: pat.Name,
-				Severity:    pat.Severity,
-				Description: pat.Description,
-				Category:    "threat",
-			}
-		}
-	}
-
-	return Result{Verdict: VerdictPass}
 }
 
 // flattenParams converts a map to a string for pattern matching.

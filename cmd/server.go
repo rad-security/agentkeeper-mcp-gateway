@@ -129,13 +129,22 @@ are blocked.`,
 		} else {
 			cfg.Mode = "audit"
 		}
+		// One session per process: evaluations and events carry it.
+		logger.SetSessionID(authorityClient.SessionID())
+
+		cwd, _ := os.Getwd()
+		routingWatch := newRoutingWatch(cwd, hasRuntimeBroker, authorityClient, tc, logger)
+		if routingWatch != nil {
+			// The first sync below reports what the client config holds now.
+			routingWatch.Scan()
+			defer routingWatch.Stop()
+		}
 		if tc != nil {
 
 			// Build server info for registration
 			tc.SetServers(telemetryServerInfosFromConfig(cfg))
-			cwd, _ := os.Getwd()
 			tc.SetDiscoveryProvider(func() []telemetry.DiscoveredServerInfo {
-				return discoverTelemetryServers(cwd)
+				return withRoutingWatch(discoverTelemetryServers(cwd), routingWatch)
 			})
 		}
 
@@ -202,7 +211,12 @@ are blocked.`,
 		if tc != nil {
 			tc.SetModeChangeHandler(func(mode string, _ int64) {
 				p.SetEnforceMode(mode == "enforce")
+				p.OnPolicyApplied()
 			})
+			// A policy sync that changes blocked lists or detection modes also
+			// changes what tools/list returns; notify the client when it does.
+			tc.SetPolicyAppliedHandler(p.OnPolicyApplied)
+			tc.SetToolListProvider(p.ListedTools)
 			dashboardConnected = tc.Start()
 			// Every exit path (stdin EOF, client disconnect, SIGINT/SIGTERM)
 			// reaches this after the proxy has recorded terminal evidence for
@@ -220,6 +234,9 @@ are blocked.`,
 		}
 		if !authorityClient.ModeAuthorityReady() {
 			return fmt.Errorf("%w: reconnect this route for an acknowledged mode assignment; existing customer configuration was preserved", telemetry.ErrModeAuthorityUnavailable)
+		}
+		if routingWatch != nil {
+			routingWatch.Start()
 		}
 
 		// Report the mode after the synchronous startup sync. This keeps the
@@ -361,22 +378,7 @@ func discoverTelemetryServers(cwd string) []telemetry.DiscoveredServerInfo {
 	}
 	out := make([]telemetry.DiscoveredServerInfo, 0, len(res.Servers))
 	for _, s := range res.Servers {
-		out = append(out, telemetry.DiscoveredServerInfo{
-			Name:           s.Name,
-			Client:         s.Client,
-			Scope:          s.Scope,
-			SourceKind:     s.SourceKind,
-			SourcePath:     s.SourcePath,
-			SourceHash:     s.SourceHash,
-			Transport:      s.Transport,
-			RouteState:     s.RouteState,
-			Routeability:   s.Routeability,
-			Routable:       s.Routable,
-			GatewayCovered: s.GatewayCovered,
-			GatewayName:    s.GatewayName,
-			EnvKeys:        s.EnvKeys,
-			HeaderKeys:     s.HeaderKeys,
-		})
+		out = append(out, telemetryDiscoveredServer(s))
 	}
 	return out
 }
