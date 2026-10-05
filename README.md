@@ -145,7 +145,7 @@ Optional. Get fleet-wide visibility, team policies, and identity-aware access co
 agentkeeper-mcp-gateway auth login
 ```
 
-Opens your browser for device authorization. Once connected, events stream to the dashboard and team policies sync every 60 seconds.
+Opens your browser for device authorization. Once connected, events upload every 5 seconds and the Gateway syncs every 30 seconds: it fetches team policy and reports its servers, including a hash of each server's tool definitions and, when they change, the definitions themselves, so the dashboard keeps a history of definition changes. Every evaluation and event carries the session id of the Gateway process that handled the call. See [What the Gateway reports](docs/gateway-sync-fields.md) for the fields.
 
 ## CLI Reference
 
@@ -206,6 +206,26 @@ For each detected IDE it:
 A second invocation is a no-op when the exact current Gateway shape is already present. Every write creates a backup and uses a source-hash compare-and-swap check, so a file edited after planning is left unchanged. The applying form writes a private manual-ownership manifest. `--remove-routing` uses that manifest to restore byte-exact original client files when nothing drifted, or to remove only the owned Gateway entry and restore migrated servers while preserving later customer changes. It refuses inferred cleanup if ownership evidence is missing or a migrated Gateway server has drifted. The same flag covers every route `configure-ide`, `cowork configure` and the Cowork guard make: global Claude Code, Claude Desktop and Cursor routes, Claude Code project-scoped servers in `~/.claude.json`, project `.mcp.json` files, and Cowork sources. With `--ide`, only that client's routes are restored. Routes made by a release that did not record project or Cowork ownership are restored to the extent the manifest and backups allow; their servers stay in the gateway config and can be removed with `remove`. A routed file that is missing when rollback runs is skipped and reported under `skipped_missing`; its record and gateway servers are kept, so running rollback again restores it if it comes back (remove leftover servers with `remove <name>` if it will not). Stop a running `cowork guard` before rolling back, or its next pass routes the restored Cowork sources again.
 
 Package installation must remain stage-only: do not run the applying form from a postinstall script or broad MDM assignment. Managed routing is a separate, explicitly approved activation step after preview and client-state checks.
+
+## Routing watch
+
+A client reads its MCP config when it starts, and so does the Gateway it launches. A server added afterwards (`claude mcp add`, an edited `mcp.json`) reaches the client directly the next time the client starts. A Gateway launched by a `configure-ide` route, when it is connected to the dashboard or in Enforce, therefore watches the config files `configure-ide` routes for its own client: for Claude Code `~/.claude.json` (user servers and every project under `projects`) and the project's `.mcp.json`, for the other clients their config file listed above. It checks them every 5 seconds (a stat first, the contents only when a file changed) and also lists the MCP servers bundled with installed Claude Code plugins. Cowork sources are covered by `cowork guard`.
+
+Every server that reaches the client without passing through the Gateway is reported to the dashboard within seconds, with why it is direct:
+
+| Reason | Meaning |
+|---|---|
+| `added_after_setup` | Added after setup: first seen after the Gateway started, or missing from the file when `configure-ide` routed it |
+| `oauth` | A remote server the client authenticates itself; `configure-ide` leaves it in the client by design |
+| `plugin` | Provided by an installed Claude Code plugin; reported only |
+
+**Observe** never writes anything. **Enforce** routes a server added after setup the way `configure-ide` does: the server moves into the Gateway config, the client file gets a backup in the gateway backup directory, and the change is recorded so `configure-ide --remove-routing` can undo it. Only the added server's entry leaves the client file. The edit is a compare-and-swap: the file is read and hashed, and re-checked right before the atomic rename; if the client wrote it in between, nothing is replaced and the edit is retried on the next check, at most three times. The Gateway prints one line per routed server:
+
+```text
+[agentkeeper] routing watch: routed MCP server "weather", added to /Users/dev/.claude.json after setup, through the Gateway as "weather"; claude-code uses the routed server after it restarts (backup: …)
+```
+
+The client keeps any direct connection it already has until it restarts, so the dashboard shows the server as `routed_pending_restart` until then. The watch does not route a server the client must keep (OAuth, or an entry with a field the Gateway does not model), a server in a file that carries no Gateway route (never routed, or its route was removed), a project `.mcp.json` inside a git repository, or anything on a machine whose routing a managed deployment owns. Set `AGENTKEEPER_AUTO_ROUTE=0` in the Gateway's environment to keep reporting but never route automatically.
 
 ## AgentKeeper Linux runtime integration
 
