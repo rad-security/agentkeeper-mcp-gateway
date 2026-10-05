@@ -105,7 +105,7 @@ func (p *Proxy) OnPolicyApplied() {
 	if p.enforceMode() {
 		mode = "enforce"
 	}
-	signature := mode + "\x00" + hashJSON(synced)
+	signature := mode + "\x00" + hashJSON(policySignatureView(synced))
 	p.shadowMu.Lock()
 	changed := p.policySignature != signature
 	p.policySignature = signature
@@ -113,6 +113,30 @@ func (p *Proxy) OnPolicyApplied() {
 	if changed {
 		p.emitToolsListChanged()
 	}
+}
+
+// policySignatureView is the synced policy with its lists sorted, so the same
+// policy delivered in a different order does not count as a change.
+func policySignatureView(synced telemetry.SyncPolicy) telemetry.SyncPolicy {
+	view := synced
+	view.BlockedServers = sortedCopy(synced.BlockedServers)
+	view.CustomKeywords = sortedCopy(synced.CustomKeywords)
+	if synced.BlockedTools != nil {
+		view.BlockedTools = make(map[string][]string, len(synced.BlockedTools))
+		for server, tools := range synced.BlockedTools {
+			view.BlockedTools[server] = sortedCopy(tools)
+		}
+	}
+	return view
+}
+
+func sortedCopy(values []string) []string {
+	if values == nil {
+		return nil
+	}
+	out := append([]string(nil), values...)
+	sort.Strings(out)
+	return out
 }
 
 // blockedServerPlaceholders returns one placeholder tool per configured server
