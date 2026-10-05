@@ -85,6 +85,9 @@ type DiscoveredServer struct {
 	GatewayName    string   `json:"gateway_name,omitempty"`
 
 	Entry config.ServerEntry `json:"-"`
+	// Project is the Claude Code project key a server sits under in
+	// ~/.claude.json `projects`, set only by ParseClientConfig.
+	Project string `json:"-"`
 }
 
 // Discover returns MCP servers configured for the requested client. Client may
@@ -354,6 +357,13 @@ func readMCPServers(path, client, scope, sourceKind, routeability string) []Disc
 }
 
 func readServersRaw(raw json.RawMessage, path, client, scope, sourceKind, routeability string) []DiscoveredServer {
+	return readServersRawWith(raw, path, client, scope, sourceKind, routeability, gatewayCoverage)
+}
+
+// readServersRawWith is readServersRaw with the Gateway coverage lookup
+// supplied by the caller, so a caller reading many servers can load the
+// Gateway config once.
+func readServersRawWith(raw json.RawMessage, path, client, scope, sourceKind, routeability string, coverage func(config.ServerEntry) (bool, string)) []DiscoveredServer {
 	if len(raw) == 0 || string(raw) == "null" {
 		return nil
 	}
@@ -380,7 +390,7 @@ func readServersRaw(raw json.RawMessage, path, client, scope, sourceKind, routea
 		}
 		covered, gatewayName := false, ""
 		if routeState != RouteRouted {
-			covered, gatewayName = gatewayCoverage(entry)
+			covered, gatewayName = coverage(entry)
 		}
 		out = append(out, DiscoveredServer{
 			Name:           name,

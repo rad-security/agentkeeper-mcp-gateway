@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/detection"
@@ -80,6 +81,7 @@ type Logger struct {
 	queueMaxEvents int
 	queueMaxBytes  int64
 	queueLastError string
+	sessionID      atomic.Value // string
 }
 
 // EventQueueStatus is safe to expose through local health output. It contains
@@ -336,6 +338,33 @@ func (l *Logger) LogSessionStart(hostname, osName, gatewayVersion string, server
 	l.writeEvent(event)
 }
 
+// SetSessionID records the Gateway process session in the context of every
+// event written from now on. It is stamped when the event is written, so an
+// event replayed from the durable queue by a later process keeps the session
+// of the process that observed it.
+func (l *Logger) SetSessionID(sessionID string) {
+	l.sessionID.Store(sessionID)
+}
+
+// withSessionID returns event with the session in its context, leaving the
+// caller's context map untouched.
+func (l *Logger) withSessionID(event Event) Event {
+	sessionID, _ := l.sessionID.Load().(string)
+	if sessionID == "" {
+		return event
+	}
+	if _, present := event.Context["session_id"]; present {
+		return event
+	}
+	context := make(map[string]interface{}, len(event.Context)+1)
+	for key, value := range event.Context {
+		context[key] = value
+	}
+	context["session_id"] = sessionID
+	event.Context = context
+	return event
+}
+
 // Warn logs a warning message to stderr.
 func (l *Logger) Warn(format string, args ...interface{}) {
 	fmt.Fprintf(os.Stderr, "[agentkeeper] "+format+"\n", args...)
@@ -507,6 +536,7 @@ func (l *Logger) Close() error {
 }
 
 func (l *Logger) writeEvent(event Event) {
+	event = l.withSessionID(event)
 	persisted := false
 	if remoteIngestable(event) && event.EventID == "" {
 		event.EventID = newEventID()

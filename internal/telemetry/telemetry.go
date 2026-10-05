@@ -3,6 +3,8 @@ package telemetry
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -19,11 +21,11 @@ import (
 	"github.com/rad-security/agentkeeper-mcp-gateway/internal/runtimebroker"
 )
 
-// ServerInfo describes a connected MCP server for sync registration.
+// ServerInfo describes a connected MCP server for sync registration. Its
+// tool definitions come from the tool list provider.
 type ServerInfo struct {
-	Name      string     `json:"name"`
-	Transport string     `json:"transport,omitempty"`
-	Tools     []ToolInfo `json:"tools,omitempty"`
+	Name      string `json:"name"`
+	Transport string `json:"transport,omitempty"`
 }
 
 // DiscoveredServerInfo describes a local MCP server discovered outside the
@@ -43,12 +45,12 @@ type DiscoveredServerInfo struct {
 	GatewayName    string   `json:"gateway_name,omitempty"`
 	EnvKeys        []string `json:"env_keys,omitempty"`
 	HeaderKeys     []string `json:"header_keys,omitempty"`
-}
-
-// ToolInfo describes a tool exposed by an MCP server.
-type ToolInfo struct {
-	Name        string `json:"name"`
-	Description string `json:"description,omitempty"`
+	// DirectReason says why a direct server bypasses the Gateway:
+	// "added_after_setup", "oauth" or "plugin"; absent otherwise.
+	DirectReason string `json:"direct_reason,omitempty"`
+	// FirstSeenAt is when the routing watch of this Gateway process first
+	// saw the server (RFC 3339, UTC).
+	FirstSeenAt string `json:"first_seen_at,omitempty"`
 }
 
 // SyncPolicy holds the org policy returned by /api/v1/mcp/sync.
@@ -95,6 +97,11 @@ type Client struct {
 	policyApplied            func()
 	gatewayVersion           string
 	servers                  []ServerInfo
+	serversMu                sync.RWMutex
+	toolLists                func() map[string][]interface{}
+	toolStates               map[string]*toolUploadState
+	toolMu                   sync.Mutex
+	syncRequests             chan struct{}
 	discovered               []DiscoveredServerInfo
 	discover                 func() []DiscoveredServerInfo
 	gatewayID                string
@@ -160,6 +167,7 @@ func NewClient(apiURL, apiKey string, logger *logging.Logger) *Client {
 		mode:           "audit",
 		logger:         logger,
 		done:           make(chan struct{}),
+		syncRequests:   make(chan struct{}, 1),
 		policyCacheTTL: 24 * time.Hour,
 		now:            time.Now,
 		requestCtx:     requestCtx,
@@ -261,8 +269,42 @@ func (c *Client) SetVersion(version string) {
 
 // SetServers sets the connected servers for sync registration.
 func (c *Client) SetServers(servers []ServerInfo) {
+	c.serversMu.Lock()
+	defer c.serversMu.Unlock()
 	c.servers = servers
 }
+
+// RequestSync asks the background loop for a sync now, outside the regular
+// interval. Requests made while one is pending are coalesced; before Start
+// the request waits for the loop.
+func (c *Client) RequestSync() {
+	select {
+	case c.syncRequests <- struct{}{}:
+	default:
+	}
+}
+
+// SessionID identifies this Gateway process to the AgentKeeper API, so the
+// evaluations and events of one process can be correlated. It carries the
+// boot id that signs this process's receipts.
+func (c *Client) SessionID() string {
+	if c.receiptStore != nil {
+		if bootID := c.receiptStore.BootID(); bootID != "" {
+			return "gw-" + bootID
+		}
+	}
+	return "gw-" + processBootID()
+}
+
+// processBootID stands in for the receipt boot id when no receipt store is
+// open: one id per process, in the same form.
+var processBootID = sync.OnceValue(func() string {
+	var raw [16]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return fmt.Sprintf("boot-%d", time.Now().UTC().UnixNano())
+	}
+	return "boot-" + hex.EncodeToString(raw[:])
+})
 
 // SetDiscoveredServers sets a static discovered-server snapshot.
 func (c *Client) SetDiscoveredServers(servers []DiscoveredServerInfo) {
@@ -336,6 +378,8 @@ func (c *Client) Start() bool {
 				c.flush()
 				c.flushReceipts()
 			case <-syncTicker.C:
+				c.sync()
+			case <-c.syncRequests:
 				c.sync()
 			case <-c.done:
 				c.drainEvidence()
@@ -449,6 +493,7 @@ func (c *Client) Evaluate(serverName, toolName string, params map[string]interfa
 		"source":         "agentkeeper-mcp-gateway",
 		"call_id":        callID,
 		"attempt_id":     attemptID,
+		"session_id":     c.SessionID(),
 		"effective_mode": modeLabel(currentMode),
 	}
 	if c.gatewayID != "" {
@@ -494,8 +539,9 @@ func shouldUseLegacyEvaluate(err error, status int) bool {
 
 // sync registers or heartbeats the gateway via /api/v1/mcp/sync.
 func (c *Client) sync() bool {
+	servers := c.connectedServersSnapshot()
 	if c.receiptStore != nil {
-		c.syncV2()
+		c.registerV2(servers.entries)
 	}
 	currentMode, _ := c.currentMode()
 	payload := map[string]interface{}{
@@ -506,9 +552,11 @@ func (c *Client) sync() bool {
 		"gateway_version":    c.gatewayVersion,
 		"mode":               currentMode,
 		"connected_clients":  nonEmptyStrings(c.clientName),
-		"connected_servers":  c.servers,
+		"connected_servers":  servers.entries,
 		"discovered_servers": c.discoveredServers(),
 	}
+	// Tool lists ride on this endpoint, which records manifest history.
+	uploads := c.attachDueToolLists(servers, payload)
 
 	data, err := json.Marshal(payload)
 	if err != nil {
@@ -525,6 +573,9 @@ func (c *Client) sync() bool {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[agentkeeper] sync failed: %v\n", err)
 		return false
+	}
+	if status >= 200 && status < 300 {
+		c.acceptToolUploads(uploads)
 	}
 	if err == nil {
 		if result.GatewayID != "" {
@@ -552,6 +603,12 @@ func (c *Client) sync() bool {
 }
 
 func (c *Client) syncV2() bool {
+	return c.registerV2(c.connectedServersSnapshot().entries)
+}
+
+// registerV2 is syncV2 with the connected servers of the current sync, which
+// carry tools_hash but never tool lists.
+func (c *Client) registerV2(servers []connectedServer) bool {
 	currentMode, currentRevision := c.currentMode()
 	payload := map[string]interface{}{
 		"hostname":                      c.hostname,
@@ -562,7 +619,7 @@ func (c *Client) syncV2() bool {
 		"effective_mode":                modeLabel(currentMode),
 		"effective_assignment_revision": currentRevision,
 		"connected_clients":             nonEmptyStrings(c.clientName),
-		"connected_servers":             c.servers,
+		"connected_servers":             servers,
 		"discovered_servers":            c.discoveredServers(),
 		"signer_key_id":                 c.receiptStore.SignerKeyID(),
 		"public_key_base64":             c.receiptStore.PublicKeyBase64(),

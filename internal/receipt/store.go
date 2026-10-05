@@ -145,6 +145,10 @@ func NewStore(root, artifactVersion string) (*Store, error) {
 func (s *Store) SignerKeyID() string     { return s.signerKeyID }
 func (s *Store) PublicKeyBase64() string { return base64.StdEncoding.EncodeToString(s.publicKey) }
 
+// BootID identifies the process that opened this Store. Every receipt the
+// process signs carries it.
+func (s *Store) BootID() string { return s.bootID }
+
 // SignBytes signs an auxiliary endpoint artifact with the same durable key
 // used for application receipts. The key never leaves the Store; callers use
 // this for owner-only local integrity checks such as the last-known-good
