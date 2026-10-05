@@ -264,3 +264,83 @@ func pad(i int) string {
 	const digits = "0123456789abcdef0123456789abcdef"
 	return string(digits[i%32]) + string(digits[(i/32)%32]) + string(digits[(i/1024)%32]) + "qqqqqqqqqqqqqqqq"
 }
+
+// A secret sent a few characters per call: no single call carries enough of
+// it, so the destination's trail has to join the pieces.
+func sendInPieces(tr *Tracker, server, tool string, size int) (firstFlagAt int, flags int) {
+	firstFlagAt = -1
+	for i, n := 0, 0; i < len(secretValue); i, n = i+size, n+1 {
+		end := i + size
+		if end > len(secretValue) {
+			end = len(secretValue)
+		}
+		f := tr.InspectCall(server, tool, map[string]interface{}{"index": float64(n), "piece": secretValue[i:end]})
+		if f != nil {
+			if f.Pattern != patternSecretEgress {
+				panic("unexpected pattern " + f.Pattern)
+			}
+			flags++
+			if firstFlagAt < 0 {
+				firstFlagAt = n
+			}
+		}
+	}
+	return firstFlagAt, flags
+}
+
+func TestSecretEgressInPairsAcrossCalls(t *testing.T) {
+	tr, e := newTracker()
+	rememberSecret(t, tr, e)
+	at, flags := sendInPieces(tr, "archive", "store_pair", 2)
+	if at < 0 {
+		t.Fatal("a secret sent two characters per call was not flagged")
+	}
+	if at < 2 {
+		t.Fatalf("flagged before enough of the secret was sent: call %d", at)
+	}
+	if flags != 1 {
+		t.Fatalf("want one report for the destination, got %d", flags)
+	}
+}
+
+func TestSecretEgressInSegmentsAcrossCalls(t *testing.T) {
+	tr, e := newTracker()
+	rememberSecret(t, tr, e)
+	if at, _ := sendInPieces(tr, "archive", "store_segment", 6); at < 0 {
+		t.Fatal("a secret sent six characters per call was not flagged")
+	}
+}
+
+func TestPiecesBackToTheSourceToolAreNotFlagged(t *testing.T) {
+	tr, e := newTracker()
+	rememberSecret(t, tr, e)
+	if at, _ := sendInPieces(tr, "files", "read_file", 4); at >= 0 {
+		t.Fatalf("pieces sent back to the source tool were flagged at call %d", at)
+	}
+}
+
+func TestUnrelatedPiecesAcrossCallsAreNotFlagged(t *testing.T) {
+	tr, e := newTracker()
+	rememberSecret(t, tr, e)
+	note := "Quarterly totals reconcile with the ledger; archive the summary for audit."
+	for i := 0; i < len(note); i += 3 {
+		end := i + 3
+		if end > len(note) {
+			end = len(note)
+		}
+		if f := tr.InspectCall("archive", "store_pair", map[string]interface{}{"piece": note[i:end]}); f != nil {
+			t.Fatalf("unrelated pieces were flagged: %+v", f)
+		}
+	}
+}
+
+func TestEgressTrailsStayBounded(t *testing.T) {
+	tr, e := newTracker()
+	rememberSecret(t, tr, e)
+	for i := 0; i < 3*maxEgressDestinations; i++ {
+		tr.InspectCall("archive", "store_"+string(rune('a'+i%26))+string(rune('a'+i/26)), map[string]interface{}{"piece": "ab"})
+	}
+	if len(tr.trails) > maxEgressDestinations || len(tr.trailOrder) > maxEgressDestinations {
+		t.Fatalf("trails grew past their bound: %d trails, %d ordered", len(tr.trails), len(tr.trailOrder))
+	}
+}

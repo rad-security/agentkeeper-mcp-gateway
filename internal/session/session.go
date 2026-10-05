@@ -40,6 +40,10 @@ const (
 	maxStagedArtifacts     = 128
 	maxFragmentConcatBytes = 64 << 10
 	maxArgShingleBytes     = 64 << 10
+	maxEgressDestinations  = 16
+	maxTrailFields         = 16
+	maxTrailHashes         = 4096
+	maxTrailLeaves         = 256
 )
 
 // Finding is a correlation detection the proxy turns into an event and, in
@@ -75,6 +79,21 @@ type Tracker struct {
 	staged       []stagedArtifact
 	callSeq      int
 	pendingStage *pendingStage
+
+	trails     map[string]*egressTrail
+	trailOrder []string
+}
+
+// egressTrail remembers what one destination tool has been sent in this
+// session, so a value sent a few characters per call is recognised once
+// enough of it has gone out. Like remembered secrets it keeps hashes: of every
+// 12-character window sent so far, field by field, plus the last 11 characters
+// of each field, which a window crossing into the next call needs.
+type egressTrail struct {
+	tails    map[string]string
+	hashes   map[uint64]bool
+	calls    int
+	reported map[uint64]bool
 }
 
 type rememberedSecret struct {
@@ -247,7 +266,124 @@ func (t *Tracker) InspectCall(server, tool string, args map[string]interface{}) 
 	if f := t.checkStagedExecution(server, tool, flat, argShingles); f != nil {
 		return f
 	}
+	return t.checkEgressAcrossCalls(server, tool, args)
+}
+
+// checkEgressAcrossCalls adds this call's arguments to its destination's trail
+// and reports a remembered value that has now reached that destination in
+// pieces over several calls, each too small to recognise on its own.
+func (t *Tracker) checkEgressAcrossCalls(server, tool string, args map[string]interface{}) *Finding {
+	if len(t.secrets) == 0 {
+		return nil
+	}
+	trail := t.trailFor(server, tool)
+	trail.calls++
+	for path, value := range stringLeaves(args) {
+		canon := canonical(value)
+		if canon == "" {
+			continue
+		}
+		tail, known := trail.tails[path]
+		if !known && len(trail.tails) >= maxTrailFields {
+			continue
+		}
+		joined := tail + canon
+		for i := 0; i+shingleLen <= len(joined); i++ {
+			if len(trail.hashes) >= maxTrailHashes {
+				// Bounded: start the trail over rather than grow.
+				trail.hashes = map[uint64]bool{}
+			}
+			trail.hashes[hash64(joined[i:i+shingleLen])] = true
+		}
+		if len(joined) > shingleLen-1 {
+			joined = joined[len(joined)-(shingleLen-1):]
+		}
+		trail.tails[path] = joined
+	}
+	if trail.calls < 2 {
+		return nil
+	}
+	lowerTool := strings.ToLower(tool)
+	for _, s := range t.secrets {
+		if trail.reported[s.full] {
+			continue
+		}
+		differentServer := !strings.EqualFold(s.server, server)
+		egressTool := !strings.EqualFold(s.tool, tool) && containsVerb(lowerTool, egressVerbs)
+		if !differentServer && !egressTool {
+			continue
+		}
+		if overlap(s.shingles, trail.hashes) < minShingleOverlap {
+			continue
+		}
+		trail.reported[s.full] = true
+		return &Finding{
+			Pattern:     patternSecretEgress,
+			Severity:    severityCritical,
+			Description: "Data returned by " + s.server + "/" + s.tool + " earlier in this session is being sent to " + server + "/" + tool + " in pieces across calls.",
+			Correlation: map[string]interface{}{
+				"source_server": s.server,
+				"source_tool":   s.tool,
+				"steps": []map[string]interface{}{
+					{"role": "source", "server": s.server, "tool": s.tool, "detail": s.pattern},
+					{"role": "egress", "server": server, "tool": tool, "detail": "pieces across calls"},
+				},
+			},
+		}
+	}
 	return nil
+}
+
+func (t *Tracker) trailFor(server, tool string) *egressTrail {
+	key := strings.ToLower(server) + "\x00" + strings.ToLower(tool)
+	if t.trails == nil {
+		t.trails = map[string]*egressTrail{}
+	}
+	if trail, ok := t.trails[key]; ok {
+		for i, k := range t.trailOrder {
+			if k == key {
+				t.trailOrder = append(append(t.trailOrder[:i:i], t.trailOrder[i+1:]...), key)
+				break
+			}
+		}
+		return trail
+	}
+	if len(t.trailOrder) >= maxEgressDestinations {
+		delete(t.trails, t.trailOrder[0])
+		t.trailOrder = t.trailOrder[1:]
+	}
+	trail := &egressTrail{tails: map[string]string{}, hashes: map[uint64]bool{}, reported: map[uint64]bool{}}
+	t.trails[key] = trail
+	t.trailOrder = append(t.trailOrder, key)
+	return trail
+}
+
+// stringLeaves lists the string values in a call's arguments by field path.
+// Array items share their array's path, so pieces sent as list items join up.
+func stringLeaves(args map[string]interface{}) map[string]string {
+	leaves := map[string]string{}
+	var walk func(path string, value interface{})
+	walk = func(path string, value interface{}) {
+		if len(leaves) >= maxTrailLeaves {
+			return
+		}
+		switch v := value.(type) {
+		case string:
+			leaves[path] += v
+		case map[string]interface{}:
+			for key, child := range v {
+				walk(path+"."+key, child)
+			}
+		case []interface{}:
+			for _, child := range v {
+				walk(path+"[]", child)
+			}
+		}
+	}
+	for key, value := range args {
+		walk(key, value)
+	}
+	return leaves
 }
 
 func (t *Tracker) checkSecretEgress(server, tool string, argShingles map[uint64]bool) *Finding {
