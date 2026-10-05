@@ -660,3 +660,155 @@ func poisonFamilyRank(family string) int {
 	}
 	return len(poisonFamilyOrder)
 }
+
+// instructionRule names a decisive instruction family that returned content
+// (a tool result, a resource, a prompt) must not carry. These reuse the
+// definition-poisoning families that read as orders to the agent.
+type instructionRule struct {
+	rule        string
+	description string
+}
+
+// decisiveResultFamilies are the poison families that express an instruction to
+// the agent and are decisive on their own: an override of prior instructions, a
+// request to conceal an action, an exfiltration instruction, a persona
+// override, a security-bypass instruction, and a credential request. They are
+// the families a returned document has no legitimate reason to contain.
+var decisiveResultFamilies = map[string]instructionRule{
+	"override":          {"poison_ignore_instructions", "Returned content instructs the agent to ignore its prior instructions"},
+	"concealment":       {"poison_conceal_from_user", "Returned content instructs the agent to hide an action from the user"},
+	"exfiltration":      {"poison_exfil_data", "Returned content instructs the agent to send data to an external destination"},
+	"persona":           {"poison_persona_override", "Returned content tries to replace the agent's identity or restrictions"},
+	"bypass":            {"poison_bypass_security", "Returned content instructs the agent to bypass security controls"},
+	"credential_access": {"poison_credential_access", "Returned content instructs the agent to read local secrets and pass them along"},
+}
+
+// resultInstructionRules returns the decisive instruction families present in a
+// piece of returned content. The input is already normalized and
+// confusable-folded (foldConfusablesLower). It reuses the definition-poisoning
+// traits and helpers so result scanning and definition scanning agree on what
+// reads as an instruction; definition evaluation itself is unchanged.
+//
+// Only traits of weight 2 or more count, and a documentation example or a
+// quoted attack phrase is discounted exactly as it is for definitions, so a
+// security advisory or a changelog that quotes an attack is not itself flagged.
+func (e *Engine) resultInstructionRules(present presentSet, lower string) []instructionRule {
+	if lower == "" || !present.anyOf(resultInstructionSignals) {
+		// The common case: a result with no instruction-shaped literal at all
+		// returns before any regex runs over its bytes.
+		return nil
+	}
+	text := lower
+	if present.has("ignore all previous instructions") {
+		text = instructionDocumentationExample.ReplaceAllString(lower, "documented malicious-input example")
+	}
+	outside := text
+	if documentsAttacks.MatchString(text) {
+		outside = quotedSpan.ReplaceAllString(apostrophe.ReplaceAllString(text, "$1 $2"), " ")
+	}
+	families := make(map[string]bool)
+	for _, trait := range e.poisonTraits {
+		if trait.weight < 2 {
+			continue
+		}
+		if _, ok := decisiveResultFamilies[trait.family]; !ok || trait.family == "credential_access" {
+			continue
+		}
+		// A cheap literal gate keeps the family's regexes from running over a
+		// large benign result that merely shares a word with an instruction.
+		if !families[trait.family] && resultFamilyGate(trait.family, present) && trait.matches(outside) {
+			families[trait.family] = true
+		}
+	}
+	// credential_access has no standalone trait; it is the contents of a
+	// credential file handed onward, or a credential file named together with a
+	// request for silence. This mirrors the definition-side derivation. The
+	// credential-store regex only runs when a credential-file literal is present.
+	if resultFamilyGate("credential_access", present) && namesCredentialFile.MatchString(outside) &&
+		(passesCredentialFile(outside) || families["concealment"]) {
+		families["credential_access"] = true
+	}
+	var rules []instructionRule
+	for _, family := range poisonFamilyOrder {
+		if families[family] {
+			rules = append(rules, decisiveResultFamilies[family])
+		}
+	}
+	return rules
+}
+
+// The literal groups below gate the decisive instruction families. An
+// instruction in a family cannot be present unless one literal from each of its
+// groups is, so a large benign result that merely shares a word (a changelog
+// that says "do not commit secrets", an API doc that says "read the token")
+// never pays for the family's full regex set. The groups are indexed in the
+// shared Aho-Corasick prefilter so membership is a set lookup, not a scan.
+var (
+	overrideVerbs = []string{"ignore", "disregard", "forget", "override", "discard", "supersede", "no longer apply", "are now void", "stop following", "pay no attention", "ignora", "ignorier", "ignorez", "ignor", "忽略", "無視", "이전", "istruzioni", "instrucciones", "instruções", "instructions préc", "instructions prec", "anweisungen"}
+	overrideNouns = []string{"instruction", "guideline", "guardrail", "safeguard", "rule", "prompt", "direction", "constraint", "restriction", "polic", "system", "told", "above", "before", "earlier", "précéd", "preced", "anterior", "anterieur", "antérieur", "vorher", "bisher", "指令", "指示", "지시"}
+	concealVerbs  = []string{"do not", "don't", "dont", "never", "must not", "mustn't", "should not", "shouldn't", "cannot", "can't", "refrain", "without", "secretly", "covertly", "stealthily", "silently", "quietly", "discreetly", "hide", "conceal", "obscure", "suppress", "keep", "no need", "no reason", "omit", "leave out", "leave it out", "stay hidden", "stays hidden", "remain hidden", "kept hidden", "ne ", "no le", "no se", "sag", "informiere", "erwähne", "erwaehne", "verrate", "不要", "ユーザー"}
+	concealNouns  = []string{"user", "human", "operator", "tell", "telling", "inform", "mention", "reveal", "notify", "alert", "disclose", "narrate", "surface", "notice", "aware", "know", "find out", "summary", "response", "reply", "answer", "output", "report", "explanation", "background", "quiet", "to yourself", "under wraps", "between us", "utilisateur", "usuari", "benutzer", "nutzer", "anwender", "告诉", "通知", "提及", "告知", "伝え", "知らせ", "言わ", "教え"}
+	exfilVerbs    = []string{"forward", "exfiltrate", "!["}
+	exfilDests    = []string{"external", "http", "://"}
+	personaLits   = []string{"you are now", "from now on", "new identity", "act as if", "pretend", "do anything now", "unrestricted", "uncensored", "unfiltered", "jailbroken", "dan mode", "evil mode", "god mode"}
+	bypassVerbs   = []string{"bypass", "ignore"}
+	bypassNouns   = []string{"security", "restriction", "filter", "safeguard", "guardrail", "safety", "content polic", "protection"}
+	credFileLits  = []string{".ssh", "id_rsa", "id_ed25519", "id_ecdsa", ".aws", ".npmrc", ".netrc", ".pypirc", "git-credential", ".kube", ".docker", "gnupg", "passwd", "shadow", "sudoers", "mcp.json", "claude_desktop_config", ".claude.json", "credentials.json", "credentials.db", "gcloud", "wallet.dat", "keychain", ".env"}
+)
+
+// resultInstructionSignals is the union of the family verbs and credential-file
+// literals. If none is present no family can match, so the whole
+// result-instruction pass is skipped before any regex scans the content.
+var resultInstructionSignals = concatLits(overrideVerbs, concealVerbs, exfilVerbs, personaLits, bypassVerbs, credFileLits)
+
+// resultPrefilterGroups returns every literal group the result-instruction pass
+// consults, for registration in the shared prefilter index.
+func resultPrefilterGroups() [][]string {
+	return [][]string{
+		overrideVerbs, overrideNouns, concealVerbs, concealNouns,
+		exfilVerbs, exfilDests, personaLits, bypassVerbs, bypassNouns, credFileLits,
+	}
+}
+
+func concatLits(groups ...[]string) []string {
+	var out []string
+	for _, g := range groups {
+		out = append(out, g...)
+	}
+	return out
+}
+
+func resultFamilyGate(family string, present presentSet) bool {
+	switch family {
+	case "credential_access":
+		return present.anyOf(credFileLits)
+	case "override":
+		return present.allGroups(overrideVerbs, overrideNouns)
+	case "concealment":
+		return present.allGroups(concealVerbs, concealNouns)
+	case "exfiltration":
+		// The weight-2 exfiltration traits are "exfiltrate" (decisive on its
+		// own), "forward … to an external …", and the markdown-image beacon
+		// ![…](http…?x=…). The generic "sends X to <dest>" is a weight-1 trait,
+		// excluded from result scanning, so a benign email address or link does
+		// not trip this family.
+		return present.has("exfiltrate") || (present.anyOf([]string{"forward", "!["}) && present.anyOf(exfilDests))
+	case "persona":
+		return present.anyOf(personaLits)
+	case "bypass":
+		return present.allGroups(bypassVerbs, bypassNouns)
+	}
+	return false
+}
+
+// MatchesInstruction reports whether a block of text carries a decisive
+// instruction family. The session correlator uses it on concatenations of
+// recent results to catch an instruction split across several of them.
+func (e *Engine) MatchesInstruction(text string) (rule, description string, ok bool) {
+	_, lower := normalizeScanText(text)
+	rules := e.resultInstructionRules(e.prefilter.presentIn(lower), lower)
+	if len(rules) == 0 {
+		return "", "", false
+	}
+	return rules[0].rule, rules[0].description, true
+}

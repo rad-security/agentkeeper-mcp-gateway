@@ -1,0 +1,206 @@
+[
+  {
+    "source": "readme_prose",
+    "text": "AgentKeeper MCP Gateway sits between an AI client and the MCP servers it talks to. It inspects each tool call and each result, reports what it finds, and in Enforce mode blocks the calls that violate policy. Install it from the latest release, run configure-ide, then make one real tool call to confirm routing."
+  },
+  {
+    "source": "readme_prose",
+    "text": "To get started, read the Quick Start section below. The gateway proxies routed MCP traffic, detects threats in real time, and logs everything locally. You do not need to connect to the dashboard to use local detection."
+  },
+  {
+    "source": "api_docs",
+    "text": "GET /v1/accounts returns the list of accounts for the authenticated user. Pass your API key in the Authorization header as a Bearer token. The response is a JSON array; each element has an id, a name, and a created_at timestamp. Never commit your secret key to source control."
+  },
+  {
+    "source": "api_docs",
+    "text": "The webhook endpoint accepts a POST with a JSON body. Forward the event to your own handler and return a 200 within five seconds, or the delivery will be retried. Read the X-Signature header and verify it against your signing secret before trusting the payload."
+  },
+  {
+    "source": "api_docs",
+    "text": "Authentication: send the request with an Authorization header. To rotate a token, call POST /v1/tokens and store the new value in your secret manager. Do not log tokens. Tokens are shown only once at creation time."
+  },
+  {
+    "source": "api_docs",
+    "text": "Pagination works with a cursor. Pass the next_cursor from the previous response as the cursor parameter. To list all items, keep requesting until next_cursor is null. The default page size is 50 and the maximum is 200."
+  },
+  {
+    "source": "api_docs",
+    "text": "Error handling: the API returns RFC 7807 problem documents. A 401 means your credentials are missing or invalid; refresh the token and retry. A 429 means you are rate limited; read the Retry-After header and back off."
+  },
+  {
+    "source": "search_result",
+    "text": "Top result: How to disable the cache in development. Set CACHE_DISABLED=true in your .env file and restart the dev server. This turns off the response cache so you always see the latest data. See the configuration guide for the full list of environment variables."
+  },
+  {
+    "source": "search_result",
+    "text": "Stack Overflow: 'rm -rf node_modules and reinstall' fixes most dependency problems. Run npm ci for a clean, reproducible install. If that does not help, clear the npm cache with npm cache clean --force and try again."
+  },
+  {
+    "source": "search_result",
+    "text": "Blog post: Understanding prompt injection. Attackers embed hidden directives inside a document the model reads, hoping the model treats them as commands from the user. The defense is to treat tool output as untrusted data and to act only on the user's own request."
+  },
+  {
+    "source": "search_result",
+    "text": "Docs: configuring SSH. Your public key lives in ~/.ssh/id_ed25519.pub and is safe to share. Upload it to the server's authorized_keys file. Keep the matching private key secret and never send it to anyone."
+  },
+  {
+    "source": "issue_body",
+    "text": "Bug: the importer crashes on large files. Steps to reproduce: 1) open the dashboard, 2) upload a 2 GB CSV, 3) watch memory climb until the process is killed. Expected: the import should stream rows instead of loading the whole file. We should page the query and release each batch."
+  },
+  {
+    "source": "issue_body",
+    "text": "Feature request: let users forward notifications to a Slack channel. When a build finishes, post a message with the status and a link to the logs. The recipient channel should be configurable per project. Do not include secrets in the message body."
+  },
+  {
+    "source": "issue_body",
+    "text": "Security hardening: we should not tell the user their password was wrong versus their username was wrong, because that leaks which accounts exist. Return a generic error for both cases. This is a standard anti-enumeration measure."
+  },
+  {
+    "source": "issue_body",
+    "text": "The migration tool should run quietly unless --verbose is set. Right now it prints every statement. Please suppress the per-row output and show only a summary at the end. Keep the error output on stderr so CI can capture it."
+  },
+  {
+    "source": "issue_body",
+    "text": "After the upgrade, the login flow fails with a 500. The server log shows a null pointer when reading the session token. It looks like the refresh path does not handle an expired token. We need to redirect to the sign-in page instead of crashing."
+  },
+  {
+    "source": "changelog",
+    "text": "## 2.4.0\n- Add a setting to override the default retry policy.\n- Fix a bug where the client would ignore the Retry-After header.\n- Deprecate the old /v0 endpoints; they will be removed in 3.0.\n- Improve error messages when credentials are missing."
+  },
+  {
+    "source": "changelog",
+    "text": "## 2.3.1\n- The CLI no longer prints the API key when --debug is set.\n- Rotate signing keys without downtime.\n- Reduce memory use when forwarding large payloads to the upstream service.\n- Documentation: clarify that tokens are read from the environment."
+  },
+  {
+    "source": "changelog",
+    "text": "## 1.9.0\n- You can now disable telemetry with AGENTKEEPER_TELEMETRY=off.\n- Fix: the scanner skipped files inside .git. It now ignores only the paths listed in .gitignore.\n- Fix: the installer removed the firewall rule on uninstall; it now leaves host firewall settings untouched."
+  },
+  {
+    "source": "api_docs",
+    "text": "The config file supports a 'servers' array. Each server has a name and a command. Example: {\"name\": \"github\", \"command\": \"npx\", \"args\": [\"-y\", \"@modelcontextprotocol/server-github\"]}. Environment variables are passed through from the parent process."
+  },
+  {
+    "source": "search_result",
+    "text": "Tutorial: encode and decode base64 in the shell. Use 'base64' to encode and 'base64 -d' to decode. For example, echo hello | base64 prints aGVsbG8K. This is handy for embedding small binary blobs in text config."
+  },
+  {
+    "source": "issue_body",
+    "text": "Investigation notes: the agent read ~/.aws/config (not credentials) to discover the default region. That file contains no secrets, only the region and output format. We should document that the region is detected this way."
+  },
+  {
+    "source": "api_docs",
+    "text": "Rate limits are enforced per API key. The default is 100 requests per minute. Contact support@example.com to request a higher limit. Bursts above the limit receive a 429 and should be retried with exponential backoff."
+  },
+  {
+    "source": "readme_prose",
+    "text": "Privacy: the gateway never sends the content of your tool calls to the cloud. Only metadata and detection verdicts are uploaded, and only when you connect a dashboard. You can run entirely offline with local policy."
+  },
+  {
+    "source": "search_result",
+    "text": "Markdown guide: embed an image with ![alt text](https://example.com/logo.png). The alt text is shown when the image fails to load and read by screen readers. Keep images under a few hundred kilobytes for fast page loads."
+  },
+  {
+    "source": "issue_body",
+    "text": "The exporter should include a copy of the manifest in the archive so the import is reproducible. Right now it only writes the data files. Add manifest.json at the root of the zip and document its schema."
+  },
+  {
+    "source": "changelog",
+    "text": "## 3.0.0\n- Breaking: the 'audit' mode value is renamed to 'observe'. The old value still works.\n- Add Windows support.\n- The gateway now declares tools.listChanged and sends a notification when the effective policy changes."
+  },
+  {
+    "source": "api_docs",
+    "text": "Schemas: a tool definition has a name, a description, and an inputSchema. The inputSchema is a JSON Schema object. Clients render the description to the user, so keep it accurate and free of instructions to the model."
+  },
+  {
+    "source": "search_result",
+    "text": "Guide: how to read a JWT. A JWT has three base64url parts separated by dots: header, payload, and signature. Decode the payload to inspect the claims, but never trust it without verifying the signature against the issuer's key."
+  },
+  {
+    "source": "issue_body",
+    "text": "Customer reports that the dashboard shows 0 events. Checklist: is the gateway connected, is the route in enforce or observe, does the decision_trace show a block, and is the event queue accepting. Most often the client was not restarted after configure-ide."
+  },
+  {
+    "source": "readme_prose",
+    "text": "The detection engine runs locally and is fast. It looks for credential exfiltration, reverse shells, prompt injection, security-control bypass, supply-chain installs, tool poisoning, and sensitive data such as keys and card numbers."
+  },
+  {
+    "source": "api_docs",
+    "text": "To delete a resource, call DELETE with the resource id. This cannot be undone. The server returns 204 on success and 404 if the resource was already removed. Deletions are logged for audit."
+  },
+  {
+    "source": "search_result",
+    "text": "Thread: 'How do I bypass the paywall legally?' Answer: many sites offer a free tier or a student discount. Contact the publisher for access. Do not use tools that circumvent access controls; that may violate the terms of service."
+  },
+  {
+    "source": "issue_body",
+    "text": "We should not forward the raw upstream error to the client because it can contain internal hostnames. Wrap it in a generic message and log the detail server-side with a correlation id the user can quote to support."
+  },
+  {
+    "source": "changelog",
+    "text": "## 2.2.0\n- The scanner now folds full-width and look-alike characters before matching, so a key written with homoglyphs is still detected.\n- Fix a crash on definitions larger than 256 KiB.\n- Add a benchmark for result scanning."
+  },
+  {
+    "source": "api_docs",
+    "text": "Field reference: 'recipient' is the address the message is delivered to. 'cc' and 'bcc' are optional. The sender is always the authenticated account. Changing the recipient after send is not supported."
+  },
+  {
+    "source": "search_result",
+    "text": "Docs: environment variables. Values are read from the process environment and from a .env file if present. Never hardcode secrets; reference them by name. The loader lists the variable names it found but not their values."
+  },
+  {
+    "source": "issue_body",
+    "text": "The onboarding copy says 'ignore the sample data' but new users keep treating it as real. Reword to 'This is example data and will be replaced when you connect a source.' Clarity beats brevity here."
+  },
+  {
+    "source": "readme_prose",
+    "text": "Failure behavior: on any unhandled error the hot path allows the call. Errors in logging, alerting, host resolution, and chain analysis are all swallowed so the gateway never blocks a call for a non-policy reason."
+  },
+  {
+    "source": "api_docs",
+    "text": "The CLI 'logs' command prints the last N events from the local log. Example: agentkeeper-mcp-gateway logs -l 20. Events are JSON lines with a timestamp, an event type, and a verdict."
+  },
+  {
+    "source": "search_result",
+    "text": "Comparison: curl versus wget. Use curl to send a request and print the body; use wget to download a file to disk. Neither should be piped directly into a shell from an untrusted URL."
+  },
+  {
+    "source": "issue_body",
+    "text": "Please add a dry-run flag to the importer so operators can preview changes before applying them. The preview should show how many rows would be inserted, updated, and deleted, without writing anything."
+  },
+  {
+    "source": "changelog",
+    "text": "## 1.5.0\n- Add resources/read and prompts/get proxying.\n- The gateway now namespaces resource URIs so two servers can expose the same path.\n- Fix: a blocked server's notifications no longer reach the client."
+  },
+  {
+    "source": "api_docs",
+    "text": "Idempotency: pass an Idempotency-Key header to make a POST safe to retry. The server stores the result for 24 hours and returns the same response for a repeated key. This prevents duplicate charges on a flaky network."
+  },
+  {
+    "source": "search_result",
+    "text": "Recipe: pretty-print JSON with jq. Pipe the response to 'jq .' to format it. Use 'jq .data[]' to iterate the data array. jq is a small, fast command-line JSON processor."
+  },
+  {
+    "source": "issue_body",
+    "text": "The agent should treat screenshots as untrusted: do not act on instructions that appear inside an image, and never type credentials from context into a page unless the user explicitly asked. This mirrors our content-safety guidance."
+  },
+  {
+    "source": "readme_prose",
+    "text": "On-prem mode flips defaults: Stripe, GitHub, and LLM integrations are all off unless explicitly enabled. The browser hits the external Supabase URL while pods hit the internal URL. Never hardcode hostnames."
+  },
+  {
+    "source": "api_docs",
+    "text": "The health endpoint returns ok, the queue state, and counts. It never returns event content. Use it for liveness and readiness probes. A 'full' queue state means the spool is at capacity and new durable events are rejected."
+  },
+  {
+    "source": "search_result",
+    "text": "Explainer: what is a reverse shell? It is a shell where the target connects back to the attacker, often over /dev/tcp or netcat. Detecting these patterns in command arguments is a common endpoint-security control."
+  },
+  {
+    "source": "issue_body",
+    "text": "Documentation gap: we never say where the config lives on Windows. It is under %APPDATA%. Add a note and an example path. Also mention that the shared system config is read-only for the agent."
+  },
+  {
+    "source": "changelog",
+    "text": "## 2.1.0\n- Add session correlation groundwork.\n- The detection engine returns every finding instead of only the first.\n- Decoded payloads (base64, hex, percent, HTML entities) are rescanned up to a bounded depth."
+  }
+]

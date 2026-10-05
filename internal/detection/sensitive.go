@@ -12,6 +12,7 @@ func compileSensitiveDataPatterns() []Pattern {
 			Description: "Stripe live API key detected",
 			Category:    "sensitive_data",
 			Regex:       regexp.MustCompile(`sk_live_[a-zA-Z0-9]{20,}`),
+			Triggers:    []string{"sk_live_"},
 		},
 		{
 			Name:        "api_key_aws",
@@ -19,6 +20,7 @@ func compileSensitiveDataPatterns() []Pattern {
 			Description: "AWS access key ID detected",
 			Category:    "sensitive_data",
 			Regex:       regexp.MustCompile(`AKIA[0-9A-Z]{16}`),
+			Triggers:    []string{"akia"},
 		},
 		{
 			Name:        "api_key_github",
@@ -26,6 +28,7 @@ func compileSensitiveDataPatterns() []Pattern {
 			Description: "GitHub personal access token detected",
 			Category:    "sensitive_data",
 			Regex:       regexp.MustCompile(`(ghp|gho|ghs|ghr|ghu)_[A-Za-z0-9_]{36,}|github_pat_[A-Za-z0-9_]{50,}`),
+			Triggers:    []string{"ghp_", "gho_", "ghs_", "ghr_", "ghu_", "github_pat_"},
 		},
 		{
 			Name:        "api_key_anthropic",
@@ -33,6 +36,7 @@ func compileSensitiveDataPatterns() []Pattern {
 			Description: "Anthropic API key detected",
 			Category:    "sensitive_data",
 			Regex:       regexp.MustCompile(`sk-ant-[A-Za-z0-9_-]{32,}`),
+			Triggers:    []string{"sk-ant-"},
 		},
 		{
 			Name:        "api_key_openai",
@@ -40,6 +44,7 @@ func compileSensitiveDataPatterns() []Pattern {
 			Description: "OpenAI API key detected",
 			Category:    "sensitive_data",
 			Regex:       regexp.MustCompile(`\bsk-(?:proj-|svcacct-|admin-)?[A-Za-z0-9_-]{40,}`),
+			Triggers:    []string{"sk-"},
 		},
 		{
 			Name:        "api_key_google",
@@ -47,6 +52,7 @@ func compileSensitiveDataPatterns() []Pattern {
 			Description: "Google API key detected",
 			Category:    "sensitive_data",
 			Regex:       regexp.MustCompile(`\bAIza[0-9A-Za-z_-]{35}`),
+			Triggers:    []string{"aiza"},
 		},
 		{
 			Name:        "api_key_aws_secret",
@@ -54,6 +60,7 @@ func compileSensitiveDataPatterns() []Pattern {
 			Description: "AWS secret access key detected",
 			Category:    "sensitive_data",
 			Regex:       regexp.MustCompile(`(?i)aws_secret_access_key["']?\s*[=:]\s*["']?[A-Za-z0-9/+=]{40}`),
+			Triggers:    []string{"aws_secret_access_key"},
 		},
 		{
 			Name:        "api_key_npm",
@@ -61,6 +68,7 @@ func compileSensitiveDataPatterns() []Pattern {
 			Description: "npm access token detected",
 			Category:    "sensitive_data",
 			Regex:       regexp.MustCompile(`\bnpm_[A-Za-z0-9]{36}\b`),
+			Triggers:    []string{"npm_"},
 		},
 		{
 			Name:        "api_key_slack",
@@ -68,6 +76,7 @@ func compileSensitiveDataPatterns() []Pattern {
 			Description: "Slack API token detected",
 			Category:    "sensitive_data",
 			Regex:       regexp.MustCompile(`xox[bporas]-[A-Za-z0-9-]+`),
+			Triggers:    []string{"xox"},
 		},
 		{
 			Name:        "private_key_pem",
@@ -75,6 +84,7 @@ func compileSensitiveDataPatterns() []Pattern {
 			Description: "PEM-encoded private key detected",
 			Category:    "sensitive_data",
 			Regex:       regexp.MustCompile(`-----BEGIN (?:(?:RSA|EC|DSA|OPENSSH|ENCRYPTED|PGP) )?PRIVATE KEY(?: BLOCK)?-----`),
+			Triggers:    []string{"-----begin"},
 		},
 		{
 			Name:        "credit_card",
@@ -82,6 +92,7 @@ func compileSensitiveDataPatterns() []Pattern {
 			Description: "Possible credit card number detected",
 			Category:    "sensitive_data",
 			Regex:       regexp.MustCompile(`\b[0-9](?:[- ]?[0-9]){12,18}\b`),
+			Prefilter:   hasCardShape,
 		},
 		{
 			Name:        "ssn",
@@ -89,6 +100,7 @@ func compileSensitiveDataPatterns() []Pattern {
 			Description: "Possible US Social Security Number detected",
 			Category:    "sensitive_data",
 			Regex:       regexp.MustCompile(`\b[0-9]{3}-[0-9]{2}-[0-9]{4}\b`),
+			Prefilter:   hasSSNShape,
 		},
 		{
 			Name:        "database_uri",
@@ -96,6 +108,7 @@ func compileSensitiveDataPatterns() []Pattern {
 			Description: "Database connection URI with credentials detected",
 			Category:    "sensitive_data",
 			Regex:       regexp.MustCompile(`(postgresql|mongodb|mysql|redis)://[^\s]+:[^\s]+@`),
+			Triggers:    []string{"postgresql://", "mongodb://", "mysql://", "redis://"},
 		},
 		{
 			Name:        "jwt_token",
@@ -103,8 +116,56 @@ func compileSensitiveDataPatterns() []Pattern {
 			Description: "JWT token detected",
 			Category:    "sensitive_data",
 			Regex:       regexp.MustCompile(`eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}`),
+			Triggers:    []string{"eyj"},
 		},
 	}
+}
+
+// hasCardShape reports whether a run of digits long enough to be a card number
+// (13+ digits, single spaces or dashes allowed between them) is present. The
+// credit-card regex and its Luhn/issuer validation run only then.
+func hasCardShape(_, lower string) bool {
+	digits := 0
+	for i := 0; i < len(lower); i++ {
+		c := lower[i]
+		switch {
+		case c >= '0' && c <= '9':
+			digits++
+			if digits >= 13 {
+				return true
+			}
+		case (c == ' ' || c == '-') && i > 0 && i+1 < len(lower) &&
+			isASCIIDigit(lower[i-1]) && isASCIIDigit(lower[i+1]):
+			// A single separator between digits keeps the run going.
+		default:
+			digits = 0
+		}
+	}
+	return false
+}
+
+// hasSSNShape reports whether a ddd-dd-dddd token is present, gating the SSN
+// regex.
+func hasSSNShape(_, lower string) bool {
+	for i := 0; i+11 <= len(lower); i++ {
+		if isASCIIDigits(lower[i:i+3]) && lower[i+3] == '-' &&
+			isASCIIDigits(lower[i+4:i+6]) && lower[i+6] == '-' &&
+			isASCIIDigits(lower[i+7:i+11]) {
+			return true
+		}
+	}
+	return false
+}
+
+func isASCIIDigit(b byte) bool { return b >= '0' && b <= '9' }
+
+func isASCIIDigits(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if !isASCIIDigit(s[i]) {
+			return false
+		}
+	}
+	return len(s) > 0
 }
 
 // validCardNumber rejects numeric identifiers that merely have a card-like
