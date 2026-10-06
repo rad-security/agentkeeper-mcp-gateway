@@ -221,7 +221,7 @@ func TestStoreNeverPersistsRawSecret(t *testing.T) {
 	// The remembered state is hashes only; the raw value must not be derivable.
 	for _, s := range tr.secrets {
 		_ = s.full
-		if len(s.shingles) == 0 {
+		if s.hashCount() == 0 {
 			t.Fatal("no shingles stored")
 		}
 	}

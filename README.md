@@ -144,19 +144,25 @@ definition is.
 
 Some attacks are invisible in any single call. The Gateway correlates activity
 across the calls of one client session, in memory in the per-session process,
-bounded and never persisted, storing only hashes of a secret (never the secret
-itself):
+bounded and never persisted, storing only hashes of a secret or contact detail
+(never the value itself):
 
 | Pattern | Severity | What it catches |
 |---|---|---|
-| `session_secret_egress` | critical | A sensitive value returned by one tool is later sent somewhere it did not come from — whole, in pieces, or base64/hex-encoded. |
+| `session_secret_egress` | critical | A sensitive value returned by one tool is later sent somewhere it did not come from — whole, in pieces, base64/hex-encoded, reversed or ROT13-encoded. A value of 12 to 15 characters is recognised only whole. |
+| `session_pii_egress` | high | Contact details from a contact record one tool returned (a result with both an email address and a phone number) are later sent somewhere they did not come from: two or more of them, as written, reformatted or encoded. |
 | `session_injection_fragments` | high | An instruction split across several results that is harmless in each one but complete when they are joined. |
 | `session_staged_execution` | high | A tool call that stages a helper reading a credential source and pointing at an external destination, followed by a call that runs it. |
 
 These findings carry a `correlation` object in the event context
-(`source_server`, `source_tool`, `steps`). They are `threat` findings, so in
-Enforce with `detection.threat = block` they are blocked before dispatch (or the
-result is withheld) like any other threat.
+(`source_server`, `source_tool`, `steps`). `session_pii_egress` is a
+`sensitive_data` finding and follows `detection.sensitive_data`; the others are
+`threat` findings, so in Enforce with `detection.threat = block` they are blocked
+before dispatch (or the result is withheld) like any other threat.
+
+A call that reached its server and came back as an error (an MCP result marked
+`isError`, or a JSON-RPC error) carries `result_is_error: true` in its event
+context: a tool can fail after it has already made a change.
 
 ### Tool shadowing
 

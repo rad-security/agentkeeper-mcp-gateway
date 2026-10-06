@@ -50,7 +50,11 @@ type ToolCallOutcome struct {
 	ResultReceived      bool
 	ResultReturned      bool
 	ResponseWithheld    bool
-	FailureReason       string
+	// ResultIsError reports that the call reached the server and its reply
+	// was an error: an MCP result marked isError, or a JSON-RPC error. A tool
+	// can fail after it has already made a change.
+	ResultIsError bool
+	FailureReason string
 	// Detection evidence beyond the primary finding. AdditionalFindings lists
 	// the other distinct findings for the same message; DecodedFrom names the
 	// decoding the primary finding was reached through; ScanTruncated reports a
@@ -268,6 +272,9 @@ func (l *Logger) LogToolCallOutcome(serverName, toolName string, params map[stri
 	context["result_received"] = outcome.ResultReceived
 	context["result_returned"] = outcome.ResultReturned
 	context["response_withheld"] = outcome.ResponseWithheld
+	if outcome.ResultIsError {
+		context["result_is_error"] = true
+	}
 	if outcome.FailureReason != "" {
 		context["failure_reason"] = outcome.FailureReason
 	}
