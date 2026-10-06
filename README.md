@@ -101,7 +101,15 @@ files or disposable dashboard keys.
 | Security control bypass | Firewall disable, SELinux/AppArmor teardown, AV kill |
 | Supply chain attacks | Suspicious package installs from raw URLs |
 | Tool poisoning | Hidden instructions in MCP tool descriptions |
-| Sensitive data | Stripe/AWS/GitHub keys, credit cards, SSNs, private keys, JWTs |
+| Sensitive data | Stripe/AWS/GitHub keys, credit cards, SSNs, private keys, JWTs, values assigned to secret-named keys |
+
+A secret with no provider format is caught by its name
+(`leaked_secret_generic_assignment`): a value of 12 or more characters assigned
+to a key containing token, secret, password, passwd, api_key or private_key, as
+in `SERVICE_API_TOKEN=...` or `"client_secret": "..."`. An assignment that holds
+something else is not reported: code that reads a secret, a placeholder, a name,
+path or id, a page cursor, a count or a timestamp. Session correlation remembers
+the value alone, so it is recognised when it is sent on without its name.
 
 ### Normalized and decoded scanning
 

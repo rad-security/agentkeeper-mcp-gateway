@@ -28,6 +28,8 @@ const (
 	maxDecodedSegments = 64
 	// maxJSONLeafDepth bounds how deep JSON string leaves are gathered.
 	maxJSONLeafDepth = 64
+	// maxSensitiveValues bounds the values one pattern reports from one view.
+	maxSensitiveValues = 16
 	// minBase64Run / minHexRun / minPercentEscapes gate decoding so ordinary
 	// text is not decoded into noise.
 	minBase64Run      = 24
@@ -50,9 +52,11 @@ type Finding struct {
 	// normalized views; "base64", "hex", "percent", "html", or a chain such as
 	// "base64>hex"). It is evidence, recorded in the event context.
 	DecodedFrom string
-	// Value is the matched text for a sensitive_data finding, kept for in-process
-	// session correlation only. It is never written to an event or a log.
-	Value string
+	// Values is every distinct text a sensitive_data finding matched in the
+	// view (up to maxSensitiveValues), so each secret in a result that carries
+	// several, such as an env file, is remembered. It is kept for in-process
+	// session correlation only and is never written to an event or a log.
+	Values []string
 }
 
 // ScanResult holds every distinct finding for one message plus whether the
@@ -165,8 +169,8 @@ func (e *Engine) scanView(v *scanView, includeResultPoison bool, add func(Findin
 		if !pat.admits(present, v.preserved, lower) {
 			continue
 		}
-		if value, ok := sensitiveMatch(pat, v.preserved); ok {
-			add(Finding{PatternName: pat.Name, Category: "sensitive_data", Severity: pat.Severity, Description: pat.Description, DecodedFrom: v.decodedFrom, Value: value})
+		if values := sensitiveMatches(pat, v.preserved); len(values) > 0 {
+			add(Finding{PatternName: pat.Name, Category: "sensitive_data", Severity: pat.Severity, Description: pat.Description, DecodedFrom: v.decodedFrom, Values: values})
 		}
 	}
 	if r, ok := e.matchThreatPatterns(present, lower, v.preserved); ok {
@@ -220,21 +224,46 @@ func (e *Engine) matchThreatPatterns(present presentSet, lower, preserved string
 	return Result{}, false
 }
 
-// sensitiveMatch returns the matched value for a sensitive pattern, applying the
-// credit-card validation the legacy engine used.
-func sensitiveMatch(pat Pattern, content string) (string, bool) {
-	if pat.Name == "credit_card" {
-		for _, candidate := range pat.Regex.FindAllString(content, -1) {
-			if validCardCandidate(candidate) {
-				return candidate, true
+// sensitiveMatches returns the distinct values a sensitive pattern matched, up
+// to maxSensitiveValues: each whole match, or what the pattern's Extract keeps
+// of it (a validated card number, or the value of an assignment).
+func sensitiveMatches(pat Pattern, content string) []string {
+	var matches [][]int
+	switch {
+	case pat.Find != nil:
+		matches = pat.Find(content)
+	case pat.Extract != nil:
+		matches = pat.Regex.FindAllStringSubmatchIndex(content, -1)
+	default:
+		matches = pat.Regex.FindAllStringIndex(content, -1)
+	}
+	var values []string
+	for _, match := range matches {
+		value := content[match[0]:match[1]]
+		if pat.Extract != nil {
+			var ok bool
+			if value, ok = pat.Extract(content, match); !ok {
+				continue
 			}
 		}
-		return "", false
+		if containsValue(values, value) {
+			continue
+		}
+		values = append(values, value)
+		if len(values) == maxSensitiveValues {
+			break
+		}
 	}
-	if match := pat.Regex.FindString(content); match != "" {
-		return match, true
+	return values
+}
+
+func containsValue(values []string, value string) bool {
+	for _, v := range values {
+		if v == value {
+			return true
+		}
 	}
-	return "", false
+	return false
 }
 
 // orderFindings puts the primary finding first: sensitive data before threats
