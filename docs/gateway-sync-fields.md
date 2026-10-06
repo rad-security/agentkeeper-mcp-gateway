@@ -11,10 +11,10 @@ Every field is additive; an API that does not know a field ignores it.
 
 ## Session id
 
-Each Gateway process has one session id, `gw-<boot id>`, where the boot id is
-the one on every receipt the process signs (`gw-boot-` followed by 32 hex
-digits). Without a receipt signer the process generates a boot id of the same
-form.
+Each Gateway process has one session id, `gw-<boot id>`. The boot id is the
+one on every receipt the process signs: `boot-` followed by 32 hex digits, so
+the session id reads `gw-boot-` followed by the same 32 digits. Without a
+receipt signer the process generates a boot id of the same form.
 
 - Every evaluation request, v2 and the v1 fallback, carries `session_id`.
 - Every event carries `context.session_id`. The id is stamped when the event is
