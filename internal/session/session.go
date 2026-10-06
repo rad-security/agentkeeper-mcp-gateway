@@ -161,25 +161,31 @@ func (t *Tracker) ObserveContent(server, tool, raw string, scan detection.ScanRe
 
 func (t *Tracker) rememberSecrets(server, tool string, scan detection.ScanResult) {
 	for _, f := range scan.Findings {
-		if f.Category != "sensitive_data" || f.Value == "" {
+		if f.Category != "sensitive_data" {
 			continue
 		}
-		canon := canonical(f.Value)
-		if len(canon) < minSecretLen {
-			continue
+		for _, value := range f.Values {
+			t.rememberSecret(server, tool, f.PatternName, value)
 		}
-		shingles := shingleSet(canon)
-		if len(shingles) == 0 {
-			continue
-		}
-		full := hash64(canon)
-		if t.hasSecret(full) {
-			continue
-		}
-		t.evictForSecret(len(shingles))
-		t.secrets = append(t.secrets, rememberedSecret{full: full, shingles: shingles, server: server, tool: tool, pattern: f.PatternName})
-		t.shingleUsed += len(shingles)
 	}
+}
+
+func (t *Tracker) rememberSecret(server, tool, pattern, value string) {
+	canon := canonical(value)
+	if len(canon) < minSecretLen {
+		return
+	}
+	shingles := shingleSet(canon)
+	if len(shingles) == 0 {
+		return
+	}
+	full := hash64(canon)
+	if t.hasSecret(full) {
+		return
+	}
+	t.evictForSecret(len(shingles))
+	t.secrets = append(t.secrets, rememberedSecret{full: full, shingles: shingles, server: server, tool: tool, pattern: pattern})
+	t.shingleUsed += len(shingles)
 }
 
 func (t *Tracker) hasSecret(full uint64) bool {

@@ -63,6 +63,13 @@ type Pattern struct {
 	// literal groups. It is used for patterns with no usable literal (card and
 	// SSN shapes), which are gated by a cheap numeric scan instead.
 	Prefilter func(preserved, lower string) bool
+	// Find, for a sensitive-data pattern, locates its matches (as submatch
+	// indexes into content) in place of running Regex over the whole content.
+	Find func(content string) [][]int
+	// Extract, for a sensitive-data pattern, turns one match (its indexes into
+	// content) into the value to report, or rejects the match. Without it the
+	// whole match is the value.
+	Extract func(content string, match []int) (string, bool)
 }
 
 // literalGroups returns every OR-group a pattern uses, for registration in the

@@ -268,13 +268,17 @@ func pad(i int) string {
 // A secret sent a few characters per call: no single call carries enough of
 // it, so the destination's trail has to join the pieces.
 func sendInPieces(tr *Tracker, server, tool string, size int) (firstFlagAt int, flags int) {
+	return sendValueInPieces(tr, secretValue, server, tool, size)
+}
+
+func sendValueInPieces(tr *Tracker, value, server, tool string, size int) (firstFlagAt int, flags int) {
 	firstFlagAt = -1
-	for i, n := 0, 0; i < len(secretValue); i, n = i+size, n+1 {
+	for i, n := 0, 0; i < len(value); i, n = i+size, n+1 {
 		end := i + size
-		if end > len(secretValue) {
-			end = len(secretValue)
+		if end > len(value) {
+			end = len(value)
 		}
-		f := tr.InspectCall(server, tool, map[string]interface{}{"index": float64(n), "piece": secretValue[i:end]})
+		f := tr.InspectCall(server, tool, map[string]interface{}{"index": float64(n), "piece": value[i:end]})
 		if f != nil {
 			if f.Pattern != patternSecretEgress {
 				panic("unexpected pattern " + f.Pattern)
