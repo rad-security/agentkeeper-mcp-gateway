@@ -1564,7 +1564,7 @@ func (p *Proxy) handleToolsCallContext(ctx context.Context, msg JSONRPCMessage) 
 				CallID: callID, AttemptID: attemptID, Mode: effectiveMode,
 				PolicyDecision: finalVerdict, EvaluationStatus: evaluationStatus,
 				DecisionID: decisionID, RequiredDisposition: "forward", AppliedDisposition: "result_returned",
-				Dispatched: true, ResultReceived: true, ResultReturned: true, FailureReason: "upstream_rpc_error",
+				Dispatched: true, ResultReceived: true, ResultReturned: true, ResultIsError: true, FailureReason: "upstream_rpc_error",
 			})
 			if finalVerdict == "block" && enforceThisCall {
 				outcome.RequiredDisposition, outcome.AppliedDisposition = "withhold_result", "result_withheld"
@@ -1619,6 +1619,7 @@ func (p *Proxy) handleToolsCallContext(ctx context.Context, msg JSONRPCMessage) 
 					DecisionID:          decisionID,
 					RequiredDisposition: "withhold_result", AppliedDisposition: "result_withheld",
 					Dispatched: true, ResultReceived: true, ResponseWithheld: true,
+					ResultIsError: toolResultIsError(response),
 				}))
 				errResult := map[string]interface{}{
 					"content": []map[string]interface{}{
@@ -1641,9 +1642,22 @@ func (p *Proxy) handleToolsCallContext(ctx context.Context, msg JSONRPCMessage) 
 		DecisionID:          decisionID,
 		RequiredDisposition: "forward", AppliedDisposition: "result_returned",
 		Dispatched: true, ResultReceived: true, ResultReturned: true,
+		ResultIsError: toolResultIsError(response),
 	}))
 
 	return &JSONRPCMessage{JSONRPC: "2.0", ID: msg.ID, Result: response}, nil
+}
+
+// toolResultIsError reports whether a tools/call result is marked isError: the
+// tool ran and failed, possibly after making a change.
+func toolResultIsError(result json.RawMessage) bool {
+	if !bytes.Contains(result, []byte(`"isError"`)) {
+		return false
+	}
+	var parsed struct {
+		IsError bool `json:"isError"`
+	}
+	return json.Unmarshal(result, &parsed) == nil && parsed.IsError
 }
 
 // unmarshalExactNumbers is json.Unmarshal, except that a number decoded into

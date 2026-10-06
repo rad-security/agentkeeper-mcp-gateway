@@ -1,13 +1,14 @@
 // Package session correlates MCP activity across the calls of one client
 // session to catch multi-step attacks that no single call reveals: a secret
-// read by one tool and sent out by a later one (whole, in pieces, or encoded),
-// an instruction split across several results, and a "stage a helper, then run
-// it" exfiltration.
+// read by one tool and sent out by a later one (whole, in pieces, encoded,
+// reversed or ROT13-encoded), contact details read by one tool and sent to
+// another, an instruction split across several results, and a "stage a
+// helper, then run it" exfiltration.
 //
 // All state is in memory in the Gateway process (one process per client
-// session), bounded, never persisted, and never stores a raw secret: only
-// truncated SHA-256 hashes of a secret and of its overlapping shingles are
-// kept, so the store cannot leak what it protects.
+// session), bounded, never persisted, and never stores a raw secret or contact
+// detail: only truncated SHA-256 hashes of a value and of its overlapping
+// shingles are kept, so the store cannot leak what it protects.
 package session
 
 import (
@@ -25,10 +26,15 @@ const (
 	patternSecretEgress    = "session_secret_egress"
 	patternInjectionFrags  = "session_injection_fragments"
 	patternStagedExecution = "session_staged_execution"
+	patternContactEgress   = "session_pii_egress"
 	categoryThreat         = "threat"
+	categorySensitiveData  = "sensitive_data"
 	severityCritical       = "critical"
 	severityHigh           = "high"
-	minSecretLen           = 16
+	minSecretLen           = 12
+	// longSecretLen is where a value has enough 12-character windows to be
+	// recognised from part of it. A shorter one is recognised only whole.
+	longSecretLen          = 16
 	shingleLen             = 12
 	shingleStride          = 4
 	minShingleOverlap      = 2
@@ -44,6 +50,10 @@ const (
 	maxTrailFields         = 16
 	maxTrailHashes         = 4096
 	maxTrailLeaves         = 256
+	maxRememberedContacts  = 512
+	maxContactsPerResult   = 64
+	maxContactScanBytes    = 256 << 10
+	minContactsSent        = 2
 )
 
 // Finding is a correlation detection the proxy turns into an event and, in
@@ -53,16 +63,22 @@ type Finding struct {
 	Severity    string
 	Description string
 	Correlation map[string]interface{}
+	// Category decides which detection mode applies: threat unless set.
+	Category string
 }
 
 // Result converts a finding to the detection result the proxy merges and logs.
 func (f Finding) Result() detection.Result {
+	category := f.Category
+	if category == "" {
+		category = categoryThreat
+	}
 	return detection.Result{
 		Verdict:     detection.VerdictWarn,
 		PatternName: f.Pattern,
 		Severity:    f.Severity,
 		Description: f.Description,
-		Category:    categoryThreat,
+		Category:    category,
 	}
 }
 
@@ -73,6 +89,8 @@ type Tracker struct {
 
 	secrets     []rememberedSecret
 	shingleUsed int
+
+	contacts []rememberedContact
 
 	fragments []fragmentEntry
 
@@ -97,11 +115,46 @@ type egressTrail struct {
 }
 
 type rememberedSecret struct {
-	full     uint64
+	full    uint64
+	forms   []secretForm
+	server  string
+	tool    string
+	pattern string
+}
+
+// secretForm is one shape a remembered value is recognised in: as returned,
+// reversed, or ROT13-encoded. It matches content that carries at least need of
+// its window hashes.
+type secretForm struct {
 	shingles map[uint64]bool
-	server   string
-	tool     string
-	pattern  string
+	need     int
+}
+
+// carriedBy reports whether content with these window hashes carries the
+// value in any of its forms.
+func (s rememberedSecret) carriedBy(hashes map[uint64]bool) bool {
+	for _, form := range s.forms {
+		if overlap(form.shingles, hashes) >= form.need {
+			return true
+		}
+	}
+	return false
+}
+
+func (s rememberedSecret) hashCount() int {
+	n := 0
+	for _, form := range s.forms {
+		n += len(form.shingles)
+	}
+	return n
+}
+
+// rememberedContact is the hash of one email address or phone number a tool
+// returned in a contact record, and where it came from.
+type rememberedContact struct {
+	hash   uint64
+	server string
+	tool   string
 }
 
 type fragmentEntry struct {
@@ -154,6 +207,7 @@ func (t *Tracker) ObserveContent(server, tool, raw string, scan detection.ScanRe
 	defer t.mu.Unlock()
 
 	t.rememberSecrets(server, tool, scan)
+	t.rememberContacts(server, tool, raw)
 	t.captureStagedID(server, raw)
 
 	return t.observeFragment(server, raw, scan)
@@ -175,17 +229,36 @@ func (t *Tracker) rememberSecret(server, tool, pattern, value string) {
 	if len(canon) < minSecretLen {
 		return
 	}
-	shingles := shingleSet(canon)
-	if len(shingles) == 0 {
-		return
-	}
 	full := hash64(canon)
 	if t.hasSecret(full) {
 		return
 	}
-	t.evictForSecret(len(shingles))
-	t.secrets = append(t.secrets, rememberedSecret{full: full, shingles: shingles, server: server, tool: tool, pattern: pattern})
-	t.shingleUsed += len(shingles)
+	secret := rememberedSecret{full: full, forms: secretForms(canon), server: server, tool: tool, pattern: pattern}
+	t.evictForSecret(secret.hashCount())
+	t.secrets = append(t.secrets, secret)
+	t.shingleUsed += secret.hashCount()
+}
+
+// secretForms are the shapes a value is recognised in when it is sent on: as
+// returned, reversed, and ROT13-encoded. A value of 16 or more characters is
+// recognised by any two of its 12-character windows, so a piece of it counts;
+// a shorter one only whole, by its first and last windows.
+func secretForms(canon string) []secretForm {
+	var forms []secretForm
+	seen := map[string]bool{}
+	for _, text := range []string{canon, reverseText(canon), rot13(canon)} {
+		if seen[text] {
+			continue
+		}
+		seen[text] = true
+		if len(text) >= longSecretLen {
+			forms = append(forms, secretForm{shingles: shingleSet(text), need: minShingleOverlap})
+			continue
+		}
+		ends := map[uint64]bool{hash64(text[:shingleLen]): true, hash64(text[len(text)-shingleLen:]): true}
+		forms = append(forms, secretForm{shingles: ends, need: len(ends)})
+	}
+	return forms
 }
 
 func (t *Tracker) hasSecret(full uint64) bool {
@@ -200,7 +273,7 @@ func (t *Tracker) hasSecret(full uint64) bool {
 // evictForSecret keeps the store within both bounds, dropping oldest first.
 func (t *Tracker) evictForSecret(incoming int) {
 	for len(t.secrets) >= maxRememberedSecrets || (t.shingleUsed+incoming > maxShingleHashes && len(t.secrets) > 0) {
-		t.shingleUsed -= len(t.secrets[0].shingles)
+		t.shingleUsed -= t.secrets[0].hashCount()
 		t.secrets = t.secrets[1:]
 	}
 }
@@ -272,7 +345,10 @@ func (t *Tracker) InspectCall(server, tool string, args map[string]interface{}) 
 	if f := t.checkStagedExecution(server, tool, flat, argShingles); f != nil {
 		return f
 	}
-	return t.checkEgressAcrossCalls(server, tool, args)
+	if f := t.checkEgressAcrossCalls(server, tool, args); f != nil {
+		return f
+	}
+	return t.checkContactEgress(server, tool, views)
 }
 
 // checkEgressAcrossCalls adds this call's arguments to its destination's trail
@@ -319,7 +395,7 @@ func (t *Tracker) checkEgressAcrossCalls(server, tool string, args map[string]in
 		if !differentServer && !egressTool {
 			continue
 		}
-		if overlap(s.shingles, trail.hashes) < minShingleOverlap {
+		if !s.carriedBy(trail.hashes) {
 			continue
 		}
 		trail.reported[s.full] = true
@@ -395,7 +471,7 @@ func stringLeaves(args map[string]interface{}) map[string]string {
 func (t *Tracker) checkSecretEgress(server, tool string, argShingles map[uint64]bool) *Finding {
 	lowerTool := strings.ToLower(tool)
 	for _, s := range t.secrets {
-		if overlap(s.shingles, argShingles) < minShingleOverlap {
+		if !s.carriedBy(argShingles) {
 			continue
 		}
 		// Flag only when the destination differs from the source: a different
@@ -467,7 +543,7 @@ func (t *Tracker) checkStagedExecution(server, tool, flat string, argShingles ma
 
 func (t *Tracker) argsCarryRememberedSecret(argShingles map[uint64]bool) bool {
 	for _, s := range t.secrets {
-		if overlap(s.shingles, argShingles) >= minShingleOverlap {
+		if s.carriedBy(argShingles) {
 			return true
 		}
 	}
@@ -520,12 +596,6 @@ func canonical(value string) string {
 
 func shingleSet(canon string) map[uint64]bool {
 	set := make(map[uint64]bool)
-	if len(canon) < shingleLen {
-		if len(canon) >= minSecretLen {
-			set[hash64(canon)] = true
-		}
-		return set
-	}
 	for i := 0; i+shingleLen <= len(canon); i += shingleStride {
 		set[hash64(canon[i:i+shingleLen])] = true
 	}
@@ -553,6 +623,25 @@ func argumentShingles(views []string) map[uint64]bool {
 		}
 	}
 	return set
+}
+
+func reverseText(s string) string {
+	b := []byte(s)
+	for i, j := 0, len(b)-1; i < j; i, j = i+1, j-1 {
+		b[i], b[j] = b[j], b[i]
+	}
+	return string(b)
+}
+
+// rot13 of canonical (lower-case) text.
+func rot13(s string) string {
+	b := []byte(s)
+	for i, c := range b {
+		if c >= 'a' && c <= 'z' {
+			b[i] = 'a' + (c-'a'+13)%26
+		}
+	}
+	return string(b)
 }
 
 func overlap(a, b map[uint64]bool) int {

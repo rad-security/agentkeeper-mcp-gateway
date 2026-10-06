@@ -316,3 +316,26 @@ func TestDurableEventQueueRejectsEventThatExceedsByteLimit(t *testing.T) {
 		t.Fatalf("missing byte-capacity diagnostic: %+v", status)
 	}
 }
+
+func TestLogToolCallOutcomeRecordsAnErrorResult(t *testing.T) {
+	logger, err := NewLogger(filepath.Join(t.TempDir(), "events.jsonl"), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.LogToolCallOutcome("fixture", "commit", nil, detection.Result{Verdict: detection.VerdictPass}, ToolCallOutcome{
+		AppliedDisposition: "result_returned", Dispatched: true, ResultReceived: true, ResultReturned: true, ResultIsError: true,
+	})
+	logger.LogToolCallOutcome("fixture", "lookup", nil, detection.Result{Verdict: detection.VerdictPass}, ToolCallOutcome{
+		AppliedDisposition: "result_returned", Dispatched: true, ResultReceived: true, ResultReturned: true,
+	})
+	events := logger.FlushBuffer()
+	if len(events) != 2 {
+		t.Fatalf("events = %d, want 2", len(events))
+	}
+	if got := events[0].Context["result_is_error"]; got != true {
+		t.Fatalf("result_is_error = %#v, want true", got)
+	}
+	if _, ok := events[1].Context["result_is_error"]; ok {
+		t.Fatalf("a successful result carries result_is_error: %#v", events[1].Context)
+	}
+}
