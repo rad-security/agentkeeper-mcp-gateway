@@ -235,7 +235,7 @@ done
 	configPath := writeGatewayConfig(t, home, `{
 		"mode": "audit",
 		"servers": [{
-			"name": "ontra-enterprise",
+			"name": "acme-enterprise",
 			"command": "`+backend+`"
 		}]
 	}`)
@@ -277,7 +277,7 @@ done
 	if !strings.Contains(firstListResp, `"agentkeeper_status"`) {
 		t.Fatalf("gateway did not return built-in tools while backend refreshed: %s stderr=%s", firstListResp, stderr.String())
 	}
-	if strings.Contains(firstListResp, `"ontra-enterprise__search_accounts"`) {
+	if strings.Contains(firstListResp, `"acme-enterprise__search_accounts"`) {
 		t.Fatalf("slow backend tool should not block first tools/list response: %s stderr=%s", firstListResp, stderr.String())
 	}
 
@@ -288,7 +288,7 @@ done
 
 	writeRPC(t, stdin, `{"jsonrpc":"2.0","id":112,"method":"tools/list","params":{}}`)
 	secondListResp := readRPCLineWithin(t, reader, 2*time.Second)
-	if !strings.Contains(secondListResp, `"ontra-enterprise__search_accounts"`) {
+	if !strings.Contains(secondListResp, `"acme-enterprise__search_accounts"`) {
 		t.Fatalf("gateway did not serve refreshed backend tool from cache: %s stderr=%s", secondListResp, stderr.String())
 	}
 }
@@ -316,8 +316,8 @@ sleep 120
 	configPath := writeGatewayConfig(t, home, `{
 		"mode": "audit",
 		"servers": [
-			{"name": "ontra-fast", "command": "`+fast+`"},
-			{"name": "ontra-hung", "command": "`+hung+`"}
+			{"name": "acme-fast", "command": "`+fast+`"},
+			{"name": "acme-hung", "command": "`+hung+`"}
 		]
 	}`)
 
@@ -358,10 +358,10 @@ sleep 120
 	if !strings.Contains(firstListResp, `"agentkeeper_status"`) {
 		t.Fatalf("gateway did not return built-in tools: %s stderr=%s", firstListResp, stderr.String())
 	}
-	if !strings.Contains(firstListResp, `"ontra-fast__lookup_account"`) {
+	if !strings.Contains(firstListResp, `"acme-fast__lookup_account"`) {
 		t.Fatalf("gateway did not include backend tool refreshed during warmup: %s stderr=%s", firstListResp, stderr.String())
 	}
-	if strings.Contains(firstListResp, `"ontra-hung__`) {
+	if strings.Contains(firstListResp, `"acme-hung__`) {
 		t.Fatalf("hung backend leaked into tools/list response: %s stderr=%s", firstListResp, stderr.String())
 	}
 

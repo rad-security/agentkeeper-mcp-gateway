@@ -136,7 +136,7 @@ func TestScan_ManifestMissing_FallbackCacheGlob(t *testing.T) {
 }
 
 func TestScan_MarketplaceCachedSkills_SkillsUnderMarketplace(t *testing.T) {
-	// Real-world layout observed at customer (Ontra / secure-supply-chain):
+	// Real-world layout observed in a customer environment:
 	//   ~/.claude/plugins/marketplaces/<marketplace>/skills/<skill>/SKILL.md
 	home := t.TempDir()
 	marketplaceSkillDir := filepath.Join(home, ".claude", "plugins", "marketplaces", "secure-supply-chain", "skills")
