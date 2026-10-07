@@ -488,15 +488,15 @@ func TestAppendNamespacedToolsDoesNotMutateOriginalTools(t *testing.T) {
 	var allTools []interface{}
 	toolMap := make(map[string]string)
 
-	appendNamespacedTools(&allTools, toolMap, "ontra", tools)
+	appendNamespacedTools(&allTools, toolMap, "acme", tools)
 
 	if got := tools[0].(map[string]interface{})["name"]; got != "lookup" {
 		t.Fatalf("appendNamespacedTools mutated original tool name: %v", got)
 	}
-	if got := allTools[0].(map[string]interface{})["name"]; got != "ontra__lookup" {
+	if got := allTools[0].(map[string]interface{})["name"]; got != "acme__lookup" {
 		t.Fatalf("namespaced tool name mismatch: %v", got)
 	}
-	if got := toolMap["ontra__lookup"]; got != "ontra" {
+	if got := toolMap["acme__lookup"]; got != "acme" {
 		t.Fatalf("tool map mismatch: %v", got)
 	}
 }
