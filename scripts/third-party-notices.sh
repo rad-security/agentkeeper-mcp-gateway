@@ -11,6 +11,10 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT="${ROOT_DIR}/internal/notices/THIRD_PARTY_NOTICES.txt"
 cd "${ROOT_DIR}"
+# Go's own license text changes between releases, so take it from the toolchain
+# go.mod names (the one CI and the release build with), not whatever is installed.
+GOTOOLCHAIN="go$(GOTOOLCHAIN=local go list -m -f '{{.GoVersion}}')"
+export GOTOOLCHAIN
 
 work="$(mktemp -d)"
 trap 'rm -rf "${work}"' EXIT
