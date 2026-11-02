@@ -41,6 +41,7 @@ jobs:
           git fetch origin main --no-tags
           git merge-base --is-ancestor HEAD origin/main
           go test -race -timeout 5m ./...
+          scripts/third-party-notices.sh --check
           go build -trimpath -o "${RUNNER_TEMP}/agentkeeper-mcp-gateway-linux-amd64" .
           capabilities="$("${RUNNER_TEMP}/agentkeeper-mcp-gateway-linux-amd64" enterprise-capabilities --json)"
           jq -e '

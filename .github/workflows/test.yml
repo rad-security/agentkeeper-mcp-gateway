@@ -13,6 +13,8 @@ jobs:
           go-version: "1.23.3"
       - run: go vet ./...
       - run: go test -race -timeout 5m ./...
+      - name: Third-party notices are up to date
+        run: scripts/third-party-notices.sh --check
 
   # Runs the built binary end to end on every OS we release for.
   smoke:
