@@ -42,7 +42,7 @@ AgentKeeper app, Helm chart, and dashboard live in
 
 Requirements:
 
-- Go 1.23.3 or compatible
+- Go 1.27.3 or compatible
 - Node.js/npm if you want to test common `npx` MCP servers locally
 
 Build and test:
