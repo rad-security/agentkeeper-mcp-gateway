@@ -270,9 +270,9 @@ func TestPlan_ClaudeCodeRecoversNativeAuthServersFromGatewayConfig(t *testing.T)
 		Mode: "audit",
 		Servers: []config.ServerEntry{
 			{
-				Name:      "ontra-mcp-server--staging",
+				Name:      "acme-mcp-server--staging",
 				Transport: "http",
-				URL:       "https://mcp.ontra.example/mcp",
+				URL:       "https://mcp.acme.example/mcp",
 			},
 			{
 				Name:      "headers-api",
@@ -306,8 +306,8 @@ func TestPlan_ClaudeCodeRecoversNativeAuthServersFromGatewayConfig(t *testing.T)
 	if len(p.Migrated) != 0 {
 		t.Fatalf("headerless HTTP server should not be migrated: %+v", p.Migrated)
 	}
-	if len(p.NativeKept) != 1 || p.NativeKept[0].Name != "ontra-mcp-server--staging" {
-		t.Fatalf("expected native-auth Ontra server to be recovered, got %+v", p.NativeKept)
+	if len(p.NativeKept) != 1 || p.NativeKept[0].Name != "acme-mcp-server--staging" {
+		t.Fatalf("expected native-auth Acme server to be recovered, got %+v", p.NativeKept)
 	}
 	if err := a.Apply(&p); err != nil {
 		t.Fatal(err)
@@ -325,7 +325,7 @@ func TestPlan_ClaudeCodeRecoversNativeAuthServersFromGatewayConfig(t *testing.T)
 	if err := json.Unmarshal(raw["mcpServers"], &servers); err != nil {
 		t.Fatal(err)
 	}
-	if len(servers) != 2 || servers["ontra-mcp-server--staging"].URL != "https://mcp.ontra.example/mcp" {
+	if len(servers) != 2 || servers["acme-mcp-server--staging"].URL != "https://mcp.acme.example/mcp" {
 		t.Fatalf("native-auth server was not restored beside gateway: %+v", servers)
 	}
 	if _, ok := servers["headers-api"]; ok {

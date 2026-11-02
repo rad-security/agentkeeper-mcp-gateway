@@ -1597,7 +1597,7 @@ func TestE2E34_ConfigureIDEMigratesAllClaudeJSONProjectServers(t *testing.T) {
 }
 
 // ---- git-worktree guard ----------------------------------------------------
-// Regression tests for the Ontra "agentkeeper adding data to a repo" incidents:
+// Regression tests for the customer-reported "agentkeeper adding data to a repo" incidents:
 // MCP config files inside a customer git worktree must never be rewritten
 // unless the user names the project explicitly with --cwd / --scope=project.
 
