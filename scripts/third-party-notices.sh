@@ -43,7 +43,21 @@ add_texts() { # <dir> <label>
   done < <(license_files "$1")
 }
 
-add_texts "$(go env GOROOT)" "Go standard library and runtime"
+go_root="$(go env GOROOT)"
+if [ ! -f "${go_root}/LICENSE" ]; then
+  # Some installs (Homebrew) keep LICENSE outside GOROOT. Take Go's license
+  # files from the official distribution of the same version instead; they are
+  # the same on every platform.
+  toolchain_dir="$(GOSUMDB=sum.golang.org GOPROXY=https://proxy.golang.org \
+    go mod download -json "golang.org/toolchain@v0.0.1-$(go env GOVERSION).linux-amd64" |
+    sed -n 's/^[[:space:]]*"Dir": "\(.*\)",$/\1/p')"
+  go_root="${toolchain_dir}"
+  if [ -z "${toolchain_dir}" ] || [ ! -f "${go_root}/LICENSE" ]; then
+    echo "Go's LICENSE is neither in $(go env GOROOT) nor in the official toolchain download." >&2
+    exit 1
+  fi
+fi
+add_texts "${go_root}" "Go standard library and runtime"
 while IFS=$'\t' read -r path version dir; do
   if [ -z "$(license_files "${dir}")" ]; then
     echo "${path}@${version} has no license file in ${dir}" >&2
